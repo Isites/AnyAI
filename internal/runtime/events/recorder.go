@@ -90,9 +90,8 @@ type persistedRecord struct {
 }
 
 type fileStore struct {
-	dir        string
-	runsDir    string
-	systemFile string
+	dir     string
+	runsDir string
 }
 
 func NewRecorder() *Recorder {
@@ -1076,9 +1075,8 @@ func newFileStore(dir string) (*fileStore, error) {
 		return nil, errors.New("events dir is required")
 	}
 	store := &fileStore{
-		dir:        dir,
-		runsDir:    filepath.Join(dir, "runs"),
-		systemFile: filepath.Join(dir, "system.jsonl"),
+		dir:     dir,
+		runsDir: filepath.Join(dir, "runs"),
 	}
 	if err := os.MkdirAll(store.runsDir, 0o755); err != nil {
 		return nil, err
@@ -1087,15 +1085,15 @@ func newFileStore(dir string) (*fileStore, error) {
 }
 
 func (s *fileStore) appendRun(run RunRecord) error {
-	return s.append(run.ID, persistedRecord{Kind: "run", Run: &run})
+	return s.append(run.ID, run.AgentID, run.CreatedAt, persistedRecord{Kind: "run", Run: &run})
 }
 
 func (s *fileStore) appendEvent(event EventRecord) error {
-	return s.append(event.RunID, persistedRecord{Kind: "event", Event: &event})
+	return s.append(event.RunID, event.AgentID, event.Timestamp, persistedRecord{Kind: "event", Event: &event})
 }
 
-func (s *fileStore) append(runID string, record persistedRecord) error {
-	path := s.pathForRun(runID)
+func (s *fileStore) append(runID, agentID string, timestamp time.Time, record persistedRecord) error {
+	path := s.pathForRun(runID, agentID, timestamp)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -1108,13 +1106,20 @@ func (s *fileStore) append(runID string, record persistedRecord) error {
 
 func (s *fileStore) load() (*recorderState, error) {
 	state := newRecorderState()
+
+	// 加载普通 runs
 	matches, err := filepath.Glob(filepath.Join(s.runsDir, "*.jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	if _, statErr := os.Stat(s.systemFile); statErr == nil {
-		matches = append(matches, s.systemFile)
+
+	// 加载按天滚动的 system 文件
+	systemMatches, err := filepath.Glob(filepath.Join(s.dir, "system_*.jsonl"))
+	if err != nil {
+		return nil, err
 	}
+	matches = append(matches, systemMatches...)
+
 	sort.Strings(matches)
 	for _, path := range matches {
 		file, err := os.Open(path)
@@ -1141,10 +1146,18 @@ func (s *fileStore) load() (*recorderState, error) {
 	return state, nil
 }
 
-func (s *fileStore) pathForRun(runID string) string {
+func (s *fileStore) pathForRun(runID, agentID string, timestamp time.Time) string {
 	runID = strings.TrimSpace(runID)
+	agentID = strings.TrimSpace(agentID)
+
+	// 系统 run 按天滚动
+	if agentID == "system" {
+		dateStr := timestamp.Format("2006-01-02")
+		return filepath.Join(s.dir, "system_"+dateStr+".jsonl")
+	}
+
 	if runID == "" {
-		return s.systemFile
+		return filepath.Join(s.runsDir, "unknown.jsonl")
 	}
 	return filepath.Join(s.runsDir, sanitizeSessionFilename(runID)+".jsonl")
 }
