@@ -1,4 +1,9 @@
+
+
+
 # AnyAI
+
+![AnyAI](./AnyAI-logo.png)
 
 AnyAI 是一个“项目优先”的 Agent 开发框架与运行时。把 `anyai.yaml`、`agent.md`、`SKILL.md` 放进一个目录后，就可以通过 CLI、浏览器页面、HTTP API 和 SSE 流式事件跑起来。
 
