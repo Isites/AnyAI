@@ -21,7 +21,7 @@ import (
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/Isites/anyai/internal/runtime/session"
 	"github.com/Isites/anyai/internal/runtime/task"
-	"github.com/Isites/anyai/internal/runtime/tool"
+	tools "github.com/Isites/anyai/internal/runtime/tool"
 	"github.com/Isites/anyai/internal/startup/http/server"
 	"github.com/go-chi/chi/v5"
 )
@@ -377,6 +377,8 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 
+	// TODO: 临时不定，后期需要废弃ManagedRun的events，进作为一个句柄，可以操控本次生命周期停止和继续，其余的消费只暴露recorder/replay/subscribe即可
+	drainManagedRunEvents(run)
 	h.observeRunMetrics(run.RunID)
 
 	if req.Stream || wantsEventStream(r) {
@@ -385,6 +387,16 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": record})
+}
+
+func drainManagedRunEvents(run *runtimeport.ManagedRun) {
+	if run == nil || run.Events == nil {
+		return
+	}
+	go func() {
+		for range run.Events {
+		}
+	}()
 }
 
 func (h *Handler) handleRunGet(w http.ResponseWriter, r *http.Request) {
