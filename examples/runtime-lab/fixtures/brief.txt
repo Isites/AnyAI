@@ -1,0 +1,5 @@
+Runtime lab brief:
+
+- Validate the unified input manifest.
+- Keep the final answer concise.
+- Make the workflow understandable from natural language.

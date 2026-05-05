@@ -1,0 +1,5 @@
+dimension,score,notes
+network_reliability,72,offline materials available but live web validation may fail
+document_clarity,88,workflow and delegation intent are clearly documented
+data_consistency,81,structured metrics are available for aggregation
+risk_coordination,64,shared context between subagents still needs reinforcement

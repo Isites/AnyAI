@@ -1,0 +1,30 @@
+{
+  "users": {
+    "U001": {
+      "user_id": "U001",
+      "name": "张先生",
+      "phone": "138****5678",
+      "email": "zhang***@example.com",
+      "member_level": "黄金",
+      "total_orders": 15,
+      "total_spent": 8560.00,
+      "preferences": ["数码产品", "手机配件"],
+      "last_order": "ORD123456",
+      "join_date": "2023-06-15",
+      "frequent_categories": ["手机", "配件"],
+      "avg_order_value": 570.67
+    },
+    "U002": {
+      "user_id": "U002",
+      "name": "李女士",
+      "phone": "139****1234",
+      "email": "li***@example.com",
+      "member_level": "白银",
+      "total_orders": 5,
+      "total_spent": 2300.00,
+      "preferences": ["电脑", "办公设备"],
+      "last_order": "ORD123458",
+      "join_date": "2023-11-01"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AnyAI Command Deck</title>
+  <link rel="stylesheet" href="/ui/assets/vendor/github-markdown-light.min.css">
+  <link rel="stylesheet" href="/ui/assets/app.css">
+</head>
+<body>
+  <div class="noise"></div>
+
+  <!-- Drawer Overlay Backdrop -->
+  <div id="drawer-backdrop" class="drawer-backdrop"></div>
+
+  <!-- App Shell without sidebar in grid -->
+  <div class="app-shell">
+    <!-- Main content takes full width -->
+    <main class="main">
+      <!-- Top bar with drawer toggle -->
+      <header class="topbar">
+        <div class="topbar-left">
+          <button type="button" id="drawer-toggle" class="drawer-toggle" aria-label="打开导航" aria-expanded="false" aria-controls="drawer">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="3" y1="12" x2="21" y2="12"></line>
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+          </button>
+          <div>
+            <div class="eyebrow" id="page-eyebrow">CONTROL SURFACE</div>
+            <h1 id="page-title">AnyAI</h1>
+            <p id="page-subtitle" class="muted">项目控制台正在加载…</p>
+          </div>
+        </div>
+        <div class="topbar-meta">
+          <div class="meta-pill">
+            <span class="meta-label">页面</span>
+            <span id="page-name">overview</span>
+          </div>
+          <div class="meta-pill">
+            <span class="meta-label">时间</span>
+            <span id="page-time">--:--:--</span>
+          </div>
+        </div>
+      </header>
+
+      <section id="flash" class="flash hidden"></section>
+      <section id="content" class="content"></section>
+    </main>
+  </div>
+
+  <!-- Drawer Sidebar - Moved outside app-shell for fixed positioning -->
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-header">
+      <a class="brand" href="/ui">
+        <span class="brand-mark">A</span>
+        <span>
+          <strong>AnyAI</strong>
+          <small>Unified Runtime Deck</small>
+        </span>
+      </a>
+      <button type="button" id="drawer-close" class="drawer-close" aria-label="关闭导航">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <nav class="nav">
+      <a data-page="overview" href="/ui">总览</a>
+      <a data-page="chat" href="/chat">会话工作台</a>
+      <a data-page="runs" href="/ui/runs">运行树</a>
+      <a data-page="jobs" href="/jobs">计划</a>
+      <a data-page="logs" href="/logs">日志</a>
+      <a data-page="api" href="/ui/api">API 导航</a>
+      <a data-page="settings" href="/settings">配置</a>
+    </nav>
+  </aside>
+
+  <!-- Toast Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/ui/assets/vendor/marked.min.js"></script>
+  <script type="module" src="/ui/assets/app.js"></script>
+</body>
+</html>

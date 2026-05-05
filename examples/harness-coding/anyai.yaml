@@ -1,0 +1,63 @@
+# Coding workflow demo.
+# The default local setup uses Ollama. If you want to validate OpenAI,
+# Anthropic, Gemini, Qwen or a compatible proxy, update `models.default`
+# and uncomment the matching provider block below.
+name: harness-coding
+
+models:
+  # default: openai/gpt-5.4
+  default: anthropic/minimax-m2.7
+
+providers:
+  ollama:
+    kind: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+
+  openai:
+    kind: openai
+    api_key: xxxxxxxxx
+    base_url: https://xxxxxxxx
+    headers:
+      User-Agent: codex-cli/0.1.0
+      X-Client: codex
+  anthropic:
+    kind: anthropic-messages
+    api_key: xxxxxx
+    base_url: https://xxxxxxxxx
+    headers:
+      User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+
+  # anthropic:
+  #   kind: anthropic
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   headers:
+  #     anthropic-beta: tools-2024-04-04
+  #   headers_env: ANTHROPIC_HEADERS_JSON
+
+  # gemini:
+  #   kind: gemini
+  #   api_key_env: GEMINI_API_KEY
+  #   headers:
+  #     X-Goog-User-Project: your-gcp-project
+  #   headers_env: GEMINI_HEADERS_JSON
+
+  # qwen:
+  #   kind: qwen
+  #   api_key_env: QWEN_API_KEY
+  #   base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  #   headers:
+  #     X-DashScope-SSE: enable
+  #   headers_env: QWEN_HEADERS_JSON
+
+  # proxy:
+  #   kind: openai-compatible
+  #   api_key_env: OPENAI_PROXY_API_KEY
+  #   base_url_env: OPENAI_PROXY_BASE_URL
+  #   headers:
+  #     X-Workspace: staging
+  #   headers_env: OPENAI_PROXY_HEADERS_JSON
+
+runtime:
+  agent_call:
+    max_parallel: 4
+  idle_timeout_ms: 420000

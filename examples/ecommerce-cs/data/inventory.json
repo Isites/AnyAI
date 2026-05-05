@@ -1,0 +1,45 @@
+{
+  "inventory": {
+    "PHONE-APPLE-IPHONE15": {
+      "sku": "PHONE-APPLE-IPHONE15",
+      "name": "iPhone 15 128GB 黑色",
+      "status": "IN_STOCK",
+      "warehouses": {
+        "beijing": 50,
+        "shanghai": 80,
+        "guangzhou": 30
+      }
+    },
+    "PHONE-APPLE-IPHONE15-PRO": {
+      "sku": "PHONE-APPLE-IPHONE15-PRO",
+      "name": "iPhone 15 Pro 256GB 深空黑",
+      "status": "LOW_STOCK",
+      "warehouses": {
+        "beijing": 3,
+        "shanghai": 5,
+        "guangzhou": 2
+      }
+    },
+    "PHONE-CASE-APPLE-15": {
+      "sku": "PHONE-CASE-APPLE-15",
+      "name": "iPhone 15 硅胶保护壳",
+      "status": "IN_STOCK",
+      "warehouses": {
+        "beijing": 200,
+        "shanghai": 180,
+        "guangzhou": 150
+      }
+    },
+    "LAPTOP-DELL-XPS15": {
+      "sku": "LAPTOP-DELL-XPS15",
+      "name": "Dell XPS 15 笔记本电脑",
+      "status": "OUT_OF_STOCK",
+      "warehouses": {
+        "beijing": 0,
+        "shanghai": 0,
+        "guangzhou": 0
+      },
+      "expected_restock": "2024-02-01"
+    }
+  }
+}

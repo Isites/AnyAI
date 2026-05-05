@@ -1,0 +1,70 @@
+# Minimal single-agent demo.
+# Quick start:
+# 1. Keep `ollama` as-is if you want the easiest local setup.
+# 2. If you switch to a cloud model, update `models.default` and uncomment the matching provider below.
+# 3. `headers:` is for fixed request headers.
+# 4. `headers_env:` expects a JSON object string, for example:
+#    export OPENAI_HEADERS_JSON='{"HTTP-Referer":"https://your-app.example","X-Title":"AnyAI Demo"}'
+name: single-agent
+
+models:
+  # The example agent markdown references Anthropic-style model names.
+  # This alias lets the example run on local Ollama without editing agent.md.
+  default: anthropic/glm-5.1
+
+providers:
+  # Zero-config local mode.
+  ollama:
+    kind: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+
+  # OpenAI official API.
+  # openai:
+  #   kind: openai
+  #   api_key_env: OPENAI_API_KEY
+  #   headers:
+  #     HTTP-Referer: https://your-app.example
+  #     X-Title: AnyAI Demo
+  #   headers_env: OPENAI_HEADERS_JSON
+
+  # Anthropic official API.
+  anthropic:
+    kind: anthropic-messages
+    api_key: xxxxxxxx
+    base_url: https://open.bigmodel.cn/api/anthropic
+    # headers:
+    #   User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+    # headers:
+    #   anthropic-beta: tools-2024-04-04
+    # headers_env: ANTHROPIC_HEADERS_JSON
+
+  # Google Gemini API.
+  # gemini:
+  #   kind: gemini
+  #   api_key_env: GEMINI_API_KEY
+  #   headers:
+  #     X-Goog-User-Project: your-gcp-project
+  #   headers_env: GEMINI_HEADERS_JSON
+
+  # Alibaba Qwen official API.
+  # qwen:
+  #   kind: qwen
+  #   api_key_env: QWEN_API_KEY
+  #   base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  #   headers:
+  #     X-DashScope-SSE: enable
+  #   headers_env: QWEN_HEADERS_JSON
+
+  # Any OpenAI-compatible proxy or self-hosted gateway.
+  # proxy:
+  #   kind: openai-compatible
+  #   api_key_env: OPENAI_PROXY_API_KEY
+  #   base_url_env: OPENAI_PROXY_BASE_URL
+  #   headers:
+  #     X-Workspace: staging
+  #   headers_env: OPENAI_PROXY_HEADERS_JSON
+
+channels:
+  gateway:
+    enabled:
+      - cli

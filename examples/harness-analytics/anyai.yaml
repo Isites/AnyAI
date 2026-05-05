@@ -1,0 +1,61 @@
+# Analytics collaboration demo.
+# Keep Ollama for the lowest setup cost, or switch providers by changing
+# `models.default` and uncommenting the matching provider block.
+name: harness-analytics
+
+models:
+  default: ollama/qwen3:1.7b
+  aliases:
+    anthropic/claude-sonnet-4-5-20250514: ollama/qwen3:1.7b
+
+providers:
+  ollama:
+    kind: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+
+  # openai:
+  #   kind: openai
+  #   api_key_env: OPENAI_API_KEY
+  #   headers:
+  #     HTTP-Referer: https://your-app.example
+  #     X-Title: AnyAI Demo
+  #   headers_env: OPENAI_HEADERS_JSON
+
+  # anthropic:
+  #   kind: anthropic
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   headers:
+  #     anthropic-beta: tools-2024-04-04
+  #   headers_env: ANTHROPIC_HEADERS_JSON
+
+  # gemini:
+  #   kind: gemini
+  #   api_key_env: GEMINI_API_KEY
+  #   headers:
+  #     X-Goog-User-Project: your-gcp-project
+  #   headers_env: GEMINI_HEADERS_JSON
+
+  # qwen:
+  #   kind: qwen
+  #   api_key_env: QWEN_API_KEY
+  #   base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  #   headers:
+  #     X-DashScope-SSE: enable
+  #   headers_env: QWEN_HEADERS_JSON
+
+  # proxy:
+  #   kind: openai-compatible
+  #   api_key_env: OPENAI_PROXY_API_KEY
+  #   base_url_env: OPENAI_PROXY_BASE_URL
+  #   headers:
+  #     X-Workspace: staging
+  #   headers_env: OPENAI_PROXY_HEADERS_JSON
+
+runtime:
+  agent_call:
+    max_parallel: 3
+
+channels:
+  gateway:
+    enabled:
+      - cli
