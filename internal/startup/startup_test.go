@@ -352,7 +352,7 @@ func TestRuntimeUpdaterAppliesRuntimeSpecResourcesAndGatewayView(t *testing.T) {
 	require.NotNil(t, core.Runtime.Resources())
 	require.Len(t, core.Runtime.Resources().SharedSkills(), 2)
 	assert.Equal(t, []string{}, core.Config.ActiveChannels)
-	assert.Equal(t, "assistant", core.Gateway.ResolveIngressAgent(runtimeport.IngressRequest{Channel: "http"}))
+	assert.Equal(t, "assistant", core.Gateway.ResolveIngressAgent(gateway.IngressRequest{Channel: "http"}))
 }
 
 type startupMockProvider struct {

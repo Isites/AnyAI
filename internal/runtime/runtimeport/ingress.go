@@ -21,7 +21,10 @@ type IngressRequest struct {
 	SenderID      string
 	AccountID     string
 	ChatType      ChatType
+	Text          string
+	MessageID     string
 	Envelope      input.InputEnvelope
 	SessionID     string
+	SessionPrefix string
 	ParentAgentID string
 }

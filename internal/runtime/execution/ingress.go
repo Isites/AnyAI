@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	"github.com/Isites/anyai/internal/runtime/input"
@@ -45,8 +46,26 @@ func StartIngressRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 	if strings.TrimSpace(req.RunID) == "" {
 		req.RunID = tools.NewRunID()
 	}
+	blocks, err := input.NormalizeBlocks(req.Text, req.Envelope.Blocks)
+	if err != nil {
+		recordRouteRejected(deps.Recorder, req, Decision{}, err.Error())
+		return nil, err
+	}
+	req.Envelope.Blocks = blocks
+	prepared, _, err := input.PrepareEnvelope(req.Envelope, input.PrepareOptions{
+		RunID:   req.RunID,
+		BaseDir: input.ProjectAssetsDir(deps.Config),
+	})
+	if err != nil {
+		recordRouteRejected(deps.Recorder, req, Decision{}, err.Error())
+		return nil, err
+	}
+	req.Envelope = prepared
 	if strings.TrimSpace(req.SessionID) == "" {
 		req.SessionID = strings.TrimSpace(req.Envelope.SessionID)
+	}
+	if strings.TrimSpace(req.SessionID) == "" {
+		req.SessionID = input.DefaultSessionID(req.SessionPrefix, time.Now().UTC())
 	}
 	if strings.TrimSpace(req.SessionID) != "" && strings.TrimSpace(req.Envelope.SessionID) == "" {
 		req.Envelope.SessionID = strings.TrimSpace(req.SessionID)
@@ -74,6 +93,7 @@ func startDirect(ctx context.Context, deps runtimeport.ExecutionDeps, req runtim
 		AgentID:       strings.TrimSpace(req.RequestedID),
 		Envelope:      req.Envelope,
 		SessionID:     req.SessionID,
+		MessageID:     strings.TrimSpace(req.MessageID),
 		ParentAgentID: req.ParentAgentID,
 		Channel:       req.Channel,
 	})
@@ -236,7 +256,7 @@ func attachmentPayloads(env input.InputEnvelope) []map[string]any {
 	out := make([]map[string]any, 0, len(env.Blocks))
 	for i, block := range env.Blocks {
 		switch strings.TrimSpace(block.Type) {
-		case "file", "image", "pdf":
+		case "file", "image", "pdf", "dir":
 		default:
 			continue
 		}
@@ -264,6 +284,9 @@ func attachmentPayloads(env input.InputEnvelope) []map[string]any {
 }
 
 func blockID(block input.InputBlock, index int) string {
+	if id := strings.TrimSpace(block.AttachmentID); id != "" {
+		return id
+	}
 	if id := strings.TrimSpace(block.ID); id != "" {
 		return id
 	}

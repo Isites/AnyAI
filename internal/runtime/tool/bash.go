@@ -57,6 +57,19 @@ func (t *BashTool) Parameters() json.RawMessage {
 			"timeout": {
 				"type": "integer",
 				"description": "Timeout in seconds (default: 120)"
+			},
+			"background": {
+				"type": "boolean",
+				"description": "Set true when intentionally starting a long-running service for later tool calls in this run."
+			},
+			"wait_for": {
+				"type": "string",
+				"description": "Optional readiness check for background commands, such as http://127.0.0.1:3000/health or tcp://127.0.0.1:3000."
+			},
+			"cleanup": {
+				"type": "string",
+				"enum": ["run_end", "none"],
+				"description": "Cleanup policy for background commands. Defaults to run_end."
 			}
 		},
 		"required": ["command"]

@@ -47,6 +47,9 @@ func BuildHistoryBlocks(history []SessionEntry) []HistoryBlock {
 		if startsHistoryBlock(entry) && len(current) > 0 {
 			flush()
 		}
+		if entry.Type == EntryTypeRuntimeControl {
+			flush()
+		}
 		current = append(current, entry)
 	}
 	flush()
@@ -90,6 +93,8 @@ func RepairLeadingFragment(history []SessionEntry) []SessionEntry {
 		switch entry.Type {
 		case EntryTypeCompaction:
 			return append(prefix, history[idx:]...)
+		case EntryTypeRuntimeControl:
+			prefix = append(prefix, entry)
 		case EntryTypeMessage:
 			if entry.Role == "user" {
 				return append(prefix, history[idx:]...)
@@ -108,6 +113,8 @@ func RepairLeadingFragment(history []SessionEntry) []SessionEntry {
 func startsHistoryBlock(entry SessionEntry) bool {
 	switch entry.Type {
 	case EntryTypeCompaction:
+		return true
+	case EntryTypeRuntimeControl:
 		return true
 	case EntryTypeMessage:
 		return entry.Role == "user"
@@ -187,7 +194,7 @@ func SummarizeRecentUserTurns(blocks []HistoryBlock) string {
 				continue
 			}
 			text := strings.TrimSpace(msg.Text)
-			if text != "" {
+			if text != "" && !IsRuntimeControlEntry(entry) {
 				lines = append(lines, text)
 			}
 			break

@@ -73,7 +73,17 @@ func (p *QwenProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 
 	for _, m := range req.Messages {
 		switch m.Role {
-		case "user":
+		case MessageRoleRuntime, MessageRoleDeveloper:
+			msgs = append(msgs, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: m.Content,
+			})
+		case MessageRoleSystem:
+			msgs = append(msgs, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: m.Content,
+			})
+		case MessageRoleUser:
 			if m.ToolCallID != "" {
 				if len(m.Images) > 0 {
 					// Tool result with images: use multi-content parts
@@ -136,7 +146,7 @@ func (p *QwenProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 					Content: m.Content,
 				})
 			}
-		case "assistant":
+		case MessageRoleAssistant:
 			msg := openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleAssistant,
 				Content: m.Content,

@@ -293,37 +293,72 @@ func (r *Runtime) ListRuns() []runtimeevents.RunRecord {
 
 func (r *Runtime) ListRunEvents(runID string) []runtimeevents.EventRecord {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
-		return r.ProjectionService.Run.ListRunEvents(runID)
+		return r.ProjectionService.Run.ReplayRunEvents(runID)
+	}
+	return nil
+}
+
+func (r *Runtime) ListRawRunEvents(runID string) []runtimeevents.EventRecord {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.ListRawRunEvents(runID)
 	}
 	return nil
 }
 
 func (r *Runtime) GetRunTree(runID string) (runtimeevents.RunTreeRecord, bool) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
-		return r.ProjectionService.Run.GetRunTree(runID)
+		return r.ProjectionService.Run.ReplayRunTreeRecord(runID)
+	}
+	return runtimeevents.RunTreeRecord{}, false
+}
+
+func (r *Runtime) GetRawRunTree(runID string) (runtimeevents.RunTreeRecord, bool) {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.GetRawRunTree(runID)
 	}
 	return runtimeevents.RunTreeRecord{}, false
 }
 
 func (r *Runtime) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
-		return r.ProjectionService.Run.RunTree(runID)
+		return r.ProjectionService.Run.ReplayRunTree(runID)
 	}
 	return nil, false
 }
 
-func (r *Runtime) SubscribeRun(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (r *Runtime) RawRunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
-		return r.ProjectionService.Run.SubscribeRun(runID)
+		return r.ProjectionService.Run.RawRunTree(runID)
+	}
+	return nil, false
+}
+
+func (r *Runtime) SubscribeRawRun(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.SubscribeRawRun(runID)
 	}
 	return nil, nil, fmt.Errorf("run projection not available")
 }
 
-func (r *Runtime) SubscribeRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (r *Runtime) SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
-		return r.ProjectionService.Run.SubscribeRunTree(runID)
+		return r.ProjectionService.Run.SubscribeRunReplay(runID)
+	}
+	return nil, nil, nil, fmt.Errorf("run projection not available")
+}
+
+func (r *Runtime) SubscribeRawRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.SubscribeRawRunTree(runID)
 	}
 	return nil, nil, fmt.Errorf("run projection not available")
+}
+
+func (r *Runtime) SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.SubscribeRunTreeReplay(runID)
+	}
+	return nil, nil, nil, fmt.Errorf("run projection not available")
 }
 
 func (r *Runtime) ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord {
@@ -401,6 +436,22 @@ func (r *Runtime) LoadSession(agentID, sessionID string) (*session.Session, erro
 		return nil, fmt.Errorf("session projection not available")
 	}
 	return r.ProjectionService.Session.Load(agentID, sessionID)
+}
+
+func (r *Runtime) LoadSessionSnapshot(agentID, sessionID string) (runtimeport.SessionSnapshot, error) {
+	if r == nil || r.ProjectionService == nil || r.ProjectionService.Session == nil {
+		return runtimeport.SessionSnapshot{}, fmt.Errorf("session projection not available")
+	}
+	sess, err := r.ProjectionService.Session.Load(agentID, sessionID)
+	if err != nil {
+		return runtimeport.SessionSnapshot{}, err
+	}
+	return runtimeport.SessionSnapshot{
+		AgentID: agentID,
+		ID:      sessionID,
+		History: session.SerializeHistory(sess),
+		Events:  r.ListSessionEvents(agentID, sessionID),
+	}, nil
 }
 
 func (r *Runtime) DeleteSession(agentID, sessionID string) error {

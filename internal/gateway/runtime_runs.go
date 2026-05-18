@@ -1,49 +1,28 @@
 package gateway
 
-import (
-	"fmt"
-
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-)
-
-func (s *Service) ListRuns() []runtimeevents.RunRecord {
+func (s *Service) ListRuns() []Run {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	return rt.ListRuns()
+	return gatewayRuns(rt.ListRuns())
 }
 
-func (s *Service) ListRunEvents(runID string) []runtimeevents.EventRecord {
+func (s *Service) ListRunEvents(runID string) []Event {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	events := rt.ListRunEvents(runID)
-	run, ok := rt.GetRun(runID)
-	if !ok {
-		return events
-	}
-	return runtimeevents.ReplayRunEvents(run, events)
+	return gatewayEvents(rt.ListRunEvents(runID))
 }
 
-func (s *Service) SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+func (s *Service) SubscribeRunReplay(runID string) ([]Event, <-chan Event, func(), error) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return subscribeReplayStream(
-		func() (<-chan runtimeevents.EventRecord, func(), error) {
-			return rt.SubscribeRun(runID)
-		},
-		func() ([]runtimeevents.EventRecord, error) {
-			run, ok := rt.GetRun(runID)
-			if !ok {
-				return nil, fmt.Errorf("run %q not found", runID)
-			}
-			return runtimeevents.ReplayRunEvents(run, rt.ListRunEvents(runID)), nil
-		},
-	)
+	snapshot, ch, cancel, err := rt.SubscribeRunReplay(runID)
+	return gatewayEvents(snapshot), gatewayEventChannel(ch), cancel, err
 }
 
 func (s *Service) CancelRun(runID string) error {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/task"
 	tools "github.com/Isites/anyai/internal/runtime/tool"
 )
@@ -40,6 +41,11 @@ func (e *ProcessExecutor) Execute(ctx context.Context, taskRecord task.Record) (
 }
 
 func (e *ProcessExecutor) executeBash(ctx context.Context, taskRecord task.Record) (task.Result, error) {
+	if result, err, ok := executeProcessViaToolRecovery(ctx, taskRecord, "bash"); ok {
+		taskResult := taskResultFromToolResult(result)
+		taskResult.Metadata = mergeProcessMetadata(taskResult.Metadata, taskRecord, "bash")
+		return taskResult, err
+	}
 	in, err := tools.ParseBashProcessInput(json.RawMessage(taskRecord.Input))
 	if err != nil {
 		return task.Result{Status: task.StatusFailed, Error: err.Error()}, nil
@@ -51,6 +57,12 @@ func (e *ProcessExecutor) executeBash(ctx context.Context, taskRecord task.Recor
 }
 
 func (e *ProcessExecutor) executePython(ctx context.Context, taskRecord task.Record) (task.Result, error) {
+	processName := normalizeProcessName(taskRecord.ProcessName)
+	if result, err, ok := executeProcessViaToolRecovery(ctx, taskRecord, processToolName(processName)); ok {
+		taskResult := taskResultFromToolResult(result)
+		taskResult.Metadata = mergeProcessMetadata(taskResult.Metadata, taskRecord, processName)
+		return taskResult, err
+	}
 	in, err := tools.ParsePythonProcessInput(json.RawMessage(taskRecord.Input))
 	if err != nil {
 		return task.Result{Status: task.StatusFailed, Error: err.Error()}, nil
@@ -59,6 +71,32 @@ func (e *ProcessExecutor) executePython(ctx context.Context, taskRecord task.Rec
 	taskResult := taskResultFromToolResult(result)
 	taskResult.Metadata = mergeProcessMetadata(taskResult.Metadata, taskRecord, normalizeProcessName(taskRecord.ProcessName))
 	return taskResult, execErr
+}
+
+func processToolName(processName string) string {
+	switch normalizeProcessName(processName) {
+	case "python3":
+		return "python"
+	default:
+		return normalizeProcessName(processName)
+	}
+}
+
+func executeProcessViaToolRecovery(ctx context.Context, taskRecord task.Record, toolName string) (tools.ToolResult, error, bool) {
+	execute := tools.TaskToolExecutionFromContext(ctx)
+	if execute == nil {
+		return tools.ToolResult{}, nil, false
+	}
+	call := llm.ToolCall{
+		ID:    metadataString(taskRecord.Metadata, "tool_call_id"),
+		Name:  toolName,
+		Input: json.RawMessage(taskRecord.Input),
+	}
+	if strings.TrimSpace(call.ID) == "" {
+		call.ID = taskRecord.ID
+	}
+	result, err := execute(ctx, call)
+	return result, err, true
 }
 
 func taskWorkDir(taskRecord task.Record) string {

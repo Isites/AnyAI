@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Isites/anyai/internal/config"
+	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/memory"
 	runtimeplan "github.com/Isites/anyai/internal/runtime/plan"
 	"github.com/Isites/anyai/internal/runtime/session"
@@ -22,9 +23,7 @@ const runtimeCapabilityNote = `The AnyAI runtime exposes real working tools. Tre
 
 When a tool call fails, read the exact error, adjust your next step, and retry with corrected arguments or a reasonable fallback. Do not pretend a failed tool succeeded or repeat the same broken call unchanged.
 
-For filesystem and shell tools, relative paths resolve from your agent workspace, which may differ from the project root, so use the injected environment paths and prefer absolute paths when anything is ambiguous. When bash is available, combine shell tools freely and, for more complex or repetitive work, run a short helper program, including a Python script, when policy allows.
-
-If save_output is available and you just drafted a long artifact in assistant text, call save_output immediately so it is actually persisted on disk.`
+For filesystem and shell tools, relative paths resolve from your agent workspace, which may differ from the project root, so use the injected environment paths and prefer absolute paths when anything is ambiguous. When bash is available, combine shell tools freely and, for more complex or repetitive work, run a short helper program, including a Python script, when policy allows.`
 
 const (
 	promptQueryMaxSnippets   = 4
@@ -34,10 +33,9 @@ const (
 // toolHints maps tool names to usage guidance injected into the runtime
 // capability section.
 var toolHints = map[string]string{
-	"read_file":        "You can read files. It reads file contents, not directory listings. Use bash to inspect directories when bash is available. You have vision capabilities: use read_file on image files when visual analysis is needed.",
-	"write_file":       "You can create or overwrite files.",
+	"read_file":        "You can read files. It reads file contents, not directory listings. Use bash to inspect directories when bash is available. If an image is already attached, inspect that image directly with vision instead of calling read_file or scripts; use read_file for text/file contents and path verification.",
+	"write_file":       "You can create, overwrite, append to, or patch files. For existing-file edits, prefer mode=patch with Codex-style *** Begin Patch / *** End Patch hunks. For large new files, write manageable chunks with mode=overwrite for the first chunk, mode=append for later chunks, and expected_offset to verify no chunk was missed.",
 	"edit_file":        "You can make targeted edits to existing files.",
-	"save_output":      "You can save the full text of your most recent assistant message to a file using save_output for long reports, plans, and review artifacts. After drafting the full content in assistant text, call save_output immediately so the file really exists on disk.",
 	"bash":             "You can execute bash commands on the user's machine from your agent workspace. Use it to inspect directories, verify file existence, and switch to absolute project paths when relative paths are ambiguous. For more complex workflows, you can write and run a short script through bash, including using installed interpreters such as python3 when available.",
 	"web_fetch":        "You can fetch web pages using the web_fetch tool.",
 	"web_search":       "You can search the web using the web_search tool.",
@@ -531,7 +529,7 @@ func (promptEnvironmentSection) key() string                       { return "env
 func (promptEnvironmentSection) stability() promptSectionStability { return promptSectionStatic }
 func (promptEnvironmentSection) priority() int                     { return 40 }
 func (promptEnvironmentSection) applicable(ctx PromptContext) bool {
-	return ctx.hasAnyTool("read_file", "write_file", "edit_file", "bash", "python", "save_output")
+	return ctx.hasAnyTool("read_file", "write_file", "edit_file", "bash", "python")
 }
 func (promptEnvironmentSection) build(ctx PromptContext) string {
 	lines := []string{"## Environment Facts", ""}
@@ -540,7 +538,7 @@ func (promptEnvironmentSection) build(ctx PromptContext) string {
 	}
 	if workspace := ctx.effectiveWorkspace(); workspace != "" {
 		lines = append(lines, "- Agent workspace: "+workspace)
-		lines = append(lines, "- Relative path base for file/bash/python/save_output tools: "+workspace)
+		lines = append(lines, "- Relative path base for file/bash/python tools: "+workspace)
 	}
 	if configPath := ctx.effectiveConfigPath(); configPath != "" {
 		lines = append(lines, "- Config file: "+configPath)
@@ -1077,6 +1075,7 @@ func derivePromptQuery(history []session.SessionEntry, fallback string) string {
 }
 
 func derivePromptQueryWithFocus(history []session.SessionEntry, focus RequestFocus, fallback string) string {
+	history = session.ModelVisibleEntries(history)
 	type snippet struct {
 		label string
 		text  string
@@ -1112,7 +1111,7 @@ func derivePromptQueryWithFocus(history []session.SessionEntry, focus RequestFoc
 			}
 			addSnippet("Tool result", firstNonEmpty(tr.Error, tr.Output))
 		case session.EntryTypeMessage:
-			if entry.Role != "user" {
+			if entry.Role != llm.MessageRoleUser {
 				continue
 			}
 			var md session.MessageData

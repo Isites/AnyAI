@@ -100,7 +100,7 @@ func repairToolInput(toolName string, raw json.RawMessage) (json.RawMessage, []s
 	}
 
 	switch strings.TrimSpace(toolName) {
-	case "read_file", "write_file", "edit_file", "save_output":
+	case "read_file", "write_file", "edit_file":
 		renameFirst(payload, "path", "file", "filepath", "filename")
 	case "bash":
 		renameFirst(payload, "command", "cmd", "script")

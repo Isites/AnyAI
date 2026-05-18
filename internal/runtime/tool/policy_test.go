@@ -52,6 +52,17 @@ func TestPolicyWildcardAllow(t *testing.T) {
 	assert.False(t, p.IsAllowed("bash"))
 }
 
+func TestPolicyPrefixWildcard(t *testing.T) {
+	p := Policy{
+		Allow: []string{"mcp__filesystem__*"},
+		Deny:  []string{"mcp__filesystem__delete_*"},
+	}
+
+	assert.True(t, p.IsAllowed("mcp__filesystem__read_file"))
+	assert.False(t, p.IsAllowed("mcp__filesystem__delete_file"))
+	assert.False(t, p.IsAllowed("mcp__browser__open"))
+}
+
 func TestPolicyWildcardDeny(t *testing.T) {
 	p := Policy{
 		Deny: []string{"*"},

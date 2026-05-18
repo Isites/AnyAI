@@ -3,25 +3,18 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Isites/anyai/internal/config"
 	"github.com/Isites/anyai/internal/gateway"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	runtimefactory "github.com/Isites/anyai/internal/runtime/factory"
 	"github.com/Isites/anyai/internal/runtime/input"
-	"github.com/Isites/anyai/internal/runtime/logging"
-	"github.com/Isites/anyai/internal/runtime/memory"
-	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
-	"github.com/Isites/anyai/internal/runtime/session"
-	"github.com/Isites/anyai/internal/runtime/task"
-	tools "github.com/Isites/anyai/internal/runtime/tool"
 	"github.com/Isites/anyai/internal/startup/http/server"
 	"github.com/go-chi/chi/v5"
 )
@@ -32,46 +25,51 @@ type InventoryPlane interface {
 	CatalogPayload() any
 	CatalogEndpointsPayload() any
 	OverviewPayload() any
-	JobScheduler() tools.JobScheduler
+	ListJobs() []gateway.Job
+	PauseJob(name string) error
+	ResumeJob(name string) error
+	RemoveJob(name string) error
+	UpdateJobSchedule(name, schedule string) error
 }
 
 type RuntimePlane interface {
 	RebuildProjections() error
 	EventStorageDir() string
+	AttachmentBaseDir() string
 }
 
 type RunPlane interface {
-	RunList() []runtimeevents.RunRecord
+	RunList() []gateway.Run
 	StartAcceptedRun(
 		ctx context.Context,
 		agentID, text string,
-		inputs []input.InputBlock,
-		sessionID, channel, senderID, accountID string,
+		inputs []gateway.InputBlock,
+		sessionID, messageID, channel, senderID, accountID string,
 		chatType gateway.ChatType,
 		sessionPrefix string,
-	) (*runtimeport.ManagedRun, runtimeevents.RunRecord, error)
-	RunRecord(runID string) (runtimeevents.RunRecord, bool)
-	RunEvents(runID string) []runtimeevents.EventRecord
-	SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
+	) (*gateway.ManagedRun, gateway.Run, error)
+	RunRecord(runID string) (gateway.Run, bool)
+	RunEvents(runID string) []gateway.Event
+	SubscribeRunReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error)
 	CancelRun(runID string) error
-	RunTreeRecord(runID string) (runtimeevents.RunTreeRecord, bool)
-	RunTree(runID string) ([]runtimeevents.RunNode, bool)
-	SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
+	RunTreeRecord(runID string) (gateway.RunTree, bool)
+	RunTree(runID string) ([]gateway.RunNode, bool)
+	SubscribeRunTreeReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error)
 }
 
 type SessionPlane interface {
-	SessionList(agentID string) ([]session.SessionInfo, error)
+	SessionList(agentID string) ([]gateway.SessionInfo, error)
 	SessionCreate(agentID, requestedKey, prefix string) (string, error)
-	SessionLoad(agentID, sessionID string) (*session.Session, error)
-	SessionEvents(agentID, sessionID string) []runtimeevents.EventRecord
-	SubscribeSession(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error)
+	SessionLoad(agentID, sessionID string) (gateway.SessionView, error)
+	SessionEvents(agentID, sessionID string) []gateway.Event
+	SubscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error)
 	SessionDelete(agentID, sessionID string) error
 }
 
 type MemoryPlane interface {
-	MemoryStats() memory.Stats
-	MemorySearch(query string, maxItems int, scope memory.SearchScope, layers ...memory.Layer) []memory.SearchMatch
-	MemoryGet(id string, scope memory.SearchScope) (memory.Entry, bool)
+	MemoryStats() gateway.MemoryStats
+	MemorySearch(query string, maxItems int, scope gateway.MemoryScope, layers ...gateway.MemoryLayer) []gateway.MemorySearchMatch
+	MemoryGet(id string, scope gateway.MemoryScope) (gateway.MemoryEntry, bool)
 	MemoryStaleCleanup(now time.Time) (int, error)
 	MemoryReindex() (int, error)
 	MemoryPromoteEligible(now time.Time) (int, error)
@@ -79,7 +77,7 @@ type MemoryPlane interface {
 
 type LogPlane interface {
 	LogEntriesPayload(limit int) []map[string]any
-	SubscribeLogs() (<-chan logging.LogEntry, func())
+	SubscribeLogs() (<-chan gateway.LogEntry, func())
 }
 
 type ConfigPlane interface {
@@ -88,10 +86,10 @@ type ConfigPlane interface {
 }
 
 type TaskPlane interface {
-	TaskList() []task.Info
-	TaskRecord(taskID string) (task.Info, bool)
-	TaskEvents(taskID string) []runtimeevents.EventRecord
-	SubscribeTask(taskID string) (<-chan runtimeevents.EventRecord, func(), error)
+	TaskList() []gateway.Task
+	TaskRecord(taskID string) (gateway.Task, bool)
+	TaskEvents(taskID string) []gateway.Event
+	SubscribeTask(taskID string) (<-chan gateway.Event, func(), error)
 	CancelTask(taskID string) error
 }
 
@@ -130,11 +128,12 @@ type Handler struct {
 }
 
 type createRunRequest struct {
-	AgentID   string             `json:"agent_id"`
-	Text      string             `json:"text,omitempty"`
-	Inputs    []input.InputBlock `json:"inputs"`
-	SessionID string             `json:"session_id,omitempty"`
-	Stream    bool               `json:"stream,omitempty"`
+	AgentID   string               `json:"agent_id"`
+	Text      string               `json:"text,omitempty"`
+	Inputs    []gateway.InputBlock `json:"inputs"`
+	SessionID string               `json:"session_id,omitempty"`
+	MessageID string               `json:"message_id,omitempty"`
+	Stream    bool                 `json:"stream,omitempty"`
 }
 
 type createSessionRequest struct {
@@ -187,6 +186,7 @@ func NewHandlerWithPlanes(planes HandlerPlanes, metrics *server.Metrics) http.Ha
 	r.Get("/runs", h.handleRuns)
 	r.Post("/runs", h.handleRunCreate)
 	r.Post("/chat", h.handleChatCreate)
+	r.Post("/attachments", h.handleAttachmentUpload)
 	r.Get("/runs/{runID}", h.handleRunGet)
 	r.Get("/runs/{runID}/events", h.handleRunEvents)
 	r.Get("/runs/{runID}/tree", h.handleRunTree)
@@ -267,8 +267,8 @@ func (h *Handler) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxItems, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("max_items")))
-	maxItems = memory.NormalizeMaxResults(maxItems, memory.DefaultSearchLimit)
-	scope := memory.NormalizeScope(memory.SearchScope{
+	maxItems = normalizeMemoryMaxResults(maxItems, 5)
+	scope := normalizeMemoryScope(gateway.MemoryScope{
 		AgentID:   strings.TrimSpace(r.URL.Query().Get("agent_id")),
 		SessionID: strings.TrimSpace(r.URL.Query().Get("session_id")),
 	})
@@ -278,12 +278,12 @@ func (h *Handler) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
-	id := memory.NormalizeID(r.URL.Query().Get("id"))
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "id is required"})
 		return
 	}
-	scope := memory.NormalizeScope(memory.SearchScope{
+	scope := normalizeMemoryScope(gateway.MemoryScope{
 		AgentID:   strings.TrimSpace(r.URL.Query().Get("agent_id")),
 		SessionID: strings.TrimSpace(r.URL.Query().Get("session_id")),
 	})
@@ -325,7 +325,7 @@ func (h *Handler) handleMemoryPromote(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) handleRuns(w http.ResponseWriter, _ *http.Request) {
 	runs := h.run.RunList()
 	if len(runs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"runs": []runtimeevents.RunRecord{}})
+		writeJSON(w, http.StatusOK, map[string]any{"runs": []gateway.Run{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
@@ -337,6 +337,77 @@ func (h *Handler) handleRunCreate(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleChatCreate(w http.ResponseWriter, r *http.Request) {
 	h.handleRunSubmission(w, r, "chat")
+}
+
+func (h *Handler) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) {
+	if h.runtime == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "runtime not available"})
+		return
+	}
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart upload"})
+		return
+	}
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		if single := r.MultipartForm.File["file"]; len(single) > 0 {
+			files = single
+		}
+	}
+	if len(files) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "at least one file is required"})
+		return
+	}
+
+	baseDir := filepath.Join(h.runtime.AttachmentBaseDir(), "uploads")
+	store := input.NewAttachmentStore(baseDir)
+	blocks := make([]gateway.InputBlock, 0, len(files))
+	for _, header := range files {
+		file, err := header.Open()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("open upload: %v", err)})
+			return
+		}
+		data, err := io.ReadAll(file)
+		_ = file.Close()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("read upload: %v", err)})
+			return
+		}
+		name := filepath.Base(strings.TrimSpace(header.Filename))
+		if name == "" || name == "." {
+			name = "upload"
+		}
+		mimeType := strings.TrimSpace(header.Header.Get("Content-Type"))
+		if mimeType == "" || mimeType == "application/octet-stream" {
+			if guessed := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); guessed != "" {
+				mimeType = guessed
+			}
+		}
+		if mimeType == "" {
+			mimeType = http.DetectContentType(data)
+		}
+		blockType := input.BlockTypeForAttachmentName(name, mimeType)
+		att, err := store.Save(name, mimeType, data)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": fmt.Sprintf("store upload: %v", err)})
+			return
+		}
+		blocks = append(blocks, gateway.InputBlock{
+			ID:           att.ID,
+			Type:         blockType,
+			Name:         att.Name,
+			Path:         att.Path,
+			AttachmentID: att.ID,
+			MimeType:     att.MimeType,
+			Meta: map[string]any{
+				"attachment_id": att.ID,
+				"size":          att.Size,
+				"uploaded":      true,
+			},
+		})
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"inputs": blocks})
 }
 
 func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, sessionPrefix string) {
@@ -356,6 +427,7 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 		req.Text,
 		req.Inputs,
 		req.SessionID,
+		req.MessageID,
 		"http",
 		"http",
 		"http",
@@ -364,8 +436,7 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 	)
 	if err != nil {
 		status := http.StatusBadRequest
-		var providerErr *runtimefactory.ProviderUnavailableError
-		if errors.As(err, &providerErr) {
+		if isProviderUnavailable(err) {
 			status = http.StatusServiceUnavailable
 		} else if strings.Contains(err.Error(), "runtime not available") {
 			status = http.StatusServiceUnavailable
@@ -389,7 +460,7 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": record})
 }
 
-func drainManagedRunEvents(run *runtimeport.ManagedRun) {
+func drainManagedRunEvents(run *gateway.ManagedRun) {
 	if run == nil || run.Events == nil {
 		return
 	}
@@ -459,13 +530,13 @@ func (h *Handler) observeRunMetrics(runID string) {
 	}()
 }
 
-func (h *Handler) observeRunMetricEvent(event runtimeevents.EventRecord) {
+func (h *Handler) observeRunMetricEvent(event gateway.Event) {
 	if h == nil || h.metrics == nil {
 		return
 	}
 	switch event.Name {
 	case "tool.call.started":
-		if toolName := runtimeevents.ToolName(event); toolName != "" {
+		if toolName := eventToolName(event); toolName != "" {
 			h.metrics.IncToolCalls(toolName)
 		}
 	case "run.failed":
@@ -568,7 +639,7 @@ func (h *Handler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		"session": map[string]any{
 			"agent_id": agentID,
 			"id":       sessionID,
-			"history":  session.SerializeHistory(sess),
+			"history":  sess.History,
 			"events":   h.session.SessionEvents(agentID, sessionID),
 		},
 	})
@@ -693,58 +764,41 @@ func (h *Handler) handleRunTreeEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleJobList(w http.ResponseWriter, _ *http.Request) {
-	js := h.inventory.JobScheduler()
-	if js == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"jobs": []any{}})
+	jobs := h.inventory.ListJobs()
+	if len(jobs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": []gateway.Job{}})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": js.ListJobs()})
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 }
 
 func (h *Handler) handleJobPause(w http.ResponseWriter, r *http.Request) {
-	h.handleJobAction(w, chi.URLParam(r, "jobName"), func(js tools.JobScheduler) error {
-		return js.PauseJob(chi.URLParam(r, "jobName"))
-	})
+	h.handleJobAction(w, func() error { return h.inventory.PauseJob(chi.URLParam(r, "jobName")) })
 }
 
 func (h *Handler) handleJobResume(w http.ResponseWriter, r *http.Request) {
-	h.handleJobAction(w, chi.URLParam(r, "jobName"), func(js tools.JobScheduler) error {
-		return js.ResumeJob(chi.URLParam(r, "jobName"))
-	})
+	h.handleJobAction(w, func() error { return h.inventory.ResumeJob(chi.URLParam(r, "jobName")) })
 }
 
 func (h *Handler) handleJobRemove(w http.ResponseWriter, r *http.Request) {
-	h.handleJobAction(w, chi.URLParam(r, "jobName"), func(js tools.JobScheduler) error {
-		return js.RemoveJob(chi.URLParam(r, "jobName"))
-	})
+	h.handleJobAction(w, func() error { return h.inventory.RemoveJob(chi.URLParam(r, "jobName")) })
 }
 
 func (h *Handler) handleJobUpdateSchedule(w http.ResponseWriter, r *http.Request) {
-	js := h.inventory.JobScheduler()
-	if js == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job scheduler not available"})
-		return
-	}
-
 	var req updateJobScheduleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Schedule) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "schedule is required"})
 		return
 	}
-	if err := js.UpdateJobSchedule(chi.URLParam(r, "jobName"), strings.TrimSpace(req.Schedule)); err != nil {
+	if err := h.inventory.UpdateJobSchedule(chi.URLParam(r, "jobName"), strings.TrimSpace(req.Schedule)); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (h *Handler) handleJobAction(w http.ResponseWriter, _ string, action func(tools.JobScheduler) error) {
-	js := h.inventory.JobScheduler()
-	if js == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job scheduler not available"})
-		return
-	}
-	if err := action(js); err != nil {
+func (h *Handler) handleJobAction(w http.ResponseWriter, action func() error) {
+	if err := action(); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
@@ -787,7 +841,7 @@ func (h *Handler) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 			}
 			payload := map[string]any{
 				"time":    entry.Time.UTC().Format("2006-01-02T15:04:05.000000000Z07:00"),
-				"level":   entry.Level.String(),
+				"level":   entry.Level,
 				"message": entry.Message,
 				"attrs":   entry.Attrs,
 			}
@@ -852,26 +906,26 @@ func writeSSEJSON(w http.ResponseWriter, eventName string, payload any) error {
 	return err
 }
 
-func isTerminalStatus(status runtimeevents.RunStatus) bool {
-	return status == runtimeevents.RunStatusCompleted || status == runtimeevents.RunStatusFailed || status == runtimeevents.RunStatusAborted
+func isTerminalStatus(status gateway.RunStatus) bool {
+	return status == gateway.RunStatusCompleted || status == gateway.RunStatusFailed || status == gateway.RunStatusAborted
 }
 
-func isTerminalEvent(event runtimeevents.EventRecord) bool {
+func isTerminalEvent(event gateway.Event) bool {
 	return event.Name == "run.completed" || event.Name == "run.failed"
 }
 
-func parseMemoryLayers(raw string) []memory.Layer {
+func parseMemoryLayers(raw string) []gateway.MemoryLayer {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.EqualFold(raw, "all") {
-		return []memory.Layer{memory.LayerEpisodic, memory.LayerLongTerm, memory.LayerCandidates}
+		return []gateway.MemoryLayer{gateway.MemoryLayerEpisodic, gateway.MemoryLayerLongTerm, gateway.MemoryLayerCandidates}
 	}
 	parts := strings.Split(raw, ",")
-	layers := make([]memory.Layer, 0, len(parts))
-	seen := map[memory.Layer]struct{}{}
+	layers := make([]gateway.MemoryLayer, 0, len(parts))
+	seen := map[gateway.MemoryLayer]struct{}{}
 	for _, part := range parts {
-		layer := memory.Layer(strings.TrimSpace(part))
+		layer := gateway.MemoryLayer(strings.TrimSpace(part))
 		switch layer {
-		case memory.LayerCandidates, memory.LayerEpisodic, memory.LayerLongTerm:
+		case gateway.MemoryLayerCandidates, gateway.MemoryLayerEpisodic, gateway.MemoryLayerLongTerm:
 		default:
 			continue
 		}
@@ -882,15 +936,52 @@ func parseMemoryLayers(raw string) []memory.Layer {
 		layers = append(layers, layer)
 	}
 	if len(layers) == 0 {
-		return []memory.Layer{memory.LayerEpisodic, memory.LayerLongTerm, memory.LayerCandidates}
+		return []gateway.MemoryLayer{gateway.MemoryLayerEpisodic, gateway.MemoryLayerLongTerm, gateway.MemoryLayerCandidates}
 	}
 	return layers
+}
+
+func normalizeMemoryScope(scope gateway.MemoryScope) gateway.MemoryScope {
+	return gateway.MemoryScope{
+		AgentID:   strings.TrimSpace(scope.AgentID),
+		SessionID: strings.TrimSpace(scope.SessionID),
+	}
+}
+
+func normalizeMemoryMaxResults(maxResults, fallback int) int {
+	if fallback <= 0 {
+		fallback = 5
+	}
+	if maxResults <= 0 {
+		return fallback
+	}
+	return maxResults
+}
+
+func isProviderUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "provider") && strings.Contains(msg, "unavailable")
+}
+
+func eventToolName(event gateway.Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	for _, key := range []string{"tool", "name", "tool_name"} {
+		if value, ok := event.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (h *Handler) handleTaskList(w http.ResponseWriter, _ *http.Request) {
 	tasks := h.task.TaskList()
 	if len(tasks) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"tasks": []task.Info{}})
+		writeJSON(w, http.StatusOK, map[string]any{"tasks": []gateway.Task{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})

@@ -22,18 +22,52 @@ const (
 
 // ImageContent holds image data for multimodal messages.
 type ImageContent struct {
+	ID       string // stable image/attachment identifier when persisted
+	Name     string // original or generated filename when available
 	MimeType string // "image/jpeg", "image/png", etc.
+	Path     string // persisted local asset path when available
+	Size     int    // byte size when known
 	Data     []byte // raw image bytes
 }
 
+const (
+	MessageRoleUser      = "user"
+	MessageRoleAssistant = "assistant"
+	MessageRoleSystem    = "system"
+	// MessageRoleDeveloper carries runtime-authored instructions that should
+	// be treated as control context rather than a user turn when a provider
+	// supports that distinction.
+	MessageRoleDeveloper = "developer"
+	// MessageRoleRuntime is an internal role for one-shot runtime directives.
+	// Provider adapters map it to the closest supported control role.
+	MessageRoleRuntime = "runtime"
+)
+
 // Message represents a conversation message.
 type Message struct {
-	Role       string         `json:"role"` // "user", "assistant", "system"
+	Role       string         `json:"role"` // user, assistant, system, developer, runtime
 	Content    string         `json:"content,omitempty"`
 	Images     []ImageContent `json:"-"` // image attachments (not serialized)
 	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"` // for tool results
 	IsError    bool           `json:"is_error,omitempty"`     // for tool results
+}
+
+func IsUserRole(role string) bool {
+	return strings.TrimSpace(role) == MessageRoleUser
+}
+
+func IsAssistantRole(role string) bool {
+	return strings.TrimSpace(role) == MessageRoleAssistant
+}
+
+func IsControlRole(role string) bool {
+	switch strings.TrimSpace(role) {
+	case MessageRoleSystem, MessageRoleDeveloper, MessageRoleRuntime:
+		return true
+	default:
+		return false
+	}
 }
 
 // ToolCall represents a tool invocation requested by the LLM.

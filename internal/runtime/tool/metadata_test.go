@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,4 +94,20 @@ func TestBrowserToolTimeoutHintForInputUsesRequestedTimeout(t *testing.T) {
 	timeout, ok := tool.TimeoutHintForInput(json.RawMessage(`{"action":"navigate","url":"https://example.com","timeout":25}`), 0)
 	require.True(t, ok)
 	assert.Equal(t, 25*time.Second, timeout)
+}
+
+func TestWebSearchToolDeclaresThirtySecondTimeout(t *testing.T) {
+	meta := DescribeToolMetadata(&WebSearchTool{})
+
+	assert.Equal(t, int64(WebSearchTimeout/time.Millisecond), meta.TimeoutHintMS)
+}
+
+func TestRecoveryHintsWriteFileMalformedInputSuggestsProcessFallback(t *testing.T) {
+	moves := RecoveryHints("write_file", "validation_error", "invalid input: unexpected end of JSON input")
+	joined := strings.Join(moves, "\n")
+
+	assert.Contains(t, joined, "not valid JSON")
+	assert.Contains(t, joined, "mode=append")
+	assert.Contains(t, joined, "expected_offset")
+	assert.Contains(t, joined, "mode=patch")
 }

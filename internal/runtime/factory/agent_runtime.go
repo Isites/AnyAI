@@ -2,7 +2,6 @@ package factory
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"github.com/Isites/anyai/internal/runtime/agent"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	"github.com/Isites/anyai/internal/runtime/llm"
+	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/Isites/anyai/internal/runtime/session"
 	"github.com/Isites/anyai/internal/runtime/skill"
@@ -92,9 +92,6 @@ func BuildAgentRuntimeFromDeps(
 	}
 
 	agentCfg := resolved.Agent
-	if extras.AssistantOutput == nil {
-		extras.AssistantOutput = sessionAssistantOutputProvider{sess: sess}
-	}
 
 	var agentSkills *skill.Loader
 	if deps.Resources != nil {
@@ -115,6 +112,24 @@ func BuildAgentRuntimeFromDeps(
 	goalRuntime := task.NewGoalRuntime(sess, deps.TaskRuntime, agentCfg.MaxTurns)
 	if extras.GoalManager == nil {
 		extras.GoalManager = goalManagerAdapter{runtime: goalRuntime}
+	}
+	mcpManager := tools.MCPManager(nil)
+	if extras.MCPManager != nil {
+		mcpManager = extras.MCPManager
+	}
+	if mcpManager == nil && deps.Resources != nil && deps.Resources.MCPs() != nil {
+		mcpManager = deps.Resources.MCPs().ManagerForAgent(agentCfg.ID)
+	}
+	if mcpManager != nil && len(extras.MCPTools) == 0 {
+		mcpTools, err := mcpManager.ListTools(context.Background())
+		if err != nil {
+			runtimelogging.Warn("some mcp tools could not be loaded", "agent", agentCfg.ID, "error", err)
+		}
+		if deps.Resources != nil && deps.Resources.MCPs() != nil {
+			deps.Resources.MCPs().SetToolsForAgent(agentCfg.ID, mcpTools)
+		}
+		extras.MCPManager = mcpManager
+		extras.MCPTools = mcpTools
 	}
 
 	executor := tools.ExecutorForAgentWithExtras(
@@ -183,6 +198,14 @@ func BuildAgentRuntimeFromDeps(
 		TaskRuntime:   deps.TaskRuntime,
 		GoalRuntime:   goalRuntime,
 	}
+	if mcpManager != nil {
+		rt.Hooks.AgentEnd = append(rt.Hooks.AgentEnd, func(context.Context, agent.AgentEndState) error {
+			if err := mcpManager.Close(); err != nil {
+				runtimelogging.Warn("failed to close mcp manager", "agent", agentCfg.ID, "error", err)
+			}
+			return nil
+		})
+	}
 	if deps.RuntimeConfigurer != nil {
 		if err := deps.RuntimeConfigurer.ConfigureAgentRuntime(rt); err != nil {
 			return nil, err
@@ -232,10 +255,6 @@ func runtimeAgentsRootDir(cfg *config.Config) string {
 	return dir
 }
 
-type sessionAssistantOutputProvider struct {
-	sess *session.Session
-}
-
 type goalManagerAdapter struct {
 	runtime *task.GoalRuntime
 }
@@ -257,28 +276,6 @@ func (a goalManagerAdapter) AwaitUserInput(_ context.Context, goalID, message st
 		return fmt.Errorf("goal runtime is not available")
 	}
 	return a.runtime.AwaitUserInput(task.GoalID(strings.TrimSpace(goalID)), strings.TrimSpace(message))
-}
-
-func (p sessionAssistantOutputProvider) LatestAssistantMessageText() (string, bool) {
-	if p.sess == nil {
-		return "", false
-	}
-	history := p.sess.History()
-	for i := len(history) - 1; i >= 0; i-- {
-		entry := history[i]
-		if entry.Type != session.EntryTypeMessage || entry.Role != "assistant" {
-			continue
-		}
-		var data session.MessageData
-		if err := json.Unmarshal(entry.Data, &data); err != nil {
-			return "", false
-		}
-		if strings.TrimSpace(data.Text) == "" {
-			continue
-		}
-		return data.Text, true
-	}
-	return "", false
 }
 
 func runtimeConfigPath(cfg *config.Config) string {

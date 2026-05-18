@@ -148,7 +148,7 @@ func (t *BrowserTool) navigateIfNeeded(ctx context.Context, url string) error {
 	if url == "" {
 		return nil
 	}
-	if err := validateURLNotInternal(url); err != nil {
+	if err := validateBrowserURL(url); err != nil {
 		return err
 	}
 	return chromedp.Run(ctx,
@@ -164,6 +164,9 @@ func (t *BrowserTool) navigate(ctx context.Context, in browserInput) (ToolResult
 	}
 	if !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {
 		return ToolResult{Error: "url must start with http:// or https://"}, nil
+	}
+	if err := validateBrowserURL(in.URL); err != nil {
+		return ToolResult{Error: fmt.Sprintf("navigate failed: %v", err)}, nil
 	}
 
 	var title string

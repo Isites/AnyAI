@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"github.com/Isites/anyai/internal/config"
-	runtimeresources "github.com/Isites/anyai/internal/runtime/resources"
-	tools "github.com/Isites/anyai/internal/runtime/tool"
 )
 
 func (s *Service) Agents() []config.AgentConfig {
@@ -14,20 +12,72 @@ func (s *Service) Agents() []config.AgentConfig {
 	return rt.Agents()
 }
 
-func (s *Service) Resources() *runtimeresources.Catalog {
+func (s *Service) ResourceCatalog() ResourceCatalog {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
-		return nil
+		return ResourceCatalog{}
 	}
-	return rt.Resources()
+	return gatewayResourceCatalog(rt.Resources())
 }
 
-func (s *Service) JobScheduler() tools.JobScheduler {
+func (s *Service) ListJobs() []Job {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	return rt.JobScheduler()
+	js := rt.JobScheduler()
+	if js == nil {
+		return nil
+	}
+	return gatewayJobs(js.ListJobs())
+}
+
+func (s *Service) PauseJob(name string) error {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return err
+	}
+	js := rt.JobScheduler()
+	if js == nil {
+		return nil
+	}
+	return js.PauseJob(name)
+}
+
+func (s *Service) ResumeJob(name string) error {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return err
+	}
+	js := rt.JobScheduler()
+	if js == nil {
+		return nil
+	}
+	return js.ResumeJob(name)
+}
+
+func (s *Service) RemoveJob(name string) error {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return err
+	}
+	js := rt.JobScheduler()
+	if js == nil {
+		return nil
+	}
+	return js.RemoveJob(name)
+}
+
+func (s *Service) UpdateJobSchedule(name, schedule string) error {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return err
+	}
+	js := rt.JobScheduler()
+	if js == nil {
+		return nil
+	}
+	return js.UpdateJobSchedule(name, schedule)
 }
 
 func (s *Service) EventStorageDir() string {

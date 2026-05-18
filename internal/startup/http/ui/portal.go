@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/Isites/anyai/internal/config"
-	"github.com/Isites/anyai/internal/runtime/logging"
+	"github.com/Isites/anyai/internal/gateway"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -16,7 +16,7 @@ type Plane interface {
 	ConfigSnapshot() *config.Config
 	SaveConfig(raw []byte) error
 	LogEntriesPayload(limit int) []map[string]any
-	SubscribeLogs() (<-chan logging.LogEntry, func())
+	SubscribeLogs() (<-chan gateway.LogEntry, func())
 }
 
 type Portal struct {
@@ -127,7 +127,7 @@ func (p *Portal) streamLogs(w http.ResponseWriter, r *http.Request) {
 			}
 			payload := map[string]any{
 				"time":    entry.Time.UTC().Format("2006-01-02T15:04:05.000000000Z07:00"),
-				"level":   entry.Level.String(),
+				"level":   entry.Level,
 				"message": entry.Message,
 				"attrs":   entry.Attrs,
 			}

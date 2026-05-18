@@ -47,7 +47,7 @@ func (s *RunView) ListRuns() []runtimeevents.RunRecord {
 	return recorder.ListRuns()
 }
 
-func (s *RunView) ListRunEvents(runID string) []runtimeevents.EventRecord {
+func (s *RunView) ListRawRunEvents(runID string) []runtimeevents.EventRecord {
 	recorder := s.Recorder()
 	if recorder == nil {
 		return nil
@@ -55,7 +55,7 @@ func (s *RunView) ListRunEvents(runID string) []runtimeevents.EventRecord {
 	return recorder.ListRunEvents(runID)
 }
 
-func (s *RunView) SubscribeRun(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *RunView) SubscribeRawRun(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
 	recorder := s.Recorder()
 	if recorder == nil {
 		return nil, nil, fmt.Errorf("run projection recorder not available")
@@ -64,7 +64,7 @@ func (s *RunView) SubscribeRun(runID string) (<-chan runtimeevents.EventRecord, 
 	return ch, cancel, nil
 }
 
-func (s *RunView) GetRunTree(runID string) (runtimeevents.RunTreeRecord, bool) {
+func (s *RunView) GetRawRunTree(runID string) (runtimeevents.RunTreeRecord, bool) {
 	recorder := s.Recorder()
 	if recorder == nil {
 		return runtimeevents.RunTreeRecord{}, false
@@ -72,7 +72,7 @@ func (s *RunView) GetRunTree(runID string) (runtimeevents.RunTreeRecord, bool) {
 	return recorder.GetRunTree(runID)
 }
 
-func (s *RunView) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
+func (s *RunView) RawRunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	recorder := s.Recorder()
 	if recorder == nil {
 		return nil, false
@@ -80,7 +80,7 @@ func (s *RunView) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	return recorder.RunTree(runID)
 }
 
-func (s *RunView) SubscribeRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *RunView) SubscribeRawRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
 	recorder := s.Recorder()
 	if recorder == nil {
 		return nil, nil, fmt.Errorf("run projection recorder not available")

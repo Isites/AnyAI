@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -29,8 +27,12 @@ type runController struct {
 	currentTurn     int
 	goalID          task.GoalID
 
-	goalCompletionPrompted bool
-	lastTurnVisibleReply   bool
+	goalCompletionPrompted   bool
+	goalCompletionEmptyTurns int
+	lastTurnVisibleReply     bool
+	awaitingVisibleReply     bool
+	pendingRuntimeControlID  string
+	backgroundProcesses      *tools.BackgroundProcessManager
 
 	finishOnce sync.Once
 }
@@ -40,14 +42,17 @@ func newRunController(rt *Runtime, ctx context.Context, userMsg string, events c
 	if maxTurns == 0 {
 		maxTurns = defaultRuntimeMaxTurns
 	}
+	backgroundProcesses := tools.NewBackgroundProcessManager()
+	ctx = tools.WithBackgroundProcessManager(ctx, backgroundProcesses)
 	return &runController{
-		rt:        rt,
-		ctx:       ctx,
-		userMsg:   userMsg,
-		events:    events,
-		maxTurns:  maxTurns,
-		toolNames: normalizeToolNames(rt.Tools.Names()),
-		loopState: newToolLoopState(),
+		rt:                  rt,
+		ctx:                 ctx,
+		userMsg:             userMsg,
+		events:              events,
+		maxTurns:            maxTurns,
+		toolNames:           normalizeToolNames(rt.Tools.Names()),
+		loopState:           newToolLoopState(),
+		backgroundProcesses: backgroundProcesses,
 	}
 }
 
@@ -72,19 +77,20 @@ func (c *runController) appendUserMessage(images []llm.ImageContent) {
 	if c == nil || c.rt == nil || c.rt.Session == nil {
 		return
 	}
+	messageID := strings.TrimSpace(tools.RuntimeContextFrom(c.ctx).InputMessageID)
 	if len(images) == 0 {
-		c.rt.Session.Append(session.UserMessageEntry(c.userMsg))
+		c.rt.Session.Append(session.UserMessageEntryWithID(messageID, c.userMsg))
 		return
 	}
 
-	imgData := make([]session.ImageData, 0, len(images))
-	for _, img := range images {
-		imgData = append(imgData, session.ImageData{
-			MimeType: img.MimeType,
-			Data:     base64.StdEncoding.EncodeToString(img.Data),
-		})
+	if refs := session.ImageRefsFromBlocks(tools.RuntimeInputBlocksFrom(c.ctx)); len(refs) > 0 {
+		c.rt.Session.Append(session.UserMessageWithImagesEntryWithID(messageID, c.userMsg, refs))
+		return
 	}
-	c.rt.Session.Append(session.UserMessageWithImagesEntry(c.userMsg, imgData))
+	c.rt.Session.AppendWithPersistedEntry(
+		session.UserMessageWithImagesEntryWithID(messageID, c.userMsg, session.ImagePayloads(images)),
+		session.UserMessageWithImagesEntryWithID(messageID, c.userMsg, session.ImageRefs(images)),
+	)
 }
 
 func (c *runController) buildChatRequest(
@@ -101,7 +107,7 @@ func (c *runController) buildChatRequest(
 	turnMeta := tools.RuntimeContextFrom(turnCtx)
 	turnCtx = tools.WithRuntimeContext(turnCtx, turnMeta)
 	history := c.rt.Session.History()
-	if !historyEndsWithRuntimeControlPrompt(history) {
+	if !session.HistoryEndsWithRuntimeControl(history) {
 		if err := c.rt.maybeCompactSession(turnCtx); err != nil {
 			return turnCtx, llm.ChatRequest{}, err
 		}
@@ -159,7 +165,10 @@ func (c *runController) buildChatRequest(
 	}
 
 	history = c.rt.Session.History()
-	prepared := prepareTranscript(assembleMessages(history), c.rt.transcriptPolicy())
+	runtimeDirective := c.takePendingRuntimeControlText(history)
+	prepared := newTranscriptBuilder(history, c.rt.transcriptPolicy()).
+		WithRuntimeDirective(runtimeDirective).
+		Build()
 	msgs := prepared.Messages
 	if prepared.SummaryContext != "" && dynamicPromptContext.Retrieval.SessionSummary == "" {
 		dynamicPromptContext.Retrieval.SessionSummary = prepared.SummaryContext
@@ -232,10 +241,31 @@ func (c *runController) runTurn(turn int) {
 	}
 	c.lastTurnVisibleReply = strings.TrimSpace(textContent.String()) != ""
 	if len(toolCalls) == 0 {
+		if c.awaitingVisibleReply {
+			if !c.lastTurnVisibleReply {
+				c.finish(AgentEvent{
+					Type:  EventError,
+					Error: fmt.Errorf("model ended without a visible reply after tool work"),
+				})
+				return
+			}
+			c.awaitingVisibleReply = false
+			c.finish(AgentEvent{Type: EventDone})
+			return
+		}
+		if c.shouldRequestVisibleReplyAfterTools(turn) {
+			c.awaitingVisibleReply = true
+			c.appendRuntimeControl(runtimeControlKindVisibleReply, c.buildVisibleReplyPrompt())
+			c.runTurn(turn + 1)
+			return
+		}
+		c.awaitingVisibleReply = false
 		c.finish(AgentEvent{Type: EventDone})
 		return
 	}
+	c.awaitingVisibleReply = false
 	c.goalCompletionPrompted = false
+	c.goalCompletionEmptyTurns = 0
 	if c.rt.GoalRuntime != nil && c.goalID != "" {
 		c.rt.GoalRuntime.RecordToolCalls(c.goalID, len(toolCalls))
 	}
@@ -246,7 +276,7 @@ func (c *runController) runTurn(turn int) {
 		if !meta.IsReadOnly() {
 			progress.SideEffectRisk = true
 		}
-		c.rt.Session.Append(session.ToolCallEntry(tc.ID, tc.Name, tools.SanitizeRawJSON(tc.Input)))
+		c.rt.Session.Append(session.ToolCallEntry(tc.ID, tc.Name, tools.SanitizeToolInputForTranscript(tc.Name, tc.Input)))
 	}
 
 	toolWriter := newAgentEventWriter(c.events)
@@ -305,9 +335,28 @@ func (c *runController) handleToolBatchCompletion(
 		c.finish(AgentEvent{Type: EventAborted})
 		return
 	}
-	if onlyInlineGoalTools && c.goalAlreadyCompleted() {
+	if onlyInlineGoalTools && (c.goalAlreadyCompleted() || c.goalAwaitingUserInput()) {
+		if c.goalAlreadyCompleted() && !c.lastTurnVisibleReply {
+			if turn+1 >= c.maxTurns {
+				c.finish(AgentEvent{
+					Type:  EventError,
+					Error: fmt.Errorf("goal completed without a visible reply"),
+				})
+				return
+			}
+			c.awaitingVisibleReply = true
+			c.appendRuntimeControl(runtimeControlKindVisibleReply, c.buildVisibleReplyPrompt())
+			c.runTurn(turn + 1)
+			return
+		}
+		if c.goalAwaitingUserInput() && !c.lastTurnVisibleReply {
+			c.surfaceAwaitingUserInput()
+		}
 		c.finish(AgentEvent{Type: EventDone})
 		return
+	}
+	if !onlyInlineGoalTools {
+		c.awaitingVisibleReply = false
 	}
 
 	c.runTurn(turn + 1)
@@ -340,6 +389,9 @@ func (c *runController) finalize(ev AgentEvent) {
 		return
 	}
 	c.finishOnce.Do(func() {
+		if c.backgroundProcesses != nil {
+			c.backgroundProcesses.Cleanup()
+		}
 		if ev.Type == EventError || ev.Type == EventAborted {
 			c.rt.guardSessionToolResults(toolGuardReasonForEvent(ev))
 		}
@@ -381,6 +433,36 @@ func (c *runController) goalAlreadyCompleted() bool {
 	return current.State == task.GoalStateCompleted
 }
 
+func (c *runController) goalAwaitingUserInput() bool {
+	if c == nil || c.rt == nil || c.rt.GoalRuntime == nil || c.goalID == "" {
+		return false
+	}
+	current, ok := c.rt.GoalRuntime.GetGoal(c.goalID)
+	if !ok || current == nil {
+		return false
+	}
+	return current.State == task.GoalStateAwaitingInput
+}
+
+func (c *runController) surfaceAwaitingUserInput() {
+	if c == nil || c.rt == nil || c.rt.GoalRuntime == nil || c.goalID == "" {
+		return
+	}
+	current, ok := c.rt.GoalRuntime.GetGoal(c.goalID)
+	if !ok || current == nil || current.State != task.GoalStateAwaitingInput {
+		return
+	}
+	message := strings.TrimSpace(current.AwaitingInputMessage)
+	if message == "" {
+		message = "I need more information from you before I can continue."
+	}
+	if c.rt.Session != nil {
+		c.rt.Session.Append(session.AssistantMessageEntry(message))
+	}
+	c.emit(AgentEvent{Type: EventTextDelta, Text: message})
+	c.lastTurnVisibleReply = true
+}
+
 func batchContainsOnlyInlineGoalTools(summary tools.ToolBatchSummary) bool {
 	if len(summary.Calls) == 0 {
 		return false
@@ -393,18 +475,29 @@ func batchContainsOnlyInlineGoalTools(summary tools.ToolBatchSummary) bool {
 	return true
 }
 
-func historyEndsWithRuntimeControlPrompt(history []session.SessionEntry) bool {
-	if len(history) == 0 {
+func (c *runController) shouldRequestVisibleReplyAfterTools(turn int) bool {
+	if c == nil {
 		return false
 	}
-	last := history[len(history)-1]
-	if last.Type != session.EntryTypeMessage || last.Role != "user" {
+	if c.lastTurnVisibleReply || !c.hadToolActivity || c.awaitingVisibleReply {
 		return false
 	}
-	var data session.MessageData
-	if err := json.Unmarshal(last.Data, &data); err != nil {
+	if c.rt != nil && c.rt.Tools != nil {
+		if _, ok := c.rt.Tools.Get("goal_complete"); ok {
+			return false
+		}
+	}
+	if c.goalID != "" && c.rt != nil && c.rt.Tools == nil {
 		return false
 	}
-	text := strings.TrimSpace(data.Text)
-	return strings.HasPrefix(text, "[Runtime goal continuation]") || strings.HasPrefix(text, "[Runtime hard stop]")
+	return turn+1 < c.maxTurns
+}
+
+func (c *runController) buildVisibleReplyPrompt() string {
+	return strings.Join([]string{
+		"[Runtime visible reply required]",
+		"The previous turn completed tool work but produced no visible assistant text for the user.",
+		"Write a concise user-facing summary of what happened and the next state now.",
+		"Do not call more tools unless they are objectively required to finish the user's request.",
+	}, "\n")
 }

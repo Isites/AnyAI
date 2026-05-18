@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/task"
@@ -40,12 +41,13 @@ func (e *ToolExecutor) Execute(ctx context.Context, taskRecord task.Record) (tas
 }
 
 func (e *ToolExecutor) executeToolCall(ctx context.Context, taskRecord task.Record) (tools.ToolResult, error) {
+	toolCallID := taskToolCallID(taskRecord)
 	toolCall := llm.ToolCall{
-		ID:   taskRecord.ID,
+		ID:   toolCallID,
 		Name: taskRecord.ToolName,
 	}
-	if taskRecord.Input != "" {
-		toolCall.Input = json.RawMessage(taskRecord.Input)
+	if raw := taskToolRawInput(ctx, taskRecord, toolCallID); raw != "" {
+		toolCall.Input = json.RawMessage(raw)
 	}
 
 	executor := e.resolveExecutor(ctx)
@@ -63,6 +65,20 @@ func (e *ToolExecutor) executeToolCall(ctx context.Context, taskRecord task.Reco
 		result, err = executor.Execute(ctx, toolCall.Name, toolCall.Input)
 	}
 	return tools.SanitizeToolResult(result), err
+}
+
+func taskToolRawInput(ctx context.Context, taskRecord task.Record, toolCallID string) string {
+	if raw, ok := tools.RawToolInputFromContext(ctx, toolCallID); ok {
+		return string(raw)
+	}
+	return taskRecord.Input
+}
+
+func taskToolCallID(taskRecord task.Record) string {
+	if id, ok := taskRecord.Metadata["tool_call_id"].(string); ok && strings.TrimSpace(id) != "" {
+		return strings.TrimSpace(id)
+	}
+	return taskRecord.ID
 }
 
 func (e *ToolExecutor) resolveExecutor(ctx context.Context) tools.Executor {

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	runtimeactivity "github.com/Isites/anyai/internal/runtime/activity"
@@ -66,7 +65,7 @@ func fatalToolExecutionResult(call llm.ToolCall, err error) tools.ToolResult {
 			"error_class":          errorClass,
 			"auto_retryable":       autoRetryable,
 			"model_recoverable":    modelRecoverable,
-			"suggested_next_moves": suggestedNextMoves(call.Name, errorClass),
+			"suggested_next_moves": tools.RecoveryHints(call.Name, errorClass, message),
 			"decision":             decision,
 			"fatal_execution_err":  !(modelRecoverable && errorClass == "validation_error"),
 		},
@@ -138,20 +137,24 @@ func (r *Runtime) appendToolBatchResults(outcomes []tools.ToolCallOutcome) {
 		if outcome.Error != nil && strings.TrimSpace(outcome.Result.Error) == "" && len(outcome.Result.Metadata) == 0 {
 			continue
 		}
-		var imgData []session.ImageData
-		for _, img := range outcome.Result.Images {
-			imgData = append(imgData, session.ImageData{
-				MimeType: img.MimeType,
-				Data:     base64.StdEncoding.EncodeToString(img.Data),
-			})
-		}
-		r.Session.Append(session.ToolResultEntryWithMetadata(
+		entry := session.ToolResultEntryWithMetadata(
 			outcome.Call.ID,
 			outcome.Result.Output,
 			outcome.Result.Error,
 			outcome.Result.Metadata,
-			imgData,
-		))
+			session.ImagePayloads(outcome.Result.Images),
+		)
+		if len(outcome.Result.Images) > 0 {
+			r.Session.AppendWithPersistedEntry(entry, session.ToolResultEntryWithMetadata(
+				outcome.Call.ID,
+				outcome.Result.Output,
+				outcome.Result.Error,
+				outcome.Result.Metadata,
+				session.ImageRefs(outcome.Result.Images),
+			))
+		} else {
+			r.Session.Append(entry)
+		}
 	}
 }
 
@@ -216,6 +219,7 @@ func (r *Runtime) submitToolTask(
 
 	meta := tools.RuntimeContextFrom(ctx)
 	taskCtx := tools.WithExecutorContext(withParentActivityBridge(ctx, emit), r.Tools)
+	taskCtx = tools.WithRawToolInput(taskCtx, call.ID, call.Input)
 	taskCtx = tools.WithTaskToolExecution(taskCtx, func(execCtx context.Context, taskCall llm.ToolCall) (tools.ToolResult, error) {
 		result, err := r.executeToolWithRecovery(execCtx, taskCall, emit, loopState, turn)
 		if err != nil {
@@ -632,7 +636,7 @@ func synthesizeFailedToolTaskRecord(spec tools.ToolCallSpec, result tools.ToolRe
 		ID:          spec.Call.ID,
 		Kind:        task.KindTool,
 		Status:      task.StatusFailed,
-		Input:       string(tools.SanitizeRawJSON(spec.Call.Input)),
+		Input:       string(tools.SanitizeToolInputForTranscript(spec.Call.Name, spec.Call.Input)),
 		ToolName:    spec.Call.Name,
 		Summary:     strings.TrimSpace(result.Output),
 		Error:       strings.TrimSpace(message),
@@ -660,7 +664,7 @@ func workflowToolRecord(spec tools.ToolCallSpec, result tools.ToolResult, execEr
 		ID:             firstNonEmpty(spec.Call.ID, tools.NewOpaqueID("workflow_tool")),
 		Kind:           task.KindTool,
 		Status:         status,
-		Input:          string(tools.SanitizeRawJSON(spec.Call.Input)),
+		Input:          string(tools.SanitizeToolInputForTranscript(spec.Call.Name, spec.Call.Input)),
 		ToolName:       spec.Call.Name,
 		Summary:        strings.TrimSpace(result.Output),
 		Error:          errText,
@@ -727,7 +731,7 @@ func (r *Runtime) taskSpecForCall(meta tools.RuntimeContext, call llm.ToolCall, 
 		RunID:         meta.RunID,
 		SessionID:     firstNonEmpty(meta.SessionID, sessionIDFromRuntime(r)),
 		IdleTimeoutMS: idleTimeoutMS,
-		Input:         string(tools.SanitizeRawJSON(call.Input)),
+		Input:         string(tools.SanitizeToolInputForTranscript(call.Name, call.Input)),
 		ToolName:      call.Name,
 		Metadata: map[string]any{
 			"tool_call_id":             call.ID,

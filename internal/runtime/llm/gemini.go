@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"google.golang.org/genai"
 )
@@ -68,9 +69,14 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 
 	// Build contents
 	var contents []*genai.Content
+	var runtimeDirectives []string
 	for _, m := range req.Messages {
 		switch m.Role {
-		case "user":
+		case MessageRoleRuntime, MessageRoleDeveloper, MessageRoleSystem:
+			if strings.TrimSpace(m.Content) != "" {
+				runtimeDirectives = append(runtimeDirectives, strings.TrimSpace(m.Content))
+			}
+		case MessageRoleUser:
 			if m.ToolCallID != "" {
 				// Tool result — send as function response
 				funcName := m.ToolCallID
@@ -111,7 +117,7 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 					Parts: parts,
 				})
 			}
-		case "assistant":
+		case MessageRoleAssistant:
 			var parts []*genai.Part
 			if m.Content != "" {
 				parts = append(parts, genai.NewPartFromText(m.Content))
@@ -165,7 +171,10 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 	config := &genai.GenerateContentConfig{}
 
 	if req.SystemPrompt != "" {
-		config.SystemInstruction = genai.NewContentFromText(req.SystemPrompt, "user")
+		runtimeDirectives = append([]string{req.SystemPrompt}, runtimeDirectives...)
+	}
+	if len(runtimeDirectives) > 0 {
+		config.SystemInstruction = genai.NewContentFromText(strings.Join(runtimeDirectives, "\n\n"), "user")
 	}
 
 	if req.MaxTokens > 0 {

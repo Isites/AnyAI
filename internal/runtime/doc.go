@@ -8,7 +8,7 @@
 //     maintenance commands.
 //   - MemoryService wraps memory reads and scoped search.
 //
-// The package implements runtimeport.Runtime, but transport-facing packages
-// should usually go through gateway so replay, routing, and channel concerns
-// stay outside the execution core.
+// The package implements runtimeport.Runtime. Transport-facing packages should
+// usually go through gateway so routing, DTO, and channel concerns stay outside
+// the execution core.
 package runtime

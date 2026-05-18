@@ -75,6 +75,17 @@ func SerializeHistory(sess *Session) []map[string]any {
 				"trigger":          compact.Trigger,
 				"legacy_heuristic": compact.LegacyHeuristic,
 			})
+		case EntryTypeRuntimeControl:
+			var control RuntimeControlData
+			if err := json.Unmarshal(entry.Data, &control); err != nil {
+				continue
+			}
+			entries = append(entries, map[string]any{
+				"type": "runtime_control",
+				"role": entry.Role,
+				"kind": control.Kind,
+				"text": control.Text,
+			})
 		case EntryTypePlan:
 			var plan PlanData
 			if err := json.Unmarshal(entry.Data, &plan); err != nil {

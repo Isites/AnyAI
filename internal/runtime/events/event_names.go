@@ -50,10 +50,12 @@ const (
 )
 
 const (
-	EventSessionCompactRequested = "session.compact.requested"
-	EventSessionCompactCompleted = "session.compact.completed"
-	EventSessionInputStored      = "session.input.stored"
-	EventSessionOutputStored     = "session.output.stored"
+	EventSessionCompactRequested     = "session.compact.requested"
+	EventSessionCompactCompleted     = "session.compact.completed"
+	EventSessionRuntimeControlStored = "session.runtime_control.stored"
+	EventSessionInputStored          = "session.input.stored"
+	EventSessionOutputStored         = "session.output.stored"
+	EventSessionMetaStored           = "session.meta.stored"
 )
 
 const (

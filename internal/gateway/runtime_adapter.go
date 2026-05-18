@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Isites/anyai/internal/runtime/input"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 )
 
@@ -19,30 +18,49 @@ func runtimeChatType(chatType ChatType) runtimeport.ChatType {
 	}
 }
 
-func ingressRequestForInboundMessage(channelName string, msg InboundMessage) runtimeport.IngressRequest {
+func gatewayChatType(chatType runtimeport.ChatType) ChatType {
+	switch chatType {
+	case runtimeport.ChatTypeGroup:
+		return ChatTypeGroup
+	case runtimeport.ChatTypeDirect:
+		fallthrough
+	default:
+		return ChatTypeDirect
+	}
+}
+
+func (s *Service) RuntimeIngressResolver() runtimeport.IngressAgentResolver {
+	return func(req runtimeport.IngressRequest) string {
+		return s.ResolveIngressAgent(gatewayIngressRequest(req))
+	}
+}
+
+func ingressRequestForInboundMessage(channelName string, msg InboundMessage) IngressRequest {
 	sessionID := sessionIDForInboundMessage(channelName, msg)
-	envelope := envelopeFromInboundMessage(msg, sessionID)
-	return runtimeport.IngressRequest{
+	blocks := inputBlocksFromInboundMessage(msg)
+	return IngressRequest{
 		Channel:   strings.TrimSpace(channelName),
 		SenderID:  strings.TrimSpace(msg.SenderID),
 		AccountID: strings.TrimSpace(msg.AccountID),
-		ChatType:  runtimeChatType(msg.ChatType),
-		Envelope:  envelope,
+		ChatType:  msg.ChatType,
+		Text:      msg.Text,
+		MessageID: strings.TrimSpace(msg.MessageID),
+		Inputs:    blocks,
 		SessionID: sessionID,
 	}
 }
 
-func envelopeFromInboundMessage(msg InboundMessage, sessionID string) input.InputEnvelope {
-	blocks := make([]input.InputBlock, 0, len(msg.Blocks)+len(msg.Media)+1)
+func inputBlocksFromInboundMessage(msg InboundMessage) []InputBlock {
+	blocks := make([]InputBlock, 0, len(msg.Blocks)+len(msg.Media)+1)
 	if strings.TrimSpace(msg.Text) != "" {
-		blocks = append(blocks, input.InputBlock{Type: "text", Text: msg.Text})
+		blocks = append(blocks, InputBlock{Type: "text", Text: msg.Text})
 	}
 	for _, media := range msg.Media {
 		blockType := mediaAttachmentBlockType(media)
 		if blockType == "" {
 			continue
 		}
-		blocks = append(blocks, input.InputBlock{
+		blocks = append(blocks, InputBlock{
 			Type:     blockType,
 			Name:     media.FileName,
 			MimeType: media.MimeType,
@@ -52,13 +70,13 @@ func envelopeFromInboundMessage(msg InboundMessage, sessionID string) input.Inpu
 	if len(msg.Blocks) > 0 {
 		blocks = append(blocks, msg.Blocks...)
 	}
-	return input.InputEnvelope{
-		SessionID: strings.TrimSpace(sessionID),
-		Blocks:    blocks,
-	}
+	return blocks
 }
 
 func sessionIDForInboundMessage(channelName string, msg InboundMessage) string {
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+		return sessionID
+	}
 	conversationID := sanitizeSessionIDPart(firstNonEmpty(strings.TrimSpace(msg.AccountID), strings.TrimSpace(msg.SenderID)))
 	if msg.ChatType == ChatTypeGroup {
 		return fmt.Sprintf("%s_group_%s", strings.TrimSpace(channelName), conversationID)

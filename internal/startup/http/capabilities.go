@@ -4,13 +4,11 @@ import (
 	"sort"
 
 	"github.com/Isites/anyai/internal/config"
-	runtimeresources "github.com/Isites/anyai/internal/runtime/resources"
-	"github.com/Isites/anyai/internal/runtime/tool"
+	"github.com/Isites/anyai/internal/gateway"
 )
 
 type agentInventoryView struct {
 	Agents       []agentCapabilityView `json:"agents"`
-	SystemSkills []skillCapabilityView `json:"system_skills,omitempty"`
 	SharedSkills []skillCapabilityView `json:"shared_skills,omitempty"`
 	Notes        []string              `json:"notes,omitempty"`
 }
@@ -44,13 +42,12 @@ type toolPolicyView struct {
 }
 
 type toolCapabilityView struct {
-	Name        string             `json:"name"`
-	Description string             `json:"description,omitempty"`
-	Metadata    tools.ToolMetadata `json:"metadata"`
+	Name        string               `json:"name"`
+	Description string               `json:"description,omitempty"`
+	Metadata    gateway.ToolMetadata `json:"metadata"`
 }
 
 type skillBundleView struct {
-	System    []skillCapabilityView `json:"system,omitempty"`
 	Shared    []skillCapabilityView `json:"shared,omitempty"`
 	Private   []skillCapabilityView `json:"private,omitempty"`
 	Effective []skillCapabilityView `json:"effective,omitempty"`
@@ -69,21 +66,20 @@ func (p *ControlPlane) agentInventory() agentInventoryView {
 	if cfg == nil {
 		return agentInventoryView{}
 	}
-	var resources *runtimeresources.Catalog
+	var resources gateway.ResourceCatalog
 	if p != nil && p.inventory != nil {
-		resources = p.inventory.Resources()
+		resources = p.inventory.ResourceCatalog()
 	}
-	if resources == nil {
+	if len(resources.Agents) == 0 && len(resources.SharedSkills) == 0 {
 		return agentInventoryView{}
 	}
 	return p.agentInventoryFromResources(cfg, resources)
 }
 
-func (p *ControlPlane) agentInventoryFromResources(cfg *config.Config, resources *runtimeresources.Catalog) agentInventoryView {
-	systemSkills := skillCapabilityViewsFromResources(resources.SystemSkills())
-	sharedSkills := skillCapabilityViewsFromResources(resources.SharedSkills())
-	agents := make([]agentCapabilityView, 0, len(resources.Agents()))
-	for _, resource := range resources.Agents() {
+func (p *ControlPlane) agentInventoryFromResources(cfg *config.Config, resources gateway.ResourceCatalog) agentInventoryView {
+	sharedSkills := skillCapabilityViewsFromResources(resources.SharedSkills)
+	agents := make([]agentCapabilityView, 0, len(resources.Agents))
+	for _, resource := range resources.Agents {
 		agents = append(agents, agentCapabilityFromResources(cfg, resource))
 	}
 	sort.SliceStable(agents, func(i, j int) bool {
@@ -95,7 +91,6 @@ func (p *ControlPlane) agentInventoryFromResources(cfg *config.Config, resources
 
 	return agentInventoryView{
 		Agents:       agents,
-		SystemSkills: systemSkills,
 		SharedSkills: sharedSkills,
 		Notes: []string{
 			"显式指定 agent_id 时，请求会直接命中该 agent，而不是先经过入口 agent 编排。",
@@ -105,7 +100,7 @@ func (p *ControlPlane) agentInventoryFromResources(cfg *config.Config, resources
 	}
 }
 
-func agentCapabilityFromResources(cfg *config.Config, resource runtimeresources.AgentResources) agentCapabilityView {
+func agentCapabilityFromResources(cfg *config.Config, resource gateway.AgentResources) agentCapabilityView {
 	agentCfg := resource.Agent
 	return agentCapabilityView{
 		ID:          agentCfg.ID,
@@ -119,7 +114,6 @@ func agentCapabilityFromResources(cfg *config.Config, resource runtimeresources.
 		ToolPolicy:  toolPolicyForAgent(agentCfg),
 		Tools:       toolCapabilityViewsFromResources(resource.Tools),
 		Skills: skillBundleView{
-			System:    skillCapabilityViewsFromResources(resource.SystemSkills),
 			Shared:    skillCapabilityViewsFromResources(resource.SharedSkills),
 			Private:   skillCapabilityViewsFromResources(resource.PrivateSkills),
 			Effective: skillCapabilityViewsFromResources(resource.EffectiveSkills),
@@ -127,7 +121,7 @@ func agentCapabilityFromResources(cfg *config.Config, resource runtimeresources.
 	}
 }
 
-func skillCapabilityViewsFromResources(items []runtimeresources.SkillDescriptor) []skillCapabilityView {
+func skillCapabilityViewsFromResources(items []gateway.SkillDescriptor) []skillCapabilityView {
 	if len(items) == 0 {
 		return nil
 	}
@@ -144,7 +138,7 @@ func skillCapabilityViewsFromResources(items []runtimeresources.SkillDescriptor)
 	return result
 }
 
-func toolCapabilityViewsFromResources(items []runtimeresources.ToolDescriptor) []toolCapabilityView {
+func toolCapabilityViewsFromResources(items []gateway.ToolDescriptor) []toolCapabilityView {
 	if len(items) == 0 {
 		return nil
 	}

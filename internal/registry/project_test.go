@@ -32,11 +32,15 @@ You are the root.
 
 	coderDir := filepath.Join(root, "agents", "coder")
 	require.NoError(t, os.MkdirAll(filepath.Join(coderDir, "skills"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(coderDir, "mcps"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "common", "skills"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "common", "mcps"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(coderDir, "agent.md"), []byte(`
 ---
 entry: true
 model: anthropic/claude-sonnet-4-5
+mcps:
+  inherit_shared: false
 tools:
   allow: [read_file]
 ---
@@ -54,13 +58,15 @@ You are the coder.
 	assert.Equal(t, "demo", project.Config.ProjectName)
 	assert.Equal(t, 19001, project.Config.Gateway.Port)
 	assert.Equal(t, filepath.Join(root, "common", "skills"), project.Config.SharedSkillsDir)
-	assert.Empty(t, project.Config.SystemSkillsDir)
+	assert.Equal(t, filepath.Join(root, "common", "mcps"), project.Config.SharedMCPsDir)
 	assert.Equal(t, filepath.Join(root, "anyai", "memory"), project.Config.Memory.Dir)
 	assert.True(t, project.Config.Memory.Enabled)
 	assert.Contains(t, project.Config.Bindings, config.Binding{AgentID: "coder", Match: config.BindingMatch{Channel: "http"}})
 	coderCfg, ok := project.Config.GetAgent("coder")
 	require.True(t, ok)
 	assert.Equal(t, filepath.Join(coderDir, "skills"), coderCfg.PrivateSkillsDir)
+	assert.Equal(t, filepath.Join(coderDir, "mcps"), coderCfg.PrivateMCPsDir)
+	assert.False(t, coderCfg.InheritSharedMCPs)
 	entry, err := project.SelectEntry("")
 	require.NoError(t, err)
 	assert.Equal(t, "coder", entry.ID)

@@ -10,6 +10,8 @@ import (
 	"github.com/Isites/anyai/internal/runtime/task"
 )
 
+const maxGoalCompletionEmptyTurns = 1
+
 type goalAfterDoneCoordinator struct {
 	controller *runController
 }
@@ -40,19 +42,17 @@ func (g goalAfterDoneCoordinator) advance() (bool, error) {
 			return false, fmt.Errorf("goal forced to stop: %s", strings.TrimSpace(status.Reason))
 		}
 		if !status.ShouldContinue {
+			if c.goalCompletionPrompted {
+				return g.handlePendingGoalCompletion(status)
+			}
 			if g.shouldPromptForGoalCompletion(status) {
 				if c.currentTurn+1 >= c.maxTurns {
-					if _, err := c.rt.GoalRuntime.MaybeContinueIfIdle(c.ctx, c.goalID); err != nil {
-						return false, err
-					}
-					c.goalCompletionPrompted = false
-					return false, nil
+					return false, fmt.Errorf("goal completion requires explicit goal_complete but maximum turns (%d) was reached", c.maxTurns)
 				}
 				prompt := g.buildGoalCompletionPrompt(*status)
-				if strings.TrimSpace(prompt) != "" && c.rt.Session != nil {
-					c.rt.Session.Append(session.UserMessageEntry(prompt))
-				}
+				c.appendRuntimeControl(runtimeControlKindGoalCompletion, prompt)
 				c.goalCompletionPrompted = true
+				c.goalCompletionEmptyTurns = 0
 				c.runTurn(c.currentTurn + 1)
 				return true, nil
 			}
@@ -63,6 +63,7 @@ func (g goalAfterDoneCoordinator) advance() (bool, error) {
 			return false, nil
 		}
 		c.goalCompletionPrompted = false
+		c.goalCompletionEmptyTurns = 0
 		if execResult, executed, err := c.maybeAutoExecuteReadyPlanStep(*status); err != nil {
 			return false, err
 		} else if executed {
@@ -79,13 +80,45 @@ func (g goalAfterDoneCoordinator) advance() (bool, error) {
 		if strings.TrimSpace(prompt) == "" {
 			return false, nil
 		}
-		if c.rt.Session != nil {
-			c.rt.Session.Append(session.UserMessageEntry(prompt))
-		}
+		c.appendRuntimeControl(runtimeControlKindGoalContinuation, prompt)
 		c.runTurn(c.currentTurn + 1)
 		return true, nil
 	}
 	return false, fmt.Errorf("runtime auto-executed too many structured plan steps without settling the goal state")
+}
+
+func (g goalAfterDoneCoordinator) handlePendingGoalCompletion(status *task.ShouldContinueResult) (bool, error) {
+	c := g.controller
+	if c == nil {
+		return false, nil
+	}
+	if status == nil {
+		return false, nil
+	}
+	if status.State != task.GoalStateInProgress || status.ShouldContinue || status.HardStop {
+		c.goalCompletionPrompted = false
+		c.goalCompletionEmptyTurns = 0
+		return false, nil
+	}
+	if c.lastTurnVisibleReply {
+		c.goalCompletionPrompted = false
+		c.goalCompletionEmptyTurns = 0
+		return false, fmt.Errorf("goal completion requires explicit goal_complete or await_user_input after runtime completion prompt")
+	}
+	c.goalCompletionEmptyTurns++
+	if c.goalCompletionEmptyTurns > maxGoalCompletionEmptyTurns {
+		c.goalCompletionPrompted = false
+		c.goalCompletionEmptyTurns = 0
+		return false, fmt.Errorf("model returned empty responses after runtime requested explicit goal_complete")
+	}
+	if c.currentTurn+1 >= c.maxTurns {
+		c.goalCompletionPrompted = false
+		return false, fmt.Errorf("goal completion requires explicit goal_complete but maximum turns (%d) was reached", c.maxTurns)
+	}
+	prompt := g.buildGoalCompletionRetryPrompt(*status, c.goalCompletionEmptyTurns+1)
+	c.appendRuntimeControl(runtimeControlKindGoalCompletionRetry, prompt)
+	c.runTurn(c.currentTurn + 1)
+	return true, nil
 }
 
 func (g goalAfterDoneCoordinator) status() (*task.ShouldContinueResult, error) {
@@ -128,9 +161,32 @@ func (g goalAfterDoneCoordinator) buildGoalCompletionPrompt(status task.ShouldCo
 			lines = append(lines, rendered)
 		}
 	}
-	lines = append(lines, "", "If anything is still unfinished or blocked, continue the work instead of calling `goal_complete`.")
+	lines = append(lines, "", "If anything is still unfinished or blocked, you must:")
+	lines = append(lines, "1. State what is still unfinished or blocked in your visible reply")
+	lines = append(lines, "2. Continue the work instead of calling `goal_complete`")
 	if _, ok := g.controller.rt.Tools.Get("await_user_input"); ok {
 		lines = append(lines, "If you still need the user to decide something before this can truly finish, call `await_user_input` and ask that question clearly.")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (g goalAfterDoneCoordinator) buildGoalCompletionRetryPrompt(status task.ShouldContinueResult, attempt int) string {
+	lines := []string{
+		"[Runtime goal continuation]",
+		"The previous response was empty, but runtime completion now requires an explicit decision.",
+		"Call `goal_complete` now if the goal is truly complete.",
+	}
+	if _, ok := g.controller.rt.Tools.Get("await_user_input"); ok {
+		lines = append(lines, "If the goal is blocked on missing user input, call `await_user_input` and ask that question clearly.")
+	}
+	lines = append(lines, "If objective work is still unfinished, you must:")
+	lines = append(lines, "1. State what is still unfinished in your visible reply")
+	lines = append(lines, "2. Continue the work immediately")
+	if reason := strings.TrimSpace(status.Reason); reason != "" {
+		lines = append(lines, "", "Runtime assessment: "+reason)
+	}
+	if attempt > 0 {
+		lines = append(lines, "", fmt.Sprintf("Completion prompt attempt: %d", attempt))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -200,9 +256,7 @@ func (g goalAfterDoneCoordinator) runModelOnlyTurn(turn int, prompt string) (str
 	if prompt == "" {
 		return "", nil
 	}
-	if c.rt.Session != nil {
-		c.rt.Session.Append(session.UserMessageEntry(prompt))
-	}
+	c.appendRuntimeControl(runtimeControlKindHardStop, prompt)
 	turnCtx, req, err := c.buildChatRequest(c.ctx, turn, nil, nil)
 	if err != nil {
 		return "", err

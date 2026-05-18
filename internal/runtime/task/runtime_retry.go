@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	defaultAgentTaskMaxAttempts = 2
+	defaultAgentTaskMaxAttempts = 3
 	defaultTaskRetryBackoffMS   = 750
 	retryMetadataMaxAttempts    = "retry_max_attempts"
 	retryMetadataBackoffMS      = "retry_backoff_ms"

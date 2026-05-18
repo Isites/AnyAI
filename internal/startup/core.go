@@ -85,7 +85,7 @@ func BuildCoreRuntimeWithConfig(cfg *config.Config, opts ...Options) (*CoreRunti
 	runtimeService := airuntime.WrapDependencies(base.Dependencies)
 	gatewayService := gateway.New(runtimeService)
 	gatewayService.ApplyRuntimeConfig(cfg, runtimefactory.ResolveFallbackAgentID(cfg, opt.FallbackAgentID))
-	base.Dependencies.SetIngressResolver(gatewayService.ResolveIngressAgent)
+	base.Dependencies.SetIngressResolver(gatewayService.RuntimeIngressResolver())
 	chanMgr := gateway.NewChannelManager(gatewayService, cfg.Security.DMPolicy.UnknownSenders)
 	if opt.ConnectTimeout > 0 {
 		chanMgr.SetConnectTimeout(opt.ConnectTimeout)

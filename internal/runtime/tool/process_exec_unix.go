@@ -30,6 +30,14 @@ func cleanupManagedCommand(cmd *exec.Cmd) {
 	_ = killManagedProcessGroup(cmd)
 }
 
+func managedProcessGroupAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	err := syscall.Kill(-cmd.Process.Pid, 0)
+	return err == nil
+}
+
 func killManagedProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone

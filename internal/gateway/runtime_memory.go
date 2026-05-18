@@ -1,33 +1,33 @@
 package gateway
 
-import (
-	"time"
+import "time"
 
-	"github.com/Isites/anyai/internal/runtime/memory"
-)
-
-func (s *Service) MemoryStats() memory.Stats {
+func (s *Service) MemoryStats() MemoryStats {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
-		return memory.Stats{}
+		return MemoryStats{}
 	}
-	return rt.MemoryStats()
+	return gatewayMemoryStats(rt.MemoryStats())
 }
 
-func (s *Service) MemorySearch(query string, maxItems int, scope memory.SearchScope, layers ...memory.Layer) []memory.SearchMatch {
+func (s *Service) MemorySearch(query string, maxItems int, scope MemoryScope, layers ...MemoryLayer) []MemorySearchMatch {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	return rt.MemorySearch(query, maxItems, scope, layers...)
+	return gatewayMemoryMatches(rt.MemorySearch(query, maxItems, runtimeMemoryScope(scope), runtimeMemoryLayers(layers)...))
 }
 
-func (s *Service) MemoryGet(id string, scope memory.SearchScope) (memory.Entry, bool) {
+func (s *Service) MemoryGet(id string, scope MemoryScope) (MemoryEntry, bool) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
-		return memory.Entry{}, false
+		return MemoryEntry{}, false
 	}
-	return rt.MemoryGet(id, scope)
+	entry, ok := rt.MemoryGet(id, runtimeMemoryScope(scope))
+	if !ok {
+		return MemoryEntry{}, false
+	}
+	return gatewayMemoryEntry(entry), true
 }
 
 func (s *Service) MemoryStaleCleanup(now time.Time) (int, error) {

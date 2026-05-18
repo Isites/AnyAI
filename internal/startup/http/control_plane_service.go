@@ -7,18 +7,14 @@ import (
 	"time"
 
 	"github.com/Isites/anyai/internal/gateway"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	"github.com/Isites/anyai/internal/runtime/input"
-	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
-	"github.com/Isites/anyai/internal/runtime/session"
-	"github.com/Isites/anyai/internal/runtime/tool"
 )
 
 type runStartRequest struct {
 	AgentID       string
 	Text          string
-	Inputs        []input.InputBlock
+	Inputs        []gateway.InputBlock
 	SessionID     string
+	MessageID     string
 	Channel       string
 	SenderID      string
 	AccountID     string
@@ -27,21 +23,21 @@ type runStartRequest struct {
 }
 
 type acceptedRun struct {
-	Run    *runtimeport.ManagedRun
-	Record runtimeevents.RunRecord
-	Inputs []input.InputBlock
+	Run    *gateway.ManagedRun
+	Record gateway.Run
+	Inputs []gateway.InputBlock
 }
 
 func (p *ControlPlane) resolveIngressAgent(channelName, requestedAgentID, senderID, accountID string, chatType gateway.ChatType) string {
 	if p == nil || p.ingress == nil {
 		return strings.TrimSpace(requestedAgentID)
 	}
-	return p.ingress.ResolveIngressAgent(runtimeport.IngressRequest{
+	return p.ingress.ResolveIngressAgent(gateway.IngressRequest{
 		Channel:     channelName,
 		RequestedID: requestedAgentID,
 		SenderID:    senderID,
 		AccountID:   accountID,
-		ChatType:    runtimeChatType(chatType),
+		ChatType:    chatType,
 	})
 }
 
@@ -50,29 +46,17 @@ func (p *ControlPlane) startRun(ctx context.Context, req runStartRequest) (*acce
 		return nil, fmt.Errorf("runtime not available")
 	}
 
-	inputs, err := input.NormalizeBlocks(req.Text, req.Inputs)
-	if err != nil {
-		return nil, err
-	}
-
-	sessionID := strings.TrimSpace(req.SessionID)
-	if sessionID == "" {
-		sessionID = input.DefaultSessionID(req.SessionPrefix, time.Now().UTC())
-	}
-
-	runCtx := tools.WithRuntimeContext(ctx, tools.RuntimeContextFrom(ctx))
-	envelope := input.InputEnvelope{
-		SessionID: sessionID,
-		Blocks:    inputs,
-	}
-	run, err := p.startIngressManagedRun(runCtx, runtimeport.IngressRequest{
-		Channel:     req.Channel,
-		RequestedID: req.AgentID,
-		SenderID:    req.SenderID,
-		AccountID:   firstNonEmpty(strings.TrimSpace(req.AccountID), strings.TrimSpace(req.SenderID)),
-		ChatType:    runtimeChatType(req.ChatType),
-		Envelope:    envelope,
-		SessionID:   sessionID,
+	run, err := p.startIngressManagedRun(ctx, gateway.IngressRequest{
+		Channel:       req.Channel,
+		RequestedID:   req.AgentID,
+		SenderID:      req.SenderID,
+		AccountID:     firstNonEmpty(strings.TrimSpace(req.AccountID), strings.TrimSpace(req.SenderID)),
+		ChatType:      req.ChatType,
+		Text:          req.Text,
+		Inputs:        req.Inputs,
+		SessionID:     strings.TrimSpace(req.SessionID),
+		MessageID:     strings.TrimSpace(req.MessageID),
+		SessionPrefix: req.SessionPrefix,
 	})
 	if err != nil {
 		return nil, err
@@ -80,44 +64,33 @@ func (p *ControlPlane) startRun(ctx context.Context, req runStartRequest) (*acce
 
 	return &acceptedRun{
 		Run:    run,
-		Record: p.acceptedRunRecord(run, inputs),
-		Inputs: inputs,
+		Record: p.acceptedRunRecord(run, req.Inputs),
+		Inputs: req.Inputs,
 	}, nil
 }
 
-func runtimeChatType(chatType gateway.ChatType) runtimeport.ChatType {
-	switch chatType {
-	case gateway.ChatTypeGroup:
-		return runtimeport.ChatTypeGroup
-	case gateway.ChatTypeDirect:
-		fallthrough
-	default:
-		return runtimeport.ChatTypeDirect
-	}
-}
-
-func (p *ControlPlane) acceptedRunRecord(run *runtimeport.ManagedRun, inputs []input.InputBlock) runtimeevents.RunRecord {
+func (p *ControlPlane) acceptedRunRecord(run *gateway.ManagedRun, inputs []gateway.InputBlock) gateway.Run {
 	if run == nil {
-		return runtimeevents.RunRecord{}
+		return gateway.Run{}
 	}
 	if p != nil && p.run != nil {
 		if stored, ok := p.run.GetRun(run.RunID); ok {
 			return stored
 		}
 	}
-	return runtimeevents.RunRecord{
+	return gateway.Run{
 		ID:          run.RunID,
 		AgentID:     run.AgentID,
 		SessionID:   run.SessionID,
 		Model:       run.Model,
-		Status:      runtimeevents.RunStatusRunning,
+		Status:      gateway.RunStatusRunning,
 		Input:       summarizeInputsForRecord(inputs),
 		StartedAt:   time.Now().UTC(),
 		CompletedAt: time.Time{},
 	}
 }
 
-func (p *ControlPlane) listSessions(agentID string) ([]session.SessionInfo, error) {
+func (p *ControlPlane) listSessions(agentID string) ([]gateway.SessionInfo, error) {
 	if p == nil || p.session == nil {
 		return nil, fmt.Errorf("runtime not available")
 	}
@@ -131,9 +104,9 @@ func (p *ControlPlane) createSession(agentID, requestedSessionID, prefix string)
 	return p.session.CreateSession(agentID, requestedSessionID, prefix)
 }
 
-func (p *ControlPlane) loadSession(agentID, sessionID string) (*session.Session, error) {
+func (p *ControlPlane) loadSession(agentID, sessionID string) (gateway.SessionView, error) {
 	if p == nil || p.session == nil {
-		return nil, fmt.Errorf("runtime not available")
+		return gateway.SessionView{}, fmt.Errorf("runtime not available")
 	}
 	return p.session.LoadSession(agentID, sessionID)
 }
@@ -145,7 +118,7 @@ func (p *ControlPlane) deleteSession(agentID, sessionID string) error {
 	return p.session.DeleteSession(agentID, sessionID)
 }
 
-func (p *ControlPlane) startIngressManagedRun(ctx context.Context, req runtimeport.IngressRequest) (*runtimeport.ManagedRun, error) {
+func (p *ControlPlane) startIngressManagedRun(ctx context.Context, req gateway.IngressRequest) (*gateway.ManagedRun, error) {
 	if p == nil || p.ingress == nil {
 		return nil, fmt.Errorf("runtime not available")
 	}

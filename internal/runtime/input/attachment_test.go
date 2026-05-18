@@ -57,3 +57,17 @@ func TestAttachmentStoreMultipleSaves(t *testing.T) {
 	assert.True(t, ok2)
 	assert.Equal(t, "b.txt", got2.Name)
 }
+
+func TestAttachmentStoreSaveWithStableID(t *testing.T) {
+	dir := t.TempDir()
+	store := NewAttachmentStore(dir)
+
+	att, err := store.SaveWithID("input_1", "nested/name.txt", "text/plain", []byte("hello"))
+	require.NoError(t, err)
+	assert.Equal(t, "input_1", att.ID)
+	assert.Equal(t, "name.txt", att.Name)
+
+	data, err := os.ReadFile(filepath.Join(dir, "input_1", "name.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hello"), data)
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
+	"github.com/Isites/anyai/internal/runtime/tooldefaults"
 )
 
 const (
@@ -22,8 +23,8 @@ const (
 	defaultRuntimeIdleTimeoutMS                 = 300000
 	defaultAgentCallDepthLimit                  = 4
 	defaultAgentCallMaxParallel                 = 4
-	defaultToolMaxAttempts                      = 1
-	defaultToolRetryBackoffMS                   = 750
+	defaultToolMaxAttempts                      = tooldefaults.MaxAttempts
+	defaultToolRetryBackoffMS                   = tooldefaults.RetryBackoffMS
 	defaultToolLoopHistorySize                  = 24
 	defaultToolLoopWarningThreshold             = 4
 	defaultToolLoopBlockThreshold               = 6
@@ -79,8 +80,8 @@ type Config struct {
 	ProjectName      string   `json:"projectName,omitempty"`
 	ProjectRoot      string   `json:"-"`
 	ProjectConfigDir string   `json:"-"`
-	SystemSkillsDir  string   `json:"-"`
 	SharedSkillsDir  string   `json:"-"`
+	SharedMCPsDir    string   `json:"-"`
 	ActiveChannels   []string `json:"-"`
 
 	mu   sync.RWMutex
@@ -130,6 +131,8 @@ type AgentConfig struct {
 	Tags                []string     `json:"tags,omitempty"`
 	PrivateSkillsDir    string       `json:"privateSkillsDir,omitempty"`
 	InheritSharedSkills bool         `json:"inheritSharedSkills,omitempty"`
+	PrivateMCPsDir      string       `json:"privateMCPsDir,omitempty"`
+	InheritSharedMCPs   bool         `json:"inheritSharedMCPs,omitempty"`
 }
 
 type CronConfig struct {

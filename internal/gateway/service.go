@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Isites/anyai/internal/config"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 )
@@ -19,27 +18,27 @@ import (
 type ChannelPort interface {
 	channelPort()
 	EvaluateMessagePolicy(channelName, dmPolicy string, msg InboundMessage) MessagePolicyDecision
-	ResolveIngressAgent(req runtimeport.IngressRequest) string
-	StartIngressRun(ctx context.Context, req runtimeport.IngressRequest) (*runtimeport.ManagedRun, error)
-	SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
-	GetRun(runID string) (runtimeevents.RunRecord, bool)
+	ResolveIngressAgent(req IngressRequest) string
+	StartIngressRun(ctx context.Context, req IngressRequest) (*ManagedRun, error)
+	SubscribeRunTreeReplay(runID string) ([]Event, <-chan Event, func(), error)
+	GetRun(runID string) (Run, bool)
 }
 
 // IngressFacade is the gateway surface for accepting new external work.
 type IngressFacade interface {
-	ResolveIngressAgent(req runtimeport.IngressRequest) string
-	StartIngressRun(ctx context.Context, req runtimeport.IngressRequest) (*runtimeport.ManagedRun, error)
+	ResolveIngressAgent(req IngressRequest) string
+	StartIngressRun(ctx context.Context, req IngressRequest) (*ManagedRun, error)
 }
 
 // ObserveFacade is the gateway surface for run read models and replay streams.
 type ObserveFacade interface {
-	GetRun(runID string) (runtimeevents.RunRecord, bool)
-	ListRuns() []runtimeevents.RunRecord
-	ListRunEvents(runID string) []runtimeevents.EventRecord
-	GetRunTree(runID string) (runtimeevents.RunTreeRecord, bool)
-	RunTree(runID string) ([]runtimeevents.RunNode, bool)
-	SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
-	SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
+	GetRun(runID string) (Run, bool)
+	ListRuns() []Run
+	ListRunEvents(runID string) []Event
+	GetRunTree(runID string) (RunTree, bool)
+	RunTree(runID string) ([]RunNode, bool)
+	SubscribeRunReplay(runID string) ([]Event, <-chan Event, func(), error)
+	SubscribeRunTreeReplay(runID string) ([]Event, <-chan Event, func(), error)
 }
 
 // ControlFacade is the gateway surface for runtime mutations and cancellation.
@@ -68,7 +67,7 @@ func New(runtime runtimeport.GatewayRuntime) *Service {
 }
 
 // RawRuntime returns the wrapped low-level runtime surface used beneath
-// gateway replay/read-model adaptation.
+// gateway DTO adaptation.
 func (s *Service) RawRuntime() runtimeport.GatewayRuntime {
 	if s == nil {
 		return nil
@@ -195,12 +194,19 @@ func (s *Service) LogEntriesPayload(limit int) []map[string]any {
 }
 
 // SubscribeLogs subscribes to the gateway log stream.
-func (s *Service) SubscribeLogs() (<-chan runtimelogging.LogEntry, func()) {
+func (s *Service) SubscribeLogs() (<-chan LogEntry, func()) {
 	if s == nil || s.logBuffer == nil {
 		return nil, nil
 	}
 	ch := s.logBuffer.Subscribe()
-	return ch, func() { s.logBuffer.Unsubscribe(ch) }
+	out := make(chan LogEntry, 128)
+	go func() {
+		defer close(out)
+		for entry := range ch {
+			out <- gatewayLogEntry(entry)
+		}
+	}()
+	return out, func() { s.logBuffer.Unsubscribe(ch) }
 }
 
 // EvaluateMessagePolicy asks runtime ingress policy whether the message should
@@ -229,7 +235,7 @@ func (s *Service) EvaluateMessagePolicy(channelName, dmPolicy string, msg Inboun
 
 // ResolveIngressAgent resolves the target agent using explicit request,
 // gateway routing rules, and finally runtime config fallback ordering.
-func (s *Service) ResolveIngressAgent(req runtimeport.IngressRequest) string {
+func (s *Service) ResolveIngressAgent(req IngressRequest) string {
 	if s == nil {
 		return strings.TrimSpace(req.RequestedID)
 	}
@@ -256,19 +262,27 @@ func (s *Service) ResolveIngressAgent(req runtimeport.IngressRequest) string {
 }
 
 // StartIngressRun submits an ingress request into runtime.
-func (s *Service) StartIngressRun(ctx context.Context, req runtimeport.IngressRequest) (*runtimeport.ManagedRun, error) {
+func (s *Service) StartIngressRun(ctx context.Context, req IngressRequest) (*ManagedRun, error) {
 	if s == nil || s.runtime == nil {
 		return nil, fmt.Errorf("runtime not available")
 	}
-	return s.runtime.StartIngressRun(ctx, req)
+	run, err := s.runtime.StartIngressRun(ctx, runtimeIngressRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	return gatewayManagedRun(run), nil
 }
 
 // GetRun returns a gateway-visible run record.
-func (s *Service) GetRun(runID string) (runtimeevents.RunRecord, bool) {
+func (s *Service) GetRun(runID string) (Run, bool) {
 	if s == nil || s.runtime == nil {
-		return runtimeevents.RunRecord{}, false
+		return Run{}, false
 	}
-	return s.runtime.GetRun(runID)
+	run, ok := s.runtime.GetRun(runID)
+	if !ok {
+		return Run{}, false
+	}
+	return gatewayRun(run), true
 }
 
 func (*Service) channelPort() {}

@@ -30,6 +30,7 @@ func newRootCmd() *cobra.Command {
 	rootCmd.AddCommand(
 		chatCmd(),
 		startCmd(),
+		mcpCmd(),
 		initCmd(),
 		versionCmd(),
 	)

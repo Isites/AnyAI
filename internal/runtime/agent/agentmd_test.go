@@ -27,6 +27,8 @@ tools:
     - bash
 skills:
   inherit_shared: false
+mcps:
+  inherit_shared: false
 tags:
   - support
 ---
@@ -49,6 +51,8 @@ You are the support agent.
 	assert.Equal(t, []string{"bash"}, doc.Tools.Deny)
 	require.NotNil(t, doc.Skills.InheritShared)
 	assert.False(t, *doc.Skills.InheritShared)
+	require.NotNil(t, doc.MCPs.InheritShared)
+	assert.False(t, *doc.MCPs.InheritShared)
 	assert.Equal(t, []string{"support"}, doc.Tags)
 	assert.Equal(t, "You are the support agent.", doc.Body)
 	assert.Equal(t, dir, doc.Dir)
@@ -65,4 +69,5 @@ func TestParseFileWithoutFrontmatter(t *testing.T) {
 	assert.Equal(t, "You are a direct prompt.", doc.Body)
 	assert.Empty(t, doc.ID)
 	assert.Nil(t, doc.Skills.InheritShared)
+	assert.Nil(t, doc.MCPs.InheritShared)
 }

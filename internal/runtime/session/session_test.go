@@ -200,6 +200,26 @@ func TestSessionCompactNoOp(t *testing.T) {
 	assert.Len(t, history, 2)
 }
 
+func TestRuntimeControlEntrySerializesAndStaysOutOfRollingSummary(t *testing.T) {
+	sess := NewSession("agent", "key")
+	sess.Append(UserMessageEntry("real request"))
+	sess.Append(RuntimeControlEntry("goal_completion", "[Runtime goal continuation]\nCall `goal_complete` now instead of ending silently."))
+
+	history := sess.History()
+	require.Len(t, history, 2)
+	assert.Equal(t, EntryTypeRuntimeControl, history[1].Type)
+
+	view := SerializeHistory(sess)
+	require.Len(t, view, 2)
+	assert.Equal(t, "runtime_control", view[1]["type"])
+	assert.Equal(t, "goal_completion", view[1]["kind"])
+
+	summary := BuildRollingSummary(history)
+	assert.Contains(t, summary, "real request")
+	assert.NotContains(t, summary, "goal_complete")
+	assert.NotContains(t, summary, "[Runtime goal continuation]")
+}
+
 func TestSessionCompactWithStore(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

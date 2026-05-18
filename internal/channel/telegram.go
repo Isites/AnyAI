@@ -3,7 +3,6 @@ package channel
 import (
 	"context"
 	"fmt"
-	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
 	"io"
 	"net/http"
 	"regexp"
@@ -75,7 +74,7 @@ func (t *TelegramChannel) Connect(ctx context.Context) error {
 		bot.WithDefaultHandler(t.defaultHandler),
 		bot.WithHTTPClient(pollTimeout, httpClient),
 		bot.WithErrorsHandler(func(err error) {
-			runtimelogging.Error("telegram bot error", "error", err)
+			gateway.Error("telegram bot error", "error", err)
 		}),
 	}
 
@@ -105,7 +104,7 @@ func (t *TelegramChannel) Connect(ctx context.Context) error {
 	t.status = gateway.StatusConnected
 	t.mu.Unlock()
 
-	runtimelogging.Info("telegram bot connected", "username", me.Username)
+	gateway.Info("telegram bot connected", "username", me.Username)
 
 	if !t.sendOnly {
 		go b.Start(ctx)
@@ -147,7 +146,7 @@ func (t *TelegramChannel) Send(ctx context.Context, msg gateway.OutboundMessage)
 
 	if err := t.sendChunked(ctx, b, chatID, text, parseMode); err != nil {
 		if parseMode == "HTML" && msg.ParseMode == "" {
-			runtimelogging.Warn("telegram HTML send failed, retrying as plain text", "error", err)
+			gateway.Warn("telegram HTML send failed, retrying as plain text", "error", err)
 			return t.sendChunked(ctx, b, chatID, msg.Text, "")
 		}
 		return err
@@ -222,7 +221,7 @@ func (t *TelegramChannel) defaultHandler(ctx context.Context, b *bot.Bot, update
 			Text:   "Hello! I'm AnyAI, your AI assistant. Send me a message to get started.",
 		})
 		if err != nil {
-			runtimelogging.Error("telegram send /start response", "error", err)
+			gateway.Error("telegram send /start response", "error", err)
 		}
 		return
 	}
@@ -290,7 +289,7 @@ func (t *TelegramChannel) defaultHandler(ctx context.Context, b *bot.Bot, update
 		if media[i].Type == "photo" && media[i].FileID != "" {
 			data, mimeType, err := t.downloadFile(ctx, b, media[i].FileID)
 			if err != nil {
-				runtimelogging.Warn("telegram photo download failed", "error", err, "file_id", media[i].FileID)
+				gateway.Warn("telegram photo download failed", "error", err, "file_id", media[i].FileID)
 				continue
 			}
 			media[i].Data = data

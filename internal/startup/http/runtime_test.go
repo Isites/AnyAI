@@ -1,8 +1,10 @@
 package httpchannel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -569,6 +571,24 @@ func TestPortalServesUnifiedShell(t *testing.T) {
 	assert.NotContains(t, body, "cdn.jsdelivr.net")
 }
 
+func TestPortalChatComposerSupportsClipboardImagePaste(t *testing.T) {
+	runtime, _, _ := testRuntime(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/ui/assets/app.js", nil)
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, "addEventListener('paste'")
+	assert.Contains(t, body, "clipboardImageFiles(event.clipboardData)")
+	assert.Contains(t, body, "uploadChatAttachments(files, { source: 'clipboard' })")
+	assert.Contains(t, body, "new File([file], name")
+	assert.Contains(t, body, "function generateMessageID()")
+	assert.Contains(t, body, "message_id: messageID")
+	assert.Contains(t, body, "payload.entry_id")
+}
+
 func TestAgentsEndpointReturnsCapabilityInventory(t *testing.T) {
 	runtime, _, _ := testRuntime(t)
 
@@ -700,7 +720,7 @@ func TestRunTreeEventsEndpointReplaysSyntheticTextDelta(t *testing.T) {
 func TestChatEndpointStreamsLifecycleFromSinglePOST(t *testing.T) {
 	runtime, _, _ := testRuntime(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/chat?stream=1", strings.NewReader(`{"agent_id":"assistant","session_id":"demo-session","text":"你好"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/chat?stream=1", strings.NewReader(`{"agent_id":"assistant","session_id":"demo-session","message_id":"e_http_supplied","text":"你好"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
@@ -711,8 +731,85 @@ func TestChatEndpointStreamsLifecycleFromSinglePOST(t *testing.T) {
 	assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), "event: run.accepted")
 	assert.Contains(t, rec.Body.String(), "event: run.started")
+	assert.Contains(t, rec.Body.String(), `"entry_id":"e_http_supplied"`)
 	assert.Contains(t, rec.Body.String(), "event: text.delta")
 	assert.Contains(t, rec.Body.String(), "Hello from agent!")
+}
+
+func TestAttachmentUploadPersistsAssetsAndReturnsImageBlock(t *testing.T) {
+	runtime, _, _ := testRuntime(t)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("files", "diagram.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte{0x89, 'P', 'N', 'G'})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/attachments", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var payload struct {
+		Inputs []gateway.InputBlock `json:"inputs"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Inputs, 1)
+	block := payload.Inputs[0]
+	assert.Equal(t, "image", block.Type)
+	assert.Equal(t, "diagram.png", block.Name)
+	assert.Equal(t, "image/png", block.MimeType)
+	assert.NotEmpty(t, block.AttachmentID)
+	assert.Contains(t, block.Path, filepath.Join("anyai", "assets", "uploads", block.AttachmentID, "diagram.png"))
+	data, err := os.ReadFile(block.Path)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0x89, 'P', 'N', 'G'}, data)
+	assert.NotContains(t, rec.Body.String(), "iVBOR")
+}
+
+func TestChatEndpointAcceptsUploadedAttachmentReference(t *testing.T) {
+	runtime, _, _ := testRuntime(t)
+
+	var upload bytes.Buffer
+	writer := multipart.NewWriter(&upload)
+	part, err := writer.CreateFormFile("files", "diagram.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte{0x89, 'P', 'N', 'G'})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	uploadReq := httptest.NewRequest(http.MethodPost, "/api/attachments", &upload)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadRec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(uploadRec, uploadReq)
+	require.Equal(t, http.StatusCreated, uploadRec.Code)
+
+	var uploadPayload struct {
+		Inputs []gateway.InputBlock `json:"inputs"`
+	}
+	require.NoError(t, json.Unmarshal(uploadRec.Body.Bytes(), &uploadPayload))
+	require.Len(t, uploadPayload.Inputs, 1)
+
+	body, err := json.Marshal(map[string]any{
+		"agent_id":   "assistant",
+		"session_id": "attachment-session",
+		"inputs":     append([]gateway.InputBlock{{Type: "text", Text: "请识别附件图片。"}}, uploadPayload.Inputs...),
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/api/chat?stream=1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "event: session.input.stored")
+	assert.Contains(t, rec.Body.String(), `"name":"diagram.png"`)
+	assert.Contains(t, rec.Body.String(), `"attachment_id":"`+uploadPayload.Inputs[0].AttachmentID+`"`)
+	assert.NotContains(t, rec.Body.String(), "iVBOR")
 }
 
 func httpManagedDoc(title string, meta map[string]string, section string, lines ...string) string {

@@ -870,16 +870,15 @@ Compaction 与 memory pipeline 是两条不同链路：
 
 ### 14.1 Skill 层级
 
-Skill 可见性分三层：
+Skill 可见性分两层：
 
-- system skills。
 - shared project skills：`common/skills/`。
 - private agent skills：`<agent_dir>/skills/`。
 
 合并优先级：
 
 ```text
-private > shared > system
+private > shared
 ```
 
 当 `skills.inherit_shared: false` 时，当前 Agent 不继承 shared skills。
@@ -888,7 +887,7 @@ private > shared > system
 
 `internal/runtime/resources.Catalog` 当前构建：
 
-- system/shared/private/effective skills 描述。
+- shared/private/effective skills 描述。
 - 每个 Agent 的可见工具描述。
 - 每个 Agent 的 scoped loader。
 - global loader。
@@ -1000,7 +999,6 @@ Workflow：
 - `todo`。
 - `goal_complete`。
 - `await_user_input`。
-- `save_output`。
 
 Daemon / messaging：
 

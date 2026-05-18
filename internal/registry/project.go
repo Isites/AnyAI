@@ -27,6 +27,7 @@ type Project struct {
 	FileModeSingle  bool
 	ExplicitEntryID string
 	SharedSkillsDir string
+	SharedMCPsDir   string
 	MemoryDir       string
 	Agents          []ProjectAgent
 	Config          *config.Config
@@ -91,6 +92,7 @@ func LoadProject(path string) (*Project, error) {
 		ProjectConfig:  projectCfg,
 	}
 	project.SharedSkillsDir = existingDir(filepath.Join(rootDir, "common", "skills"))
+	project.SharedMCPsDir = existingDir(filepath.Join(rootDir, "common", "mcps"))
 	project.MemoryDir = existingDir(filepath.Join(rootDir, "anyai", "memory"))
 
 	if err := project.buildAgents(agentPaths); err != nil {
@@ -289,6 +291,10 @@ func (p *Project) buildAgents(agentPaths []string) error {
 		if doc.Skills.InheritShared != nil {
 			inheritShared = *doc.Skills.InheritShared
 		}
+		inheritSharedMCPs := true
+		if doc.MCPs.InheritShared != nil {
+			inheritSharedMCPs = *doc.MCPs.InheritShared
+		}
 
 		model := doc.Model
 		if p.ProjectConfig != nil {
@@ -319,6 +325,8 @@ func (p *Project) buildAgents(agentPaths []string) error {
 			Tags:                doc.Tags,
 			PrivateSkillsDir:    existingDir(filepath.Join(dir, "skills")),
 			InheritSharedSkills: inheritShared,
+			PrivateMCPsDir:      existingDir(filepath.Join(dir, "mcps")),
+			InheritSharedMCPs:   inheritSharedMCPs,
 		}
 		if doc.Entry {
 			entryCount++
@@ -348,7 +356,7 @@ func (p *Project) buildRuntimeConfig() (*config.Config, error) {
 	cfg.ProjectRoot = p.RootDir
 	cfg.ProjectConfigDir = p.RootDir
 	cfg.SharedSkillsDir = p.SharedSkillsDir
-	cfg.SystemSkillsDir = ""
+	cfg.SharedMCPsDir = p.SharedMCPsDir
 	cfg.Memory.Dir = filepath.Join(cfg.RuntimeDataDir(), "memory")
 
 	if p.ProjectConfig != nil {
@@ -359,24 +367,24 @@ func (p *Project) buildRuntimeConfig() (*config.Config, error) {
 		cfg.Runtime.AgentCall.MaxParallel = p.ProjectConfig.Runtime.AgentCall.MaxParallel
 		cfg.Runtime.Tools.MaxAttempts = p.ProjectConfig.Runtime.Tools.MaxAttempts
 		cfg.Runtime.Tools.RetryBackoffMS = p.ProjectConfig.Runtime.Tools.RetryBackoffMS
-			cfg.Runtime.Tools.LoopDetection = config.ToolLoopDetectionConfig{
-				Enabled:          p.ProjectConfig.Runtime.Tools.LoopDetection.Enabled,
-				HistorySize:      p.ProjectConfig.Runtime.Tools.LoopDetection.HistorySize,
-				WarningThreshold: p.ProjectConfig.Runtime.Tools.LoopDetection.WarningThreshold,
-				BlockThreshold:   p.ProjectConfig.Runtime.Tools.LoopDetection.BlockThreshold,
-			}
-			cfg.Runtime.Sessions.Compaction = config.SessionCompactionConfig{
-				Enabled:              config.CloneBoolPtr(p.ProjectConfig.Runtime.Sessions.Compaction.Enabled),
-				TriggerMode:          p.ProjectConfig.Runtime.Sessions.Compaction.TriggerMode,
-				EntryThreshold:       p.ProjectConfig.Runtime.Sessions.Compaction.EntryThreshold,
-				TokenThreshold:       p.ProjectConfig.Runtime.Sessions.Compaction.TokenThreshold,
-				KeepRecentUserTurns:  p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTurns,
-				KeepRecentUserTokens: p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTokens,
-				SummaryMaxTokens:     p.ProjectConfig.Runtime.Sessions.Compaction.SummaryMaxTokens,
-			}
-			cfg.Logging = config.LoggingConfig{
-				FileLevel:      p.ProjectConfig.Logging.FileLevel,
-				StderrLevel:    p.ProjectConfig.Logging.StderrLevel,
+		cfg.Runtime.Tools.LoopDetection = config.ToolLoopDetectionConfig{
+			Enabled:          p.ProjectConfig.Runtime.Tools.LoopDetection.Enabled,
+			HistorySize:      p.ProjectConfig.Runtime.Tools.LoopDetection.HistorySize,
+			WarningThreshold: p.ProjectConfig.Runtime.Tools.LoopDetection.WarningThreshold,
+			BlockThreshold:   p.ProjectConfig.Runtime.Tools.LoopDetection.BlockThreshold,
+		}
+		cfg.Runtime.Sessions.Compaction = config.SessionCompactionConfig{
+			Enabled:              config.CloneBoolPtr(p.ProjectConfig.Runtime.Sessions.Compaction.Enabled),
+			TriggerMode:          p.ProjectConfig.Runtime.Sessions.Compaction.TriggerMode,
+			EntryThreshold:       p.ProjectConfig.Runtime.Sessions.Compaction.EntryThreshold,
+			TokenThreshold:       p.ProjectConfig.Runtime.Sessions.Compaction.TokenThreshold,
+			KeepRecentUserTurns:  p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTurns,
+			KeepRecentUserTokens: p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTokens,
+			SummaryMaxTokens:     p.ProjectConfig.Runtime.Sessions.Compaction.SummaryMaxTokens,
+		}
+		cfg.Logging = config.LoggingConfig{
+			FileLevel:      p.ProjectConfig.Logging.FileLevel,
+			StderrLevel:    p.ProjectConfig.Logging.StderrLevel,
 			WhatsMeowLevel: p.ProjectConfig.Logging.WhatsMeowLevel,
 			MirrorStderr:   config.CloneBoolPtr(p.ProjectConfig.Logging.MirrorStderr),
 			Rotation: config.LogRotationConfig{

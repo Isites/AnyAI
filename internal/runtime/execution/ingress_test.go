@@ -1,6 +1,8 @@
 package execution
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Isites/anyai/internal/config"
@@ -50,6 +52,13 @@ func TestResolveIngressAgentUsesRequestedThenDefault(t *testing.T) {
 }
 
 func TestRecordInputLifecycleEmitsInputAndAttachmentEvents(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "brief.txt")
+	imagePath := filepath.Join(dir, "diagram.png")
+	dirPath := filepath.Join(dir, "reference")
+	require.NoError(t, os.MkdirAll(dirPath, 0o755))
+	require.NoError(t, os.WriteFile(filePath, []byte("brief"), 0o644))
+	require.NoError(t, os.WriteFile(imagePath, []byte("png"), 0o644))
 	recorder := runtimeevents.NewRecorder()
 	req := runtimeport.IngressRequest{
 		RunID:       "run_1",
@@ -62,8 +71,9 @@ func TestRecordInputLifecycleEmitsInputAndAttachmentEvents(t *testing.T) {
 		Envelope: input.InputEnvelope{
 			Blocks: []input.InputBlock{
 				{Type: "text", Text: "hello"},
-				{ID: "att_file", Type: "file", Name: "brief.txt", Path: "/tmp/brief.txt", MimeType: "text/plain"},
-				{Type: "image", Name: "diagram.png", Path: "/tmp/diagram.png", MimeType: "image/png"},
+				{ID: "att_file", Type: "file", Name: "brief.txt", Path: filePath, MimeType: "text/plain"},
+				{ID: "input_3", Type: "image", Name: "diagram.png", Path: imagePath, MimeType: "image/png"},
+				{ID: "input_4", Type: "dir", Name: "reference", Path: dirPath},
 			},
 		},
 	}
@@ -71,15 +81,17 @@ func TestRecordInputLifecycleEmitsInputAndAttachmentEvents(t *testing.T) {
 	recordInputLifecycle(recorder, req, "entry")
 
 	events := recorder.ListRunEvents("run_1")
-	require.Len(t, events, 4)
+	require.Len(t, events, 5)
 	assert.Equal(t, "input.received", events[0].Name)
 	assert.Equal(t, "attachment.stored", events[1].Name)
 	assert.Equal(t, "attachment.stored", events[2].Name)
-	assert.Equal(t, "input.normalized", events[3].Name)
-	assert.Equal(t, 3, events[0].Payload["block_count"])
-	assert.Equal(t, 2, events[0].Payload["attachment_count"])
+	assert.Equal(t, "attachment.stored", events[3].Name)
+	assert.Equal(t, "input.normalized", events[4].Name)
+	assert.Equal(t, 4, events[0].Payload["block_count"])
+	assert.Equal(t, 3, events[0].Payload["attachment_count"])
 	assert.Equal(t, "att_file", events[1].Payload["attachment_id"])
 	assert.Equal(t, "input_3", events[2].Payload["attachment_id"])
+	assert.Equal(t, "input_4", events[3].Payload["attachment_id"])
 }
 
 func TestRecordRouteDecisionEmitsAcceptedThenRouted(t *testing.T) {

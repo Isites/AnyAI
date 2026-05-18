@@ -136,6 +136,89 @@ func TestWriteFileToolAllowsParentTraversalOutsideWorkspace(t *testing.T) {
 	assert.Equal(t, "project content", string(data))
 }
 
+func TestWriteFileToolAppendsWithExpectedOffset(t *testing.T) {
+	dir := t.TempDir()
+	tool := &WriteFileTool{WorkDir: dir}
+
+	input, _ := json.Marshal(writeFileInput{Path: "large.txt", Content: "hello", Mode: "overwrite"})
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Empty(t, result.Error)
+
+	offset := int64(5)
+	input, _ = json.Marshal(writeFileInput{Path: "large.txt", Content: " world", Mode: "append", ExpectedOffset: &offset})
+	result, err = tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Empty(t, result.Error)
+
+	data, err := os.ReadFile(filepath.Join(dir, "large.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", string(data))
+}
+
+func TestWriteFileToolRejectsAppendWhenExpectedOffsetMismatches(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "large.txt"), []byte("hello"), 0o644))
+	tool := &WriteFileTool{WorkDir: dir}
+
+	offset := int64(4)
+	input, _ := json.Marshal(writeFileInput{Path: "large.txt", Content: " world", Mode: "append", ExpectedOffset: &offset})
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Contains(t, result.Error, "expected file size")
+
+	data, err := os.ReadFile(filepath.Join(dir, "large.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(data))
+}
+
+func TestWriteFileToolAppliesCodexStylePatch(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "notes.txt")
+	require.NoError(t, os.WriteFile(target, []byte("alpha\nbeta\ngamma\n"), 0o644))
+	tool := &WriteFileTool{WorkDir: dir}
+
+	patch := `*** Begin Patch
+*** Update File: notes.txt
+@@
+ alpha
+-beta
++bravo
+ gamma
+*** End Patch`
+	input, _ := json.Marshal(writeFileInput{Patch: patch})
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Empty(t, result.Error)
+
+	data, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha\nbravo\ngamma\n", string(data))
+}
+
+func TestWriteFileToolPatchCanAddAndDeleteFiles(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "old.txt"), []byte("remove me\n"), 0o644))
+	tool := &WriteFileTool{WorkDir: dir}
+
+	patch := `*** Begin Patch
+*** Add File: new.txt
++created
++file
+*** Delete File: old.txt
+*** End Patch`
+	input, _ := json.Marshal(writeFileInput{Patch: patch})
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Empty(t, result.Error)
+
+	data, err := os.ReadFile(filepath.Join(dir, "new.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "created\nfile\n", string(data))
+	_, err = os.Stat(filepath.Join(dir, "old.txt"))
+	assert.True(t, os.IsNotExist(err))
+}
+
 func TestEditFileTool(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "edit.txt")

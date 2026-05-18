@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Isites/anyai/internal/config"
+	runtimemcp "github.com/Isites/anyai/internal/runtime/mcp"
 	"github.com/Isites/anyai/internal/runtime/memory"
 	runtimeplan "github.com/Isites/anyai/internal/runtime/plan"
 	"github.com/Isites/anyai/internal/runtime/skill"
@@ -33,7 +34,6 @@ type ToolDescriptor struct {
 // AgentResources captures the preloaded runtime resources for one agent.
 type AgentResources struct {
 	Agent           config.AgentConfig
-	SystemSkills    []SkillDescriptor
 	SharedSkills    []SkillDescriptor
 	PrivateSkills   []SkillDescriptor
 	EffectiveSkills []SkillDescriptor
@@ -52,12 +52,12 @@ type BuildDeps struct {
 // Catalog is the in-memory snapshot of agent, skill, and tool metadata that
 // higher layers can read without rescanning the project on every request.
 type Catalog struct {
-	systemSkills []SkillDescriptor
 	sharedSkills []SkillDescriptor
 	agents       []AgentResources
 	agentsByID   map[string]AgentResources
 	skillLoaders map[string]*skill.Loader
 	globalLoader *skill.Loader
+	mcps         *runtimemcp.Catalog
 }
 
 func BuildCatalog(cfg *config.Config, deps BuildDeps) (*Catalog, error) {
@@ -66,24 +66,25 @@ func BuildCatalog(cfg *config.Config, deps BuildDeps) (*Catalog, error) {
 			agentsByID:   map[string]AgentResources{},
 			skillLoaders: map[string]*skill.Loader{},
 			globalLoader: skill.NewLoader(),
+			mcps:         runtimemcp.EmptyCatalog(),
 		}, nil
 	}
 
-	systemRaw, err := skill.LoadDir(cfg.SystemSkillsDir)
-	if err != nil {
-		return nil, fmt.Errorf("load system skills: %w", err)
-	}
 	sharedRaw, err := skill.LoadDir(cfg.SharedSkillsDir)
 	if err != nil {
 		return nil, fmt.Errorf("load shared skills: %w", err)
 	}
+	mcpCatalog, err := runtimemcp.BuildCatalog(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("load mcps: %w", err)
+	}
 
 	catalog := &Catalog{
-		systemSkills: skillDescriptors(systemRaw, "system"),
 		sharedSkills: skillDescriptors(sharedRaw, "shared"),
 		agentsByID:   make(map[string]AgentResources, len(cfg.Agents.List)),
 		skillLoaders: make(map[string]*skill.Loader, len(cfg.Agents.List)),
-		globalLoader: skill.NewLoaderFromSkills(append(append([]skill.Skill(nil), systemRaw...), sharedRaw...)),
+		globalLoader: skill.NewLoaderFromSkills(sharedRaw),
+		mcps:         mcpCatalog,
 	}
 
 	for _, agentCfg := range cfg.Agents.List {
@@ -93,10 +94,9 @@ func BuildCatalog(cfg *config.Config, deps BuildDeps) (*Catalog, error) {
 			return nil, fmt.Errorf("load private skills for agent %q: %w", agentCfg.ID, err)
 		}
 
-		effectiveRaw := mergeSkillLayers(systemRaw, sharedRaw, privateRaw, agentCfg.InheritSharedSkills)
+		effectiveRaw := mergeSkillLayers(sharedRaw, privateRaw, agentCfg.InheritSharedSkills)
 		resource := AgentResources{
 			Agent:           cloneAgentConfig(agentCfg),
-			SystemSkills:    cloneSkillDescriptors(catalog.systemSkills),
 			SharedSkills:    nilSkillDescriptorsUnless(agentCfg.InheritSharedSkills, cloneSkillDescriptors(catalog.sharedSkills)),
 			PrivateSkills:   skillDescriptors(privateRaw, "private"),
 			EffectiveSkills: effectiveSkillDescriptors(cfg, privateDir, effectiveRaw),
@@ -108,13 +108,6 @@ func BuildCatalog(cfg *config.Config, deps BuildDeps) (*Catalog, error) {
 	}
 
 	return catalog, nil
-}
-
-func (c *Catalog) SystemSkills() []SkillDescriptor {
-	if c == nil {
-		return nil
-	}
-	return cloneSkillDescriptors(c.systemSkills)
 }
 
 func (c *Catalog) SharedSkills() []SkillDescriptor {
@@ -160,7 +153,14 @@ func (c *Catalog) GlobalLoader() *skill.Loader {
 	return c.globalLoader
 }
 
-func mergeSkillLayers(systemSkills, sharedSkills, privateSkills []skill.Skill, inheritShared bool) []skill.Skill {
+func (c *Catalog) MCPs() *runtimemcp.Catalog {
+	if c == nil {
+		return nil
+	}
+	return c.mcps
+}
+
+func mergeSkillLayers(sharedSkills, privateSkills []skill.Skill, inheritShared bool) []skill.Skill {
 	ordered := map[string]skill.Skill{}
 	order := []string{}
 	appendLayer := func(items []skill.Skill) {
@@ -172,7 +172,6 @@ func mergeSkillLayers(systemSkills, sharedSkills, privateSkills []skill.Skill, i
 		}
 	}
 
-	appendLayer(systemSkills)
 	if inheritShared {
 		appendLayer(sharedSkills)
 	}
@@ -280,8 +279,6 @@ func resolveSkillScope(cfg *config.Config, privateDir, filePath string) string {
 		return "private"
 	case cfg != nil && pathWithin(filePath, strings.TrimSpace(cfg.SharedSkillsDir)):
 		return "shared"
-	case cfg != nil && pathWithin(filePath, strings.TrimSpace(cfg.SystemSkillsDir)):
-		return "system"
 	default:
 		return "custom"
 	}
@@ -377,7 +374,6 @@ func cloneAgentConfig(agentCfg config.AgentConfig) config.AgentConfig {
 func cloneAgentResources(item AgentResources) AgentResources {
 	cloned := item
 	cloned.Agent = cloneAgentConfig(item.Agent)
-	cloned.SystemSkills = cloneSkillDescriptors(item.SystemSkills)
 	cloned.SharedSkills = cloneSkillDescriptors(item.SharedSkills)
 	cloned.PrivateSkills = cloneSkillDescriptors(item.PrivateSkills)
 	cloned.EffectiveSkills = cloneSkillDescriptors(item.EffectiveSkills)

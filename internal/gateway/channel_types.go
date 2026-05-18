@@ -3,8 +3,6 @@ package gateway
 import (
 	"context"
 	"time"
-
-	"github.com/Isites/anyai/internal/runtime/input"
 )
 
 // ChannelStatus describes the state of a channel.
@@ -42,10 +40,12 @@ type InboundMessage struct {
 	ChatType   ChatType
 	SenderID   string
 	SenderName string
+	SessionID  string
+	MessageID  string
 	Text       string
 	ReplyTo    string
 	Media      []MediaAttachment
-	Blocks     []input.InputBlock
+	Blocks     []InputBlock
 	Timestamp  time.Time
 }
 
@@ -53,6 +53,9 @@ type InboundMessage struct {
 type OutboundMessage struct {
 	ChatID      string
 	Text        string
+	AgentID     string
+	SessionID   string
+	RunID       string
 	ParseMode   string
 	ReplyMarkup any
 }
@@ -68,13 +71,16 @@ type MessagePolicyDecision struct {
 // message. Channels can optionally consume these events to surface runtime
 // status information to end-users.
 type RunEvent struct {
-	RunID         string
-	AgentID       string
-	SessionID     string
-	ParentAgentID string
-	Name          string
-	Timestamp     time.Time
-	Payload       map[string]any
+	RunID             string
+	TraceID           string
+	TraceNodeID       string
+	ParentTraceNodeID string
+	AgentID           string
+	SessionID         string
+	ParentAgentID     string
+	Name              string
+	Timestamp         time.Time
+	Payload           map[string]any
 }
 
 // ChannelInfo is the read-only channel inventory view exposed by gateway.
@@ -97,4 +103,10 @@ type Channel interface {
 // status updates in addition to final outbound text messages.
 type RunEventAware interface {
 	HandleRunEvent(ctx context.Context, event RunEvent) error
+}
+
+// FinalResponseAware lets event-driven channels opt out of the separate
+// terminal Send call when they render conversation state from replay.
+type FinalResponseAware interface {
+	WantsFinalResponseSend() bool
 }

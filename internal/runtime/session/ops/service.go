@@ -84,7 +84,14 @@ func (s *Service) recordSessionChange(change session.Change) {
 	if s == nil || change.Kind != session.ChangeAppend {
 		return
 	}
-	if change.Entry.Type != session.EntryTypeMessage || strings.TrimSpace(change.Entry.Role) != "assistant" {
+	switch change.Entry.Type {
+	case session.EntryTypeMessage:
+		if strings.TrimSpace(change.Entry.Role) != "assistant" {
+			return
+		}
+	case session.EntryTypeRuntimeControl:
+	case session.EntryTypeMeta:
+	default:
 		return
 	}
 	if strings.TrimSpace(change.Entry.RunID) == "" {
@@ -364,9 +371,13 @@ func (s *Service) RebuildFromEvents() error {
 			switch strings.TrimSpace(event.Name) {
 			case runtimeevents.EventSessionInputStored,
 				runtimeevents.EventSessionOutputStored,
+				runtimeevents.EventSessionRuntimeControlStored,
+				runtimeevents.EventSessionMetaStored,
 				runtimeevents.EventToolCallStarted,
 				runtimeevents.EventToolCompleted,
 				runtimeevents.EventToolFailed,
+				runtimeevents.EventRunFailed,
+				runtimeevents.EventRunAborted,
 				runtimeevents.EventRunFallbackReply,
 				runtimeevents.EventTextDelta,
 				"session.created",
@@ -506,6 +517,7 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 
 	var assistantText strings.Builder
 	var fallbackReply string
+	var terminalMeta string
 	for _, event := range events {
 		switch strings.TrimSpace(event.Name) {
 		case runtimeevents.EventSessionInputStored:
@@ -516,6 +528,21 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 				assistantText.Reset()
 				assistantText.WriteString(text)
 			}
+		case runtimeevents.EventSessionRuntimeControlStored:
+			text := strings.TrimSpace(stringPayload(event.Payload, "text"))
+			if text == "" {
+				continue
+			}
+			state.ensureSession().Append(session.ApplyEntryRefs(
+				session.RuntimeControlEntry(strings.TrimSpace(stringPayload(event.Payload, "kind")), text),
+				entryRefsFromEvent(event),
+			))
+		case runtimeevents.EventSessionMetaStored:
+			text := strings.TrimSpace(stringPayload(event.Payload, "text"))
+			if text == "" {
+				continue
+			}
+			state.ensureSession().Append(session.ApplyEntryRefs(session.MetaEntry(text), entryRefsFromEvent(event)))
 		case "session.created":
 			state.reset()
 		case "session.deleted":
@@ -584,6 +611,11 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 				trigger,
 				boolPayload(event.Payload, "legacy_heuristic"),
 			))
+		case runtimeevents.EventRunFailed, runtimeevents.EventRunAborted:
+			if hasSessionMetaEvent(events, event.RunID) {
+				continue
+			}
+			terminalMeta = runTerminalMetaText(event)
 		}
 	}
 
@@ -596,6 +628,63 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 			RunID: run.ID,
 		}))
 	}
+	if terminalMeta == "" && !hasSessionMetaEvent(events, run.ID) {
+		terminalMeta = runRecordTerminalMetaText(run)
+	}
+	if terminalMeta != "" {
+		state.ensureSession().Append(session.ApplyEntryRefs(session.MetaEntry(terminalMeta), session.EntryRefs{
+			RunID: run.ID,
+		}))
+	}
+}
+
+func runTerminalMetaText(event runtimeevents.EventRecord) string {
+	message := strings.TrimSpace(firstNonEmptyStringPayload(event.Payload, "message", "error"))
+	switch strings.TrimSpace(event.Name) {
+	case runtimeevents.EventRunFailed:
+		if message == "" {
+			message = "run failed"
+		}
+		return "Run failed: " + message
+	case runtimeevents.EventRunAborted:
+		if message == "" {
+			message = "run aborted"
+		}
+		return "Run aborted: " + message
+	default:
+		return ""
+	}
+}
+
+func runRecordTerminalMetaText(run runtimeevents.RunRecord) string {
+	message := strings.TrimSpace(run.Error)
+	switch run.Status {
+	case runtimeevents.RunStatusFailed:
+		if message == "" {
+			message = "run failed"
+		}
+		return "Run failed: " + message
+	case runtimeevents.RunStatusAborted:
+		if message == "" {
+			message = "run aborted"
+		}
+		return "Run aborted: " + message
+	default:
+		return ""
+	}
+}
+
+func hasSessionMetaEvent(events []runtimeevents.EventRecord, runID string) bool {
+	runID = strings.TrimSpace(runID)
+	for _, event := range events {
+		if strings.TrimSpace(event.Name) != runtimeevents.EventSessionMetaStored {
+			continue
+		}
+		if runID == "" || strings.TrimSpace(event.RunID) == runID {
+			return true
+		}
+	}
+	return false
 }
 
 type sessionReplay struct {
@@ -737,10 +826,19 @@ func structuredPlanFromPayload(payload map[string]any) (runtimeplan.Plan, bool) 
 func imagePayload(value any) []session.ImageData {
 	appendImage := func(images []session.ImageData, payload map[string]any) []session.ImageData {
 		image := session.ImageData{
+			ID:       strings.TrimSpace(stringPayload(payload, "id")),
 			MimeType: firstNonEmptyStringPayload(payload, "mime_type", "mimeType"),
 			Data:     strings.TrimSpace(stringPayload(payload, "data")),
+			Path:     strings.TrimSpace(stringPayload(payload, "path")),
+			Name:     strings.TrimSpace(stringPayload(payload, "name")),
 		}
-		if image.MimeType == "" && image.Data == "" {
+		if image.ID == "" {
+			image.ID = strings.TrimSpace(firstNonEmptyStringPayload(payload, "attachment_id", "attachmentID"))
+		}
+		if size := intPayload(payload, "size"); size > 0 {
+			image.Size = size
+		}
+		if image.ID == "" && image.MimeType == "" && image.Data == "" && image.Path == "" && image.Name == "" && image.Size == 0 {
 			return images
 		}
 		return append(images, image)
@@ -781,11 +879,12 @@ func sessionInputEntryFromEvents(events []runtimeevents.EventRecord) (session.Se
 		}
 		text := strings.TrimSpace(stringPayload(event.Payload, "text"))
 		images := imagePayload(event.Payload["images"])
+		entryID := strings.TrimSpace(stringPayload(event.Payload, "entry_id"))
 		if len(images) > 0 {
-			return session.ApplyEntryRefs(session.UserMessageWithImagesEntry(text, images), entryRefsFromEvent(event)), true
+			return session.ApplyEntryRefs(session.UserMessageWithImagesEntryWithID(entryID, text, images), entryRefsFromEvent(event)), true
 		}
 		if text != "" {
-			return session.ApplyEntryRefs(session.UserMessageEntry(text), entryRefsFromEvent(event)), true
+			return session.ApplyEntryRefs(session.UserMessageEntryWithID(entryID, text), entryRefsFromEvent(event)), true
 		}
 	}
 	return session.SessionEntry{}, false

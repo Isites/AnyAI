@@ -10,11 +10,10 @@ import (
 )
 
 type ProjectLayout struct {
-	DataDir         string
-	SessionsDir     string
-	MemoryDir       string
-	EventsDir       string
-	SystemSkillsDir string
+	DataDir     string
+	SessionsDir string
+	MemoryDir   string
+	EventsDir   string
 }
 
 func PrepareProjectLayout(cfg *config.Config) (ProjectLayout, error) {
@@ -23,8 +22,7 @@ func PrepareProjectLayout(cfg *config.Config) (ProjectLayout, error) {
 	}
 
 	layout := ProjectLayout{
-		DataDir:         cfg.RuntimeDataDir(),
-		SystemSkillsDir: strings.TrimSpace(cfg.SystemSkillsDir),
+		DataDir: cfg.RuntimeDataDir(),
 	}
 	layout.SessionsDir = filepath.Join(layout.DataDir, "sessions")
 	layout.EventsDir = filepath.Join(layout.DataDir, "events")
@@ -35,11 +33,6 @@ func PrepareProjectLayout(cfg *config.Config) (ProjectLayout, error) {
 
 	if err := os.MkdirAll(layout.SessionsDir, 0o755); err != nil {
 		return ProjectLayout{}, fmt.Errorf("create sessions dir: %w", err)
-	}
-	if layout.SystemSkillsDir != "" {
-		if err := os.MkdirAll(layout.SystemSkillsDir, 0o755); err != nil {
-			return ProjectLayout{}, fmt.Errorf("create system skills dir: %w", err)
-		}
 	}
 	if err := os.MkdirAll(layout.MemoryDir, 0o755); err != nil {
 		return ProjectLayout{}, fmt.Errorf("create memory dir: %w", err)

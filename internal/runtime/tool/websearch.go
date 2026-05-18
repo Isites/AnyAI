@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-const searchTimeout = 15 * time.Second
-
 // WebSearchTool searches the web and returns results.
 // Uses DuckDuckGo's HTML search (no API key required).
 type WebSearchTool struct{}
@@ -29,7 +27,7 @@ func (t *WebSearchTool) Description() string {
 }
 
 func (t *WebSearchTool) ToolMetadata() ToolMetadata {
-	return readOnlyToolMetadata(t.Name(), searchToolTimeoutMS)
+	return readOnlyToolMetadata(t.Name(), int64(WebSearchTimeout/time.Millisecond))
 }
 
 func (t *WebSearchTool) Parameters() json.RawMessage {
@@ -67,7 +65,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, input json.RawMessage) (Too
 		maxResults = 10
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, WebSearchTimeout)
 	defer cancel()
 
 	results, err := duckDuckGoSearch(ctx, in.Query, maxResults)

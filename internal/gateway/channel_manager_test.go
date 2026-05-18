@@ -323,6 +323,9 @@ func TestChannelManagerRouting(t *testing.T) {
 	require.Len(t, sent, 1)
 	assert.Equal(t, "chat1", sent[0].ChatID) // Should reply to the chat ID
 	assert.Equal(t, "Hello from agent!", sent[0].Text)
+	assert.Equal(t, "agent1", sent[0].AgentID)
+	assert.Equal(t, "mock1_chat1", sent[0].SessionID)
+	assert.NotEmpty(t, sent[0].RunID)
 
 	cm.Stop()
 }
@@ -411,7 +414,7 @@ func TestChannelManagerForwardRunEventIncludesToolRecoveryEvents(t *testing.T) {
 			Decision:    "retry",
 		},
 	}) {
-		require.NoError(t, mock.HandleRunEvent(context.Background(), cm.dispatch.channelRunEventFromRecord(record)))
+		require.NoError(t, mock.HandleRunEvent(context.Background(), cm.dispatch.channelRunEventFromRecord(gatewayEvent(record))))
 	}
 	for _, record := range runtimeevents.EventRecordsForAgentEvent(run, agent.AgentEvent{
 		Type:     agent.EventToolWarning,
@@ -424,7 +427,7 @@ func TestChannelManagerForwardRunEventIncludesToolRecoveryEvents(t *testing.T) {
 			Blocked:  true,
 		},
 	}) {
-		require.NoError(t, mock.HandleRunEvent(context.Background(), cm.dispatch.channelRunEventFromRecord(record)))
+		require.NoError(t, mock.HandleRunEvent(context.Background(), cm.dispatch.channelRunEventFromRecord(gatewayEvent(record))))
 	}
 
 	events := mock.Events()

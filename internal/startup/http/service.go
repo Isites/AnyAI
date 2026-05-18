@@ -9,7 +9,6 @@ import (
 
 	"github.com/Isites/anyai/internal/config"
 	"github.com/Isites/anyai/internal/gateway"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	httpapi "github.com/Isites/anyai/internal/startup/http/api"
 	httpserver "github.com/Isites/anyai/internal/startup/http/server"
 	httpui "github.com/Isites/anyai/internal/startup/http/ui"
@@ -136,16 +135,16 @@ type memoryOverviewView struct {
 }
 
 type overviewView struct {
-	ProjectName string                    `json:"project_name,omitempty"`
-	Version     string                    `json:"version"`
-	GeneratedAt time.Time                 `json:"generated_at"`
-	Gateway     map[string]any            `json:"gateway"`
-	Channels    []channelView             `json:"channels"`
-	Counts      countsView                `json:"counts"`
-	Memory      memoryOverviewView        `json:"memory"`
-	Agents      []config.AgentConfig      `json:"agents"`
-	RecentRuns  []runtimeevents.RunRecord `json:"recent_runs"`
-	Jobs        []map[string]any          `json:"jobs"`
+	ProjectName string               `json:"project_name,omitempty"`
+	Version     string               `json:"version"`
+	GeneratedAt time.Time            `json:"generated_at"`
+	Gateway     map[string]any       `json:"gateway"`
+	Channels    []channelView        `json:"channels"`
+	Counts      countsView           `json:"counts"`
+	Memory      memoryOverviewView   `json:"memory"`
+	Agents      []config.AgentConfig `json:"agents"`
+	RecentRuns  []gateway.Run        `json:"recent_runs"`
+	Jobs        []map[string]any     `json:"jobs"`
 }
 
 type endpointDoc struct {
@@ -287,9 +286,9 @@ func (p *ControlPlane) overview() overviewView {
 		overview.Counts.Runs = len(runs)
 		for _, run := range runs {
 			switch run.Status {
-			case runtimeevents.RunStatusRunning, runtimeevents.RunStatusQueued:
+			case gateway.RunStatusRunning, gateway.RunStatusQueued:
 				overview.Counts.RunningRuns++
-			case runtimeevents.RunStatusFailed, runtimeevents.RunStatusAborted:
+			case gateway.RunStatusFailed, gateway.RunStatusAborted:
 				overview.Counts.FailedRuns++
 			}
 		}
@@ -338,11 +337,7 @@ func (p *ControlPlane) jobs() []map[string]any {
 	if p == nil || p.inventory == nil {
 		return nil
 	}
-	js := p.inventory.JobScheduler()
-	if js == nil {
-		return nil
-	}
-	jobs := js.ListJobs()
+	jobs := p.inventory.ListJobs()
 	result := make([]map[string]any, 0, len(jobs))
 	for _, job := range jobs {
 		result = append(result, map[string]any{
@@ -460,8 +455,9 @@ func (p *ControlPlane) catalog() catalogView {
 				RequestFields: []fieldDoc{
 					{Name: "agent_id", Type: "string", Description: "目标 agent ID。可为空，此时按入口 agent / 路由默认规则解析。"},
 					{Name: "session_id", Type: "string", Description: "建议显式传入，便于持续会话和历史恢复。"},
+					{Name: "message_id", Type: "string", Description: "可选的客户端消息 ID；用于 session/replay 去重与恢复。"},
 					{Name: "text", Type: "string", Description: "纯文本场景可直接传 text；与 inputs 二选一即可。"},
-					{Name: "inputs", Type: "[]InputBlock", Description: "多模态、文件或结构化输入时使用。"},
+					{Name: "inputs", Type: "[]InputBlock", Description: "多模态、文件或结构化输入时使用；上传附件先调用 /api/attachments，再提交返回的引用块。"},
 				},
 				ResponseFields: []fieldDoc{
 					{Name: "run.id", Type: "string", Description: "非流式模式下返回的运行 ID。"},
@@ -470,6 +466,7 @@ func (p *ControlPlane) catalog() catalogView {
 				Example: map[string]any{
 					"agent_id":   "assistant",
 					"session_id": "demo-session",
+					"message_id": "msg_001",
 					"text":       "请概述当前项目的 HTTP 架构",
 				},
 				ResponseExample: map[string]any{
@@ -487,7 +484,38 @@ func (p *ControlPlane) catalog() catalogView {
 				},
 				Curl: `curl -N -X POST 'http://127.0.0.1:18789/api/chat?stream=1' \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id":"assistant","session_id":"demo-session","text":"你好"}'`,
+  -d '{"agent_id":"assistant","session_id":"demo-session","message_id":"msg_001","text":"你好"}'`,
+			},
+			{
+				Method:      "POST",
+				Path:        "/api/attachments",
+				Group:       "Inputs",
+				Transport:   "HTTP",
+				Summary:     "上传附件并返回可复用输入块",
+				Description: "multipart/form-data 上传文件到项目 anyai/assets/uploads 下，响应里的 inputs 可直接传给 /api/chat 或 /api/runs；图片和 PDF 会按 MIME/扩展名自动标记为 image/pdf。",
+				RequestFields: []fieldDoc{
+					{Name: "files", Type: "multipart file[]", Description: "一个或多个文件。"},
+					{Name: "file", Type: "multipart file", Description: "单文件兼容字段。"},
+				},
+				ResponseFields: []fieldDoc{
+					{Name: "inputs[].type", Type: "string", Description: "file/image/pdf。"},
+					{Name: "inputs[].attachment_id", Type: "string", Description: "持久化附件 ID。"},
+					{Name: "inputs[].path", Type: "string", Description: "服务端 assets 目录中的文件路径引用。"},
+					{Name: "inputs[].mime_type", Type: "string", Description: "附件 MIME 类型。"},
+				},
+				Example: map[string]any{
+					"multipart": "files=@diagram.png",
+				},
+				ResponseExample: map[string]any{
+					"inputs": []map[string]any{{
+						"type":          "image",
+						"name":          "diagram.png",
+						"attachment_id": "att_123",
+						"path":          "/project/anyai/assets/uploads/att_123/diagram.png",
+						"mime_type":     "image/png",
+					}},
+				},
+				Curl: `curl -F 'files=@diagram.png' http://127.0.0.1:18789/api/attachments`,
 			},
 			{
 				Method:      "POST",
@@ -499,6 +527,7 @@ func (p *ControlPlane) catalog() catalogView {
 				RequestFields: []fieldDoc{
 					{Name: "agent_id", Type: "string", Description: "目标 agent ID。可为空，此时按入口 agent / 路由默认规则解析。"},
 					{Name: "session_id", Type: "string", Description: "建议由调用方显式传入，便于持续会话和历史恢复。"},
+					{Name: "message_id", Type: "string", Description: "可选的客户端消息 ID；用于 session/replay 去重与恢复。"},
 					{Name: "inputs", Type: "[]InputBlock", Required: true, Description: "至少一个合法输入块，常见为 text、file、dir、image、pdf、url。"},
 				},
 				ResponseFields: []fieldDoc{
@@ -846,10 +875,11 @@ func (p *ControlPlane) catalog() catalogView {
 				Fields: []fieldDoc{
 					{Name: "agent_id", Type: "string", Description: "目标 agent。"},
 					{Name: "session_id", Type: "string", Description: "可选但强烈建议传入。"},
+					{Name: "message_id", Type: "string", Description: "可选的客户端消息 ID；重复 replay/live 事件可按该 ID 去重。"},
 					{Name: "text", Type: "string", Description: "纯文本输入。"},
-					{Name: "inputs", Type: "[]InputBlock", Description: "多模态或文件输入。"},
+					{Name: "inputs", Type: "[]InputBlock", Description: "多模态或文件输入；附件引用可来自 /api/attachments。"},
 				},
-				Example: map[string]any{"agent_id": "assistant", "session_id": "demo-session", "text": "你好"},
+				Example: map[string]any{"agent_id": "assistant", "session_id": "demo-session", "message_id": "msg_001", "text": "你好"},
 			},
 			{
 				Name:        "InputBlock",
@@ -858,7 +888,8 @@ func (p *ControlPlane) catalog() catalogView {
 				Fields: []fieldDoc{
 					{Name: "type", Type: "string", Description: "text/file/dir/image/pdf/url。"},
 					{Name: "text", Type: "string", Description: "当 type=text 时携带用户文本。"},
-					{Name: "path", Type: "string", Description: "当 type=file/dir/pdf 时可传本地路径。"},
+					{Name: "path", Type: "string", Description: "当 type=file/dir/image/pdf 时传服务端可读取路径，WebUI/HTTP 上传场景使用 assets 引用路径。"},
+					{Name: "attachment_id", Type: "string", Description: "已持久化附件 ID，用于工具读取、回显与 session 中的小引用。"},
 					{Name: "url", Type: "string", Description: "当 type=url 时可传远端地址。"},
 					{Name: "mime_type", Type: "string", Description: "二进制或图像类型说明。"},
 					{Name: "meta", Type: "object", Description: "调用方自定义扩展字段。"},

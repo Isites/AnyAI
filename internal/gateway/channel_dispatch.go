@@ -2,12 +2,8 @@ package gateway
 
 import (
 	"context"
-	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
 	"strings"
 	"time"
-
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 )
 
 type dispatcher struct {
@@ -24,17 +20,17 @@ func newDispatcher(runtime ChannelPort, dmPolicy string) *dispatcher {
 
 func (d *dispatcher) handle(ctx context.Context, ch Channel, msg InboundMessage) {
 	if d == nil || d.runtime == nil {
-		runtimelogging.Error("channel runtime is not configured", "channel", ch.Name())
+		Error("channel runtime is not configured", "channel", ch.Name())
 		return
 	}
 
 	policy := d.runtime.EvaluateMessagePolicy(ch.Name(), d.dmPolicy, msg)
 	if !policy.Accepted {
 		if policy.Reason == "unknown_direct_sender_notify" {
-			runtimelogging.Info("message from unknown sender (dm policy: notify)",
+			Info("message from unknown sender (dm policy: notify)",
 				"channel", ch.Name(), "sender", msg.SenderID)
 		} else {
-			runtimelogging.Debug("message from unknown sender ignored (dm policy: ignore)",
+			Debug("message from unknown sender ignored (dm policy: ignore)",
 				"channel", ch.Name(), "sender", msg.SenderID)
 		}
 		return
@@ -43,7 +39,7 @@ func (d *dispatcher) handle(ctx context.Context, ch Channel, msg InboundMessage)
 	ingressReq := ingressRequestForInboundMessage(ch.Name(), msg)
 	resolvedAgentID := d.runtime.ResolveIngressAgent(ingressReq)
 
-	runtimelogging.Info("processing message",
+	Info("processing message",
 		"channel", ch.Name(),
 		"sender", msg.SenderID,
 		"agent", resolvedAgentID,
@@ -51,12 +47,14 @@ func (d *dispatcher) handle(ctx context.Context, ch Channel, msg InboundMessage)
 
 	run, err := d.runtime.StartIngressRun(ctx, ingressReq)
 	if err != nil {
-		runtimelogging.Error("agent run error", "error", err, "channel", ch.Name(), "sender", msg.SenderID)
+		Error("agent run error", "error", err, "channel", ch.Name(), "sender", msg.SenderID)
 		if sendErr := ch.Send(ctx, OutboundMessage{
-			ChatID: responseChatID(msg),
-			Text:   "Sorry, I encountered an error. Please try again.",
+			ChatID:    responseChatID(msg),
+			Text:      "Sorry, I encountered an error. Please try again.",
+			AgentID:   resolvedAgentID,
+			SessionID: ingressReq.SessionID,
 		}); sendErr != nil {
-			runtimelogging.Error("send error response", "error", sendErr)
+			Error("send error response", "error", sendErr)
 		}
 		return
 	}
@@ -67,13 +65,13 @@ func (d *dispatcher) handle(ctx context.Context, ch Channel, msg InboundMessage)
 	for event := range run.Events {
 		if eventAware, ok := ch.(RunEventAware); ok {
 			if err := eventAware.HandleRunEvent(ctx, d.channelRunEventFromRecord(event)); err != nil {
-				runtimelogging.Warn("channel rejected run event", "channel", ch.Name(), "event", event.Name, "error", err)
+				Warn("channel rejected run event", "channel", ch.Name(), "event", event.Name, "error", err)
 			}
 		}
 
 		response.Observe(event)
-		if message := runtimeevents.FailureMessage(event); message != "" {
-			runtimelogging.Error("agent run failed", "message", message, "agent", run.AgentID)
+		if message := failureMessage(event); message != "" {
+			Error("agent run failed", "message", message, "agent", run.AgentID)
 			response.SetFallbackIfEmpty("Sorry, I encountered an error processing your request.")
 		}
 	}
@@ -89,12 +87,18 @@ func (d *dispatcher) handle(ctx context.Context, ch Channel, msg InboundMessage)
 	if finalResponse == "" {
 		return
 	}
+	if finalAware, ok := ch.(FinalResponseAware); ok && !finalAware.WantsFinalResponseSend() {
+		return
+	}
 
 	if err := ch.Send(ctx, OutboundMessage{
-		ChatID: responseChatID(msg),
-		Text:   finalResponse,
+		ChatID:    responseChatID(msg),
+		Text:      finalResponse,
+		AgentID:   run.AgentID,
+		SessionID: run.SessionID,
+		RunID:     run.RunID,
 	}); err != nil {
-		runtimelogging.Error("send response", "error", err, "channel", ch.Name())
+		Error("send response", "error", err, "channel", ch.Name())
 	}
 }
 
@@ -104,25 +108,25 @@ type channelResponseBuffer struct {
 
 // channelResponseBuffer mirrors run-level replay buffering for channel.Send:
 // progress text before context-producing tools is not a final chat reply.
-func (b *channelResponseBuffer) Observe(event runtimeevents.EventRecord) {
-	if text := runtimeevents.TextDelta(event); text != "" {
+func (b *channelResponseBuffer) Observe(event Event) {
+	if text := textDelta(event); text != "" {
 		b.text.WriteString(text)
 		return
 	}
 	switch strings.TrimSpace(event.Name) {
-	case runtimeevents.EventToolRetrying,
-		runtimeevents.EventToolWarning,
-		runtimeevents.EventToolCallRequested,
-		runtimeevents.EventToolCallStarted,
-		runtimeevents.EventToolCompleted,
-		runtimeevents.EventToolFailed:
+	case EventToolRetrying,
+		EventToolWarning,
+		EventToolCallRequested,
+		EventToolCallStarted,
+		EventToolCompleted,
+		EventToolFailed:
 		if shouldResetChannelResponseForTool(event) {
 			b.text.Reset()
 		}
-	case runtimeevents.EventAgentCallStarted,
-		runtimeevents.EventAgentCallSubmitted,
-		runtimeevents.EventAgentCallCompleted,
-		runtimeevents.EventAgentCallFailed:
+	case EventAgentCallStarted,
+		EventAgentCallSubmitted,
+		EventAgentCallCompleted,
+		EventAgentCallFailed:
 		b.text.Reset()
 	}
 }
@@ -138,16 +142,16 @@ func (b *channelResponseBuffer) Final() string {
 	return strings.TrimSpace(b.text.String())
 }
 
-func shouldResetChannelResponseForTool(event runtimeevents.EventRecord) bool {
-	switch strings.TrimSpace(runtimeevents.ToolName(event)) {
-	case "goal_complete", "await_user_input", "save_output":
+func shouldResetChannelResponseForTool(event Event) bool {
+	switch strings.TrimSpace(toolName(event)) {
+	case "goal_complete", "await_user_input":
 		return false
 	default:
 		return true
 	}
 }
 
-func (d *dispatcher) forwardRunTree(ctx context.Context, ch Channel, run *runtimeport.ManagedRun) chan struct{} {
+func (d *dispatcher) forwardRunTree(ctx context.Context, ch Channel, run *ManagedRun) chan struct{} {
 	eventAware, ok := ch.(RunEventAware)
 	if !ok || d == nil || d.runtime == nil || run == nil || strings.TrimSpace(run.RunID) == "" {
 		return nil
@@ -187,30 +191,103 @@ func (d *dispatcher) forwardRunTree(ctx context.Context, ch Channel, run *runtim
 	return done
 }
 
-func (d *dispatcher) forwardRunTreeRecord(ctx context.Context, ch Channel, eventAware RunEventAware, entryRunID, entryAgentID string, record runtimeevents.EventRecord) bool {
+func (d *dispatcher) forwardRunTreeRecord(ctx context.Context, ch Channel, eventAware RunEventAware, entryRunID, entryAgentID string, record Event) bool {
 	if record.RunID == entryRunID && record.AgentID == entryAgentID {
 		return true
 	}
 	if err := eventAware.HandleRunEvent(ctx, d.channelRunEventFromRecord(record)); err != nil {
-		runtimelogging.Warn("channel rejected run tree event", "channel", ch.Name(), "event", record.Name, "error", err)
+		Warn("channel rejected run tree event", "channel", ch.Name(), "event", record.Name, "error", err)
 	}
 	return true
 }
 
-func (d *dispatcher) channelRunEventFromRecord(record runtimeevents.EventRecord) RunEvent {
+func (d *dispatcher) channelRunEventFromRecord(record Event) RunEvent {
 	out := RunEvent{
-		RunID:     record.RunID,
-		AgentID:   record.AgentID,
-		SessionID: record.SessionID,
-		Name:      record.Name,
-		Timestamp: record.Timestamp,
-		Payload:   record.Payload,
+		RunID:             record.RunID,
+		TraceID:           record.TraceID,
+		TraceNodeID:       record.TraceNodeID,
+		ParentTraceNodeID: record.ParentTraceNodeID,
+		AgentID:           record.AgentID,
+		SessionID:         record.SessionID,
+		Name:              record.Name,
+		Timestamp:         record.Timestamp,
+		Payload:           record.Payload,
 	}
 	if d == nil || d.runtime == nil {
 		return out
 	}
 	if run, ok := d.runtime.GetRun(record.RunID); ok {
 		out.ParentAgentID = run.ParentAgentID
+		if out.TraceID == "" {
+			out.TraceID = run.TraceID
+		}
+		if out.TraceNodeID == "" {
+			out.TraceNodeID = run.TraceNodeID
+		}
+		if out.ParentTraceNodeID == "" {
+			out.ParentTraceNodeID = run.ParentTraceNodeID
+		}
+	}
+	if out.TraceNodeID == "" {
+		out.TraceNodeID = traceNodeID(out.RunID, out.AgentID)
+	}
+	if out.TraceID == "" {
+		out.TraceID = out.RunID
 	}
 	return out
+}
+
+func textDelta(event Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	if value, ok := event.Payload["text"].(string); ok {
+		return value
+	}
+	return ""
+}
+
+func failureMessage(event Event) string {
+	switch strings.TrimSpace(event.Name) {
+	case EventRunFailed:
+		if event.Payload != nil {
+			if msg, ok := event.Payload["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				return strings.TrimSpace(msg)
+			}
+			if errMsg, ok := event.Payload["error"].(string); ok && strings.TrimSpace(errMsg) != "" {
+				return strings.TrimSpace(errMsg)
+			}
+		}
+	case EventToolFailed:
+		if event.Payload != nil {
+			if errMsg, ok := event.Payload["error"].(string); ok && strings.TrimSpace(errMsg) != "" {
+				return strings.TrimSpace(errMsg)
+			}
+		}
+	}
+	return ""
+}
+
+func toolName(event Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	for _, key := range []string{"tool", "name", "tool_name"} {
+		if value, ok := event.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func traceNodeID(runID, agentID string) string {
+	runID = strings.TrimSpace(runID)
+	agentID = strings.TrimSpace(agentID)
+	if runID == "" {
+		return ""
+	}
+	if agentID == "" {
+		return runID
+	}
+	return runID + "::" + agentID
 }

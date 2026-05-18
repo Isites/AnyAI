@@ -18,8 +18,9 @@ type compactFallbackProvider struct {
 func (p *compactFallbackProvider) ChatStream(_ context.Context, req ChatRequest) (<-chan ChatEvent, error) {
 	p.lastReq = req
 	p.seenCalls++
-	ch := make(chan ChatEvent, len(p.events))
-	for _, event := range p.events {
+	events := p.events
+	ch := make(chan ChatEvent, len(events))
+	for _, event := range events {
 		ch <- event
 	}
 	close(ch)

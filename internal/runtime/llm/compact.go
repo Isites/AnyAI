@@ -82,7 +82,7 @@ func compactViaChatStream(
 
 	msgs := append([]Message(nil), req.Messages...)
 	msgs = append(msgs, Message{
-		Role:    "user",
+		Role:    MessageRoleUser,
 		Content: userPrompt,
 	})
 

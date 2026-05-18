@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -59,4 +60,30 @@ func TestSanitizeToolResultRedactsOutputAndMetadata(t *testing.T) {
 	nested, ok := sanitized.Metadata["nested"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "[REDACTED]", nested["password"])
+}
+
+func TestSanitizeToolInputForTranscriptSummarizesWriteFileContent(t *testing.T) {
+	raw := json.RawMessage(`{"path":"report.md","content":"` + strings.Repeat("a", 400) + `"}`)
+
+	sanitized := SanitizeToolInputForTranscript("write_file", raw)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(sanitized, &payload))
+	assert.Equal(t, "report.md", payload["path"])
+	assert.Equal(t, float64(400), payload["content_bytes"])
+	assert.Contains(t, payload["content"], "content omitted")
+	assert.Less(t, len(payload["content"].(string)), 320)
+}
+
+func TestSanitizeToolInputForTranscriptSummarizesWriteFilePatchPaths(t *testing.T) {
+	patch := "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** Move to: b.txt\n*** End Patch"
+	raw, err := json.Marshal(map[string]any{"patch": patch})
+	require.NoError(t, err)
+
+	sanitized := SanitizeToolInputForTranscript("write_file", raw)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(sanitized, &payload))
+	assert.Equal(t, []any{"a.txt", "b.txt"}, payload["patch_paths"])
+	assert.Equal(t, float64(len(patch)), payload["patch_bytes"])
 }

@@ -20,15 +20,16 @@ type InputEnvelope struct {
 
 // InputBlock represents a single typed input element.
 type InputBlock struct {
-	ID       string         `json:"id,omitempty"`
-	Type     string         `json:"type"`
-	Name     string         `json:"name,omitempty"`
-	Text     string         `json:"text,omitempty"`
-	Path     string         `json:"path,omitempty"`
-	URL      string         `json:"url,omitempty"`
-	MimeType string         `json:"mime_type,omitempty"`
-	Data     []byte         `json:"data,omitempty"`
-	Meta     map[string]any `json:"meta,omitempty"`
+	ID           string         `json:"id,omitempty"`
+	Type         string         `json:"type"`
+	Name         string         `json:"name,omitempty"`
+	Text         string         `json:"text,omitempty"`
+	Path         string         `json:"path,omitempty"`
+	AttachmentID string         `json:"attachment_id,omitempty"`
+	URL          string         `json:"url,omitempty"`
+	MimeType     string         `json:"mime_type,omitempty"`
+	Data         []byte         `json:"data,omitempty"`
+	Meta         map[string]any `json:"meta,omitempty"`
 }
 
 // Valid returns true if the block type is recognized.

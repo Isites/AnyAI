@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -18,12 +20,14 @@ import (
 
 	"github.com/Isites/anyai/internal/config"
 	"github.com/Isites/anyai/internal/registry"
+	"github.com/Isites/anyai/internal/runtime/agent"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	"github.com/Isites/anyai/internal/runtime/input"
 	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/memory"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/Isites/anyai/internal/runtime/session"
+	runtimesessionops "github.com/Isites/anyai/internal/runtime/session/ops"
 	"github.com/Isites/anyai/internal/runtime/task"
 	"github.com/Isites/anyai/internal/runtime/testutil"
 	"github.com/Isites/anyai/internal/runtime/tool"
@@ -69,6 +73,71 @@ func (p *capturingProvider) Requests() []llm.ChatRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]llm.ChatRequest(nil), p.requests...)
+}
+
+type stagedProvider struct {
+	mu       sync.Mutex
+	requests []llm.ChatRequest
+	handler  func(callIndex int, req llm.ChatRequest) ([]llm.ChatEvent, error)
+}
+
+func (p *stagedProvider) ChatStream(_ context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	p.mu.Lock()
+	callIndex := len(p.requests)
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+
+	events, err := p.handler(callIndex, req)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan llm.ChatEvent, len(events))
+	for _, event := range events {
+		ch <- event
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (p *stagedProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "mock-model", Name: "Mock Model", Provider: "test"}}
+}
+
+func (p *stagedProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
+	return llm.CompactResponse{Summary: "staged compact summary"}, nil
+}
+
+func (p *stagedProvider) Requests() []llm.ChatRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.ChatRequest(nil), p.requests...)
+}
+
+type failingProvider struct {
+	err error
+}
+
+func (p failingProvider) ChatStream(context.Context, llm.ChatRequest) (<-chan llm.ChatEvent, error) {
+	return nil, p.err
+}
+
+func (p failingProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "failing-model", Name: "Failing Model", Provider: "test"}}
+}
+
+func (p failingProvider) Compact(context.Context, llm.CompactRequest) (llm.CompactResponse, error) {
+	return llm.CompactResponse{Summary: "failing compact summary"}, nil
+}
+
+type agentRuntimeConfigurerFunc func(*agent.Runtime)
+
+func (f agentRuntimeConfigurerFunc) ConfigureAgentRuntime(rt any) error {
+	agentRuntime, ok := rt.(*agent.Runtime)
+	if !ok {
+		return fmt.Errorf("unexpected runtime type %T", rt)
+	}
+	f(agentRuntime)
+	return nil
 }
 
 type streamingProvider struct {
@@ -190,6 +259,38 @@ func (p *contextCapturingProvider) Contexts() []tools.RuntimeContext {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]tools.RuntimeContext(nil), p.contexts...)
+}
+
+type imageToolExecutor struct{}
+
+func (imageToolExecutor) Execute(_ context.Context, name string, _ json.RawMessage) (tools.ToolResult, error) {
+	if name != "image_tool" {
+		return tools.ToolResult{}, fmt.Errorf("unknown tool: %q", name)
+	}
+	return tools.ToolResult{
+		Output: "generated image",
+		Images: []llm.ImageContent{{
+			Name:     "tool.png",
+			MimeType: "image/png",
+			Data:     []byte{0x89, 'P', 'N', 'G'},
+		}},
+	}, nil
+}
+
+func (imageToolExecutor) ToolDefs() []llm.ToolDef {
+	return []llm.ToolDef{{
+		Name:        "image_tool",
+		Description: "Return a generated test image.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
+	}}
+}
+
+func (imageToolExecutor) Names() []string {
+	return []string{"image_tool"}
+}
+
+func (imageToolExecutor) Get(name string) (tools.Tool, bool) {
+	return nil, name == "image_tool"
 }
 
 type noopAgentCallRunner struct {
@@ -331,6 +432,175 @@ func toolDefNames(defs []llm.ToolDef) []string {
 	return names
 }
 
+func TestStartManagedRunPersistsToolImagesToAssets(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "agent")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = root
+	cfg.ProjectConfigDir = root
+	cfg.Agents.List = []config.AgentConfig{{
+		ID:        "assistant",
+		Name:      "Assistant",
+		Model:     "test/mock-model",
+		Workspace: workspace,
+		Tools:     config.ToolPolicy{Allow: []string{"image_tool"}},
+	}}
+
+	store := session.NewStore(t.TempDir())
+	recorder := runtimeevents.NewRecorder()
+	provider := &stagedProvider{
+		handler: func(callIndex int, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+			switch callIndex {
+			case 0:
+				return toolEventsForExecution(jsonToolCallForExecution("tc_image", "image_tool", map[string]any{})), nil
+			default:
+				var toolImages []llm.ImageContent
+				for _, msg := range req.Messages {
+					if msg.ToolCallID == "tc_image" {
+						toolImages = append(toolImages, msg.Images...)
+					}
+				}
+				require.Len(t, toolImages, 1)
+				assert.Equal(t, "image/png", toolImages[0].MimeType)
+				assert.Equal(t, []byte{0x89, 'P', 'N', 'G'}, toolImages[0].Data)
+				return []llm.ChatEvent{
+					{Type: llm.EventTextDelta, Text: "saw persisted image"},
+					{Type: llm.EventDone},
+				}, nil
+			}
+		},
+	}
+
+	run, err := StartManagedRun(context.Background(), runtimeport.ExecutionDeps{
+		Providers:    map[string]llm.LLMProvider{"test": provider},
+		Config:       cfg,
+		SessionStore: store,
+		Recorder:     recorder,
+		RuntimeConfigurer: agentRuntimeConfigurerFunc(func(rt *agent.Runtime) {
+			rt.Tools = imageToolExecutor{}
+		}),
+	}, runtimeport.RunRequest{
+		RunID:     "run_tool_image",
+		AgentID:   "assistant",
+		SessionID: "session-tool-image",
+		Envelope:  input.NewEnvelopeFromText("session-tool-image", "create an image"),
+	})
+	require.NoError(t, err)
+	drainManagedRun(t, run)
+
+	imagePath := filepath.Join(root, "anyai", "assets", "run_tool_image", "tool_results", "tc_image", "tool.png")
+	assert.FileExists(t, imagePath)
+
+	sess, err := store.Load("assistant", "session-tool-image")
+	require.NoError(t, err)
+	var persistedImage session.ImageData
+	for _, entry := range sess.Entries() {
+		if entry.Type != session.EntryTypeToolResult {
+			continue
+		}
+		var data session.ToolResultData
+		require.NoError(t, json.Unmarshal(entry.Data, &data))
+		if data.ToolCallID == "tc_image" {
+			require.Len(t, data.Images, 1)
+			persistedImage = data.Images[0]
+		}
+	}
+	assert.Equal(t, imagePath, persistedImage.Path)
+	assert.Empty(t, persistedImage.Data)
+
+	var eventImage map[string]any
+	for _, event := range recorder.ListRunEvents("run_tool_image") {
+		if event.Name != runtimeevents.EventToolCompleted {
+			continue
+		}
+		images, _ := event.Payload["images"].([]map[string]any)
+		if len(images) == 0 {
+			rawImages, _ := event.Payload["images"].([]any)
+			if len(rawImages) > 0 {
+				eventImage, _ = rawImages[0].(map[string]any)
+			}
+		} else {
+			eventImage = images[0]
+		}
+	}
+	require.NotNil(t, eventImage)
+	assert.Equal(t, imagePath, eventImage["path"])
+	_, hasData := eventImage["data"]
+	assert.False(t, hasData)
+}
+
+func TestStartManagedRunPersistsRunFailureMeta(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "agent")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = root
+	cfg.ProjectConfigDir = root
+	cfg.Agents.List = []config.AgentConfig{
+		{
+			ID:        "assistant",
+			Name:      "Assistant",
+			Model:     "test/failing-model",
+			Workspace: workspace,
+		},
+	}
+
+	store := session.NewStore(t.TempDir())
+	recorder := runtimeevents.NewRecorder()
+	_ = runtimesessionops.NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return recorder },
+	)
+	run, err := StartManagedRun(context.Background(), runtimeport.ExecutionDeps{
+		Providers:    map[string]llm.LLMProvider{"test": failingProvider{err: errors.New("provider unavailable")}},
+		Config:       cfg,
+		SessionStore: store,
+		Recorder:     recorder,
+		RuntimeConfigurer: agentRuntimeConfigurerFunc(func(rt *agent.Runtime) {
+			rt.LLMMaxAttempts = 1
+		}),
+	}, runtimeport.RunRequest{
+		RunID:     "run_failed",
+		AgentID:   "assistant",
+		SessionID: "session-failed",
+		Envelope:  input.NewEnvelopeFromText("session-failed", "please fail"),
+	})
+	require.NoError(t, err)
+
+	var sawFailed bool
+	for event := range run.Events {
+		if event.Name == runtimeevents.EventRunFailed {
+			sawFailed = true
+		}
+	}
+	require.True(t, sawFailed)
+
+	sess, err := store.Load("assistant", "session-failed")
+	require.NoError(t, err)
+	history := sess.History()
+	require.NotEmpty(t, history)
+	last := history[len(history)-1]
+	require.Equal(t, session.EntryTypeMeta, last.Type)
+
+	var meta session.MessageData
+	require.NoError(t, json.Unmarshal(last.Data, &meta))
+	assert.Contains(t, meta.Text, "Run failed: llm error: provider unavailable")
+
+	events := recorder.ListRunEvents("run_failed")
+	var sawMeta bool
+	for _, event := range events {
+		if event.Name == runtimeevents.EventSessionMetaStored {
+			sawMeta = true
+			assert.Contains(t, event.Payload["text"], "Run failed: llm error: provider unavailable")
+		}
+	}
+	assert.True(t, sawMeta)
+}
+
 func TestManagedRunOutputBufferUsesOnlyPostToolAssistantText(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -386,16 +656,6 @@ func TestManagedRunOutputBufferUsesOnlyPostToolAssistantText(t *testing.T) {
 				{Type: runtimeevents.AgentEventDone},
 			},
 			want: "Done: delivered the project.",
-		},
-		{
-			name: "save output does not clear report text",
-			events: []runtimeevents.AgentEvent{
-				{Type: runtimeevents.AgentEventTextDelta, Text: "# Report\n\nAll checks passed."},
-				{Type: runtimeevents.AgentEventToolCallRequested, ToolCall: &llm.ToolCall{Name: "save_output"}},
-				{Type: runtimeevents.AgentEventToolResult, ToolCall: &llm.ToolCall{Name: "save_output"}},
-				{Type: runtimeevents.AgentEventDone},
-			},
-			want: "# Report\n\nAll checks passed.",
 		},
 	}
 
@@ -560,6 +820,7 @@ func TestStartManagedRunExposesRuntimeScopedTools(t *testing.T) {
 	memMgr := memory.NewManager(filepath.Join(root, "memory"))
 	require.NoError(t, memMgr.Load())
 	require.NoError(t, memMgr.SaveToLayer(memory.LayerLongTerm, "rule", "# Rule\n\nAlways verify staging."))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "spec.md"), []byte("# Spec\n\nCheck staging."), 0o644))
 
 	taskStore := task.NewStore()
 	provider := &capturingProvider{response: "done"}
@@ -600,6 +861,150 @@ func TestStartManagedRunExposesRuntimeScopedTools(t *testing.T) {
 	assert.Contains(t, requests[0].Messages[0].Content, "[File: spec.md, MIME: text/markdown]")
 }
 
+func TestProjectAssetsDirUsesProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = root
+
+	assert.Equal(t, filepath.Join(root, "anyai", "assets"), input.ProjectAssetsDir(cfg))
+}
+
+func TestStartIngressRunCoversImageAndFileFullPath(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "agent")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+	fixturesDir := filepath.Join(root, "fixtures")
+	require.NoError(t, os.MkdirAll(filepath.Join(fixturesDir, "reference"), 0o755))
+	sourceFile := filepath.Join(fixturesDir, "brief.txt")
+	require.NoError(t, os.WriteFile(sourceFile, []byte("brief content from source file"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(fixturesDir, "reference", "note.md"), []byte("# reference note"), 0o644))
+
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = root
+	cfg.ProjectConfigDir = root
+	cfg.Agents.List = []config.AgentConfig{
+		{
+			ID:        "assistant",
+			Name:      "Assistant",
+			Model:     "test/mock-model",
+			Workspace: workspace,
+			Tools: config.ToolPolicy{
+				Allow: []string{"input_manifest", "attachment_get"},
+			},
+		},
+	}
+
+	var idsByType map[string]string
+	provider := &stagedProvider{
+		handler: func(callIndex int, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+			switch callIndex {
+			case 0:
+				require.NotEmpty(t, req.Messages)
+				require.Len(t, req.Messages[0].Images, 1)
+				assert.Equal(t, "image/png", req.Messages[0].Images[0].MimeType)
+				assert.Equal(t, []byte{0x89, 'P', 'N', 'G'}, req.Messages[0].Images[0].Data)
+				return toolEventsForExecution(jsonToolCallForExecution("tc_manifest", "input_manifest", map[string]any{})), nil
+			case 1:
+				manifest := toolResultContentForExecution(req.Messages, "tc_manifest")
+				require.NotEmpty(t, manifest)
+				var err error
+				idsByType, err = attachmentIDsByTypeForExecution(manifest)
+				require.NoError(t, err)
+				return toolEventsForExecution(
+					jsonToolCallForExecution("tc_file", "attachment_get", map[string]any{"attachment_id": idsByType["file"]}),
+					jsonToolCallForExecution("tc_dir", "attachment_get", map[string]any{"attachment_id": idsByType["dir"]}),
+					jsonToolCallForExecution("tc_image", "attachment_get", map[string]any{"attachment_id": idsByType["image"], "include_base64": true}),
+					jsonToolCallForExecution("tc_pdf", "attachment_get", map[string]any{"attachment_id": idsByType["pdf"]}),
+				), nil
+			default:
+				fileResult := toolResultContentForExecution(req.Messages, "tc_file")
+				dirResult := toolResultContentForExecution(req.Messages, "tc_dir")
+				imageResult := toolResultContentForExecution(req.Messages, "tc_image")
+				pdfResult := toolResultContentForExecution(req.Messages, "tc_pdf")
+				assert.Contains(t, fileResult, "brief content from source file")
+				assert.Contains(t, dirResult, `"kind":"directory"`)
+				assert.Contains(t, dirResult, `"name":"note.md"`)
+				assert.Contains(t, imageResult, `"encoding":"base64"`)
+				assert.Contains(t, pdfResult, `"mime_type":"application/pdf"`)
+				assert.Contains(t, pdfResult, `"content_available":false`)
+				assert.Contains(t, pdfResult, `"name":"spec.pdf"`)
+				return []llm.ChatEvent{
+					{Type: llm.EventTextDelta, Text: "图片和文件全流程验证完成"},
+					{Type: llm.EventDone},
+				}, nil
+			}
+		},
+	}
+	recorder := runtimeevents.NewRecorder()
+	run, err := StartIngressRun(context.Background(), runtimeport.ExecutionDeps{
+		Providers:    map[string]llm.LLMProvider{"test": provider},
+		Config:       cfg,
+		SessionStore: session.NewStore(t.TempDir()),
+		Recorder:     recorder,
+	}, runtimeport.IngressRequest{
+		RunID:       "run_full_path",
+		RequestedID: "assistant",
+		SessionID:   "session-full-path",
+		Channel:     "http",
+		Envelope: input.InputEnvelope{
+			SessionID: "session-full-path",
+			Blocks: []input.InputBlock{
+				{Type: "text", Text: "请检查输入中的图片和文件。"},
+				{Type: "file", Name: "brief.txt", Path: sourceFile},
+				{Type: "dir", Name: "reference", Path: filepath.Join(fixturesDir, "reference")},
+				{Type: "image", Name: "diagram.png", MimeType: "image/png", Data: []byte{0x89, 'P', 'N', 'G'}},
+				{Type: "pdf", Name: "spec.pdf", MimeType: "application/pdf", Data: []byte("%PDF-1.4 full path test")},
+			},
+		},
+	})
+	require.NoError(t, err)
+	drainManagedRun(t, run)
+	require.NotNil(t, idsByType)
+
+	assetsDir := filepath.Join(root, "anyai", "assets", "run_full_path")
+	for _, typ := range []string{"file", "image", "pdf"} {
+		assert.DirExists(t, filepath.Join(assetsDir, idsByType[typ]))
+	}
+	for _, typ := range []string{"file", "image", "pdf"} {
+		assert.NotContains(t, provider.Requests()[0].Messages[0].Content, filepath.Join("assets", "run_full_path", idsByType[typ]))
+	}
+	assert.FileExists(t, filepath.Join(assetsDir, idsByType["file"], "brief.txt"))
+	assert.FileExists(t, filepath.Join(assetsDir, idsByType["image"], "diagram.png"))
+	assert.FileExists(t, filepath.Join(assetsDir, idsByType["pdf"], "spec.pdf"))
+
+	events := recorder.ListRunEvents("run_full_path")
+	require.NotEmpty(t, events)
+	var sawInputNormalized, sawCompactSessionImage bool
+	var storedAttachmentTypes []string
+	for _, event := range events {
+		switch event.Name {
+		case runtimeevents.EventInputNormalized:
+			sawInputNormalized = true
+			assert.Equal(t, 5, event.Payload["block_count"])
+			assert.Equal(t, 4, event.Payload["attachment_count"])
+		case runtimeevents.EventAttachmentStored:
+			if typ, _ := event.Payload["type"].(string); typ != "" {
+				storedAttachmentTypes = append(storedAttachmentTypes, typ)
+			}
+		case runtimeevents.EventSessionInputStored:
+			images, _ := event.Payload["images"].([]map[string]any)
+			if len(images) == 0 {
+				if raw, ok := event.Payload["images"].([]any); ok && len(raw) > 0 {
+					item, _ := raw[0].(map[string]any)
+					_, hasData := item["data"]
+					sawCompactSessionImage = !hasData
+				}
+			} else {
+				_, hasData := images[0]["data"]
+				sawCompactSessionImage = !hasData
+			}
+		}
+	}
+	assert.True(t, sawInputNormalized)
+	assert.ElementsMatch(t, []string{"file", "dir", "image", "pdf"}, storedAttachmentTypes)
+	assert.True(t, sawCompactSessionImage, "session input event should store image refs, not base64 data")
+}
+
 func TestStartManagedRunPropagatesTaskIDIntoRuntimeContext(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "agent")
@@ -637,6 +1042,46 @@ func TestStartManagedRunPropagatesTaskIDIntoRuntimeContext(t *testing.T) {
 	assert.Equal(t, "task_current", contexts[0].TaskID)
 	assert.Equal(t, "session-task", contexts[0].SessionID)
 	assert.Equal(t, "run_task", contexts[0].RunID)
+}
+
+func TestStartManagedRunPersistsProvidedInputMessageID(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "agent")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = root
+	cfg.ProjectConfigDir = root
+	cfg.Agents.List = []config.AgentConfig{
+		{
+			ID:        "assistant",
+			Name:      "Assistant",
+			Model:     "test/mock-model",
+			Workspace: workspace,
+		},
+	}
+
+	store := session.NewStore(t.TempDir())
+	provider := &capturingProvider{response: "done"}
+	run, err := StartManagedRun(context.Background(), runtimeport.ExecutionDeps{
+		Providers:    map[string]llm.LLMProvider{"test": provider},
+		Config:       cfg,
+		SessionStore: store,
+	}, runtimeport.RunRequest{
+		RunID:     "run_message_id",
+		AgentID:   "assistant",
+		SessionID: "session-message-id",
+		MessageID: "e_client_supplied",
+		Envelope:  input.NewEnvelopeFromText("session-message-id", "hello with id"),
+	})
+	require.NoError(t, err)
+	drainManagedRun(t, run)
+
+	sess, err := store.Load("assistant", "session-message-id")
+	require.NoError(t, err)
+	history := sess.History()
+	require.NotEmpty(t, history)
+	assert.Equal(t, "e_client_supplied", history[0].ID)
 }
 
 func TestStartManagedRunExtendsTimeoutWhileStreamingProgressContinues(t *testing.T) {
@@ -952,6 +1397,56 @@ func drainManagedRun(t *testing.T, run *runtimeport.ManagedRun) {
 			t.Fatal("timeout waiting for managed run to finish")
 		}
 	}
+}
+
+func jsonToolCallForExecution(id, name string, payload map[string]any) llm.ToolCall {
+	input, _ := json.Marshal(payload)
+	return llm.ToolCall{
+		ID:    id,
+		Name:  name,
+		Input: input,
+	}
+}
+
+func toolEventsForExecution(calls ...llm.ToolCall) []llm.ChatEvent {
+	events := make([]llm.ChatEvent, 0, len(calls)*2+1)
+	for _, call := range calls {
+		call := call
+		events = append(events, llm.ChatEvent{Type: llm.EventToolCallStart, ToolCall: &call})
+		events = append(events, llm.ChatEvent{Type: llm.EventToolCallDone, ToolCall: &call})
+	}
+	events = append(events, llm.ChatEvent{Type: llm.EventDone})
+	return events
+}
+
+func toolResultContentForExecution(messages []llm.Message, toolCallID string) string {
+	for _, msg := range messages {
+		if msg.Role == llm.MessageRoleUser && msg.ToolCallID == toolCallID {
+			return strings.TrimSpace(msg.Content)
+		}
+	}
+	return ""
+}
+
+func attachmentIDsByTypeForExecution(manifestJSON string) (map[string]string, error) {
+	var manifest []map[string]any
+	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
+		return nil, err
+	}
+	ids := map[string]string{}
+	for _, item := range manifest {
+		typ, _ := item["type"].(string)
+		id, _ := item["id"].(string)
+		if typ != "" && id != "" {
+			ids[typ] = id
+		}
+	}
+	for _, typ := range []string{"file", "dir", "image", "pdf"} {
+		if strings.TrimSpace(ids[typ]) == "" {
+			return nil, fmt.Errorf("manifest missing id for %s", typ)
+		}
+	}
+	return ids, nil
 }
 
 func executionManagedDoc(title string, meta map[string]string, section string, lines ...string) string {

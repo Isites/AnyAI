@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
-	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -113,7 +113,7 @@ func (s *Server) Start() error {
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 	}
-	runtimelogging.Info("gateway listening", "addr", addr)
+	slog.Info("gateway listening", "addr", addr)
 	return s.httpServer.ListenAndServe()
 }
 

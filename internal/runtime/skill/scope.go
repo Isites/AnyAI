@@ -8,15 +8,14 @@ import (
 )
 
 // LoaderForAgent builds a scoped loader for one agent using the design's
-// visibility rules: optional system skills, then shared skills, then private
-// skills, with later layers overriding earlier ones.
+// visibility rules: shared project skills, then private skills, with later
+// layers overriding earlier ones.
 func LoaderForAgent(cfg *config.Config, agentCfg *config.AgentConfig) (*Loader, error) {
 	loader := NewLoader()
 	if agentCfg == nil {
 		return loader, nil
 	}
 
-	systemDir := cfg.SystemSkillsDir
 	sharedDir := cfg.SharedSkillsDir
 	privateDir := agentCfg.PrivateSkillsDir
 	if strings.TrimSpace(privateDir) == "" && strings.TrimSpace(agentCfg.Workspace) != "" {
@@ -39,11 +38,6 @@ func LoaderForAgent(cfg *config.Config, agentCfg *config.AgentConfig) (*Loader, 
 		return nil
 	}
 
-	if strings.TrimSpace(systemDir) != "" {
-		if err := appendLayer(systemDir); err != nil {
-			return nil, err
-		}
-	}
 	if agentCfg.InheritSharedSkills {
 		if err := appendLayer(sharedDir); err != nil {
 			return nil, err

@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -9,11 +10,84 @@ import (
 	"time"
 
 	"github.com/Isites/anyai/internal/gateway"
+	"github.com/Isites/anyai/internal/runtime/input"
 	runtimesession "github.com/Isites/anyai/internal/runtime/session"
+	runtimesessionevents "github.com/Isites/anyai/internal/runtime/sessionevents"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type cliTestSessionSurface struct {
+	store *runtimesession.Store
+}
+
+func newCLITestSessionSurface(projectRoot string) *cliTestSessionSurface {
+	return &cliTestSessionSurface{
+		store: runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions")),
+	}
+}
+
+func (s *cliTestSessionSurface) ListSessions(agentID string) ([]gateway.SessionInfo, error) {
+	infos, err := s.store.List(agentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]gateway.SessionInfo, len(infos))
+	for i, info := range infos {
+		out[i] = gateway.SessionInfo{
+			ID:           info.ID,
+			CreatedAt:    info.CreatedAt,
+			LastActivity: info.LastActivity,
+			EntryCount:   info.EntryCount,
+		}
+	}
+	return out, nil
+}
+
+func (s *cliTestSessionSurface) LoadSession(agentID, sessionID string) (gateway.SessionView, error) {
+	if !s.store.Exists(agentID, sessionID) {
+		return gateway.SessionView{}, fmt.Errorf("session %q not found", sessionID)
+	}
+	sess, err := s.store.Load(agentID, sessionID)
+	if err != nil {
+		return gateway.SessionView{}, err
+	}
+	records := runtimesessionevents.HistoryEventRecords(agentID, sessionID, sess.History())
+	events := make([]gateway.Event, len(records))
+	for i, record := range records {
+		events[i] = gateway.Event{
+			SchemaVersion:     record.SchemaVersion,
+			Sequence:          record.Sequence,
+			RunID:             record.RunID,
+			TraceID:           record.TraceID,
+			TraceNodeID:       record.TraceNodeID,
+			ParentTraceNodeID: record.ParentTraceNodeID,
+			AgentID:           record.AgentID,
+			SessionID:         record.SessionID,
+			Name:              record.Name,
+			Timestamp:         record.Timestamp,
+			Payload:           record.Payload,
+		}
+	}
+	return gateway.SessionView{
+		AgentID: agentID,
+		ID:      sessionID,
+		History: runtimesession.SerializeHistory(sess),
+		Events:  events,
+	}, nil
+}
+
+func (s *cliTestSessionSurface) CreateSession(agentID, requestedKey, prefix string) (string, error) {
+	sessionID := sanitizeCLISessionID(requestedKey)
+	if sessionID == "" {
+		sessionID = input.DefaultSessionID(prefix, time.Now().UTC())
+	}
+	if s.store.Exists(agentID, sessionID) {
+		return sessionID, nil
+	}
+	return sessionID, s.store.Create(agentID, sessionID)
+}
 
 func executeCLICommand(cmd tea.Cmd) []tea.Msg {
 	if cmd == nil {
@@ -83,6 +157,60 @@ func TestParseCLIReferencesURLRefNaturalSyntax(t *testing.T) {
 	assert.Equal(t, "https://example.com/page", blocks[0].URL)
 }
 
+func TestParseCLIReferencesImageRef(t *testing.T) {
+	blocks := ParseCLIReferences("inspect @image:/tmp/diagram.png")
+	assert.Len(t, blocks, 1)
+	assert.Equal(t, "image", blocks[0].Type)
+	assert.Equal(t, "diagram.png", blocks[0].Name)
+	assert.Contains(t, blocks[0].Path, "diagram.png")
+}
+
+func TestParseCLIReferencesAutoImagePathRef(t *testing.T) {
+	blocks := ParseCLIReferences("inspect @/tmp/diagram.png")
+	assert.Len(t, blocks, 1)
+	assert.Equal(t, "image", blocks[0].Type)
+	assert.Equal(t, "diagram.png", blocks[0].Name)
+	assert.Contains(t, blocks[0].Path, "diagram.png")
+}
+
+func TestParseCLIReferencesEmbeddedAutoImagePathRef(t *testing.T) {
+	blocks := ParseCLIReferences("游戏无法玩，对应最新截图1@~/Desktop/8f34523d-b295-417d-b229-6fad16aea560.png")
+	require.Len(t, blocks, 1)
+	assert.Equal(t, "image", blocks[0].Type)
+	assert.Equal(t, "8f34523d-b295-417d-b229-6fad16aea560.png", blocks[0].Name)
+	assert.Contains(t, blocks[0].Path, filepath.Join("Desktop", "8f34523d-b295-417d-b229-6fad16aea560.png"))
+}
+
+func TestParseCLIInputStripsEmbeddedImageReferenceFromPrompt(t *testing.T) {
+	cleanText, blocks := ParseCLIInput("游戏无法玩，对应最新截图1@~/Desktop/8f34523d-b295-417d-b229-6fad16aea560.png")
+	require.Len(t, blocks, 1)
+	assert.Equal(t, "游戏无法玩，对应最新截图1", cleanText)
+	assert.NotContains(t, cleanText, "@~")
+	assert.NotContains(t, cleanText, "Desktop")
+	assert.Equal(t, "image", blocks[0].Type)
+}
+
+func TestParseCLIInputStripsExplicitReferences(t *testing.T) {
+	cleanText, blocks := ParseCLIInput("请看 @image:/tmp/diagram.png 和 @file /tmp/brief.txt")
+	require.Len(t, blocks, 2)
+	assert.Equal(t, "请看 和", cleanText)
+	assert.Equal(t, "image", blocks[0].Type)
+	assert.Equal(t, "file", blocks[1].Type)
+}
+
+func TestParseCLIReferencesPlainImagePathNeedsAtPrefix(t *testing.T) {
+	blocks := ParseCLIReferences("inspect /tmp/diagram.png")
+	assert.Nil(t, blocks)
+}
+
+func TestParseCLIReferencesPDFRefNaturalSyntax(t *testing.T) {
+	blocks := ParseCLIReferences("read @pdf /tmp/spec.pdf")
+	assert.Len(t, blocks, 1)
+	assert.Equal(t, "pdf", blocks[0].Type)
+	assert.Equal(t, "spec.pdf", blocks[0].Name)
+	assert.Contains(t, blocks[0].Path, "spec.pdf")
+}
+
 func TestParseCLIReferencesMultipleRefs(t *testing.T) {
 	blocks := ParseCLIReferences("read @file:/tmp/a.txt and @dir:/tmp/subdir")
 	assert.Len(t, blocks, 2)
@@ -94,6 +222,32 @@ func TestParseCLIReferencesEmptyPath(t *testing.T) {
 	// @file: with no path after it — should not produce a block
 	blocks := ParseCLIReferences("check @file:")
 	assert.Nil(t, blocks)
+}
+
+func TestSummarizeCLIInputBlocks(t *testing.T) {
+	blocks := []gateway.InputBlock{
+		{Type: "image", Name: "diagram.png", Path: "/tmp/diagram.png"},
+		{Type: "pdf", Name: "spec.pdf", Path: "/tmp/spec.pdf"},
+	}
+	assert.Equal(t, "已附加 image:diagram.png  •  pdf:spec.pdf", summarizeCLIInputBlocks(blocks))
+}
+
+func TestHeadlessCLIInjectTextParsesAttachmentReferences(t *testing.T) {
+	ch := NewHeadlessCLIChannel("/tmp/demo-project", "lead")
+	require.NoError(t, ch.Connect(context.Background()))
+	defer func() { _ = ch.Disconnect() }()
+
+	require.NoError(t, ch.InjectText("游戏无法玩，对应最新截图1@/tmp/diagram.png"))
+
+	select {
+	case msg := <-ch.Receive():
+		assert.Equal(t, "游戏无法玩，对应最新截图1", msg.Text)
+		require.Len(t, msg.Blocks, 1)
+		assert.Equal(t, "image", msg.Blocks[0].Type)
+		assert.Equal(t, "diagram.png", msg.Blocks[0].Name)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for parsed CLI message")
+	}
 }
 
 func TestCLIModelRendersPersistentRunTreeAndConversation(t *testing.T) {
@@ -272,7 +426,7 @@ func TestCLIModelSyncsRootSessionHistoryIntoConversation(t *testing.T) {
 	require.NoError(t, err)
 	childSession.Append(runtimesession.AssistantMessageEntry("子代理内部消息"))
 
-	model := newCLIModel(projectRoot, "lead", func(string) {})
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*cliModel)
 
@@ -312,7 +466,7 @@ func TestCLIModelDoesNotDuplicateOutboundAssistantTextWhenSessionAlreadySynced(t
 	sess.Append(runtimesession.UserMessageEntry("继续"))
 	sess.Append(runtimesession.AssistantMessageEntry("最终答复"))
 
-	model := newCLIModel(projectRoot, "lead", func(string) {})
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*cliModel)
 
@@ -331,6 +485,270 @@ func TestCLIModelDoesNotDuplicateOutboundAssistantTextWhenSessionAlreadySynced(t
 	assert.Equal(t, 1, strings.Count(model.renderConversation(), "最终答复"))
 }
 
+func TestCLIModelDoesNotDuplicatePendingUserMessageWhenPersistedWithAttachment(t *testing.T) {
+	projectRoot := t.TempDir()
+	surface := newCLITestSessionSurface(projectRoot)
+	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+
+	var sentText []string
+	var sentMessageID string
+	model := newCLIModelWithSession(projectRoot, "lead", surface, func(text, sessionID string, messageID ...string) {
+		sentText = append(sentText, text)
+		if len(messageID) > 0 {
+			sentMessageID = messageID[0]
+		}
+		sess, err := store.Load("lead", sessionID)
+		require.NoError(t, err)
+		sess.Append(runtimesession.UserMessageWithImagesEntryWithID(sentMessageID, text, []runtimesession.ImageData{
+			{ID: "img_1", Name: "shot.png", MimeType: "image/png"},
+		}))
+	})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	model.input.SetValue("/session image-session")
+	model.input.CursorEnd()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+
+	model.input.SetValue("检查这个项目 @~/Desktop/shot.png")
+	model.input.CursorEnd()
+
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+	require.Equal(t, []string{"检查这个项目 @~/Desktop/shot.png"}, sentText)
+	require.NotEmpty(t, sentMessageID)
+
+	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
+		RunID:     "run_root",
+		AgentID:   "lead",
+		SessionID: model.cliSessionID,
+		Name:      "session.input.stored",
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"entry_id": sentMessageID,
+			"text":     "检查这个项目 @~/Desktop/shot.png",
+			"images": []runtimesession.ImageData{
+				{ID: "img_1", Name: "shot.png", MimeType: "image/png"},
+			},
+		},
+	}})
+	model = updated.(*cliModel)
+
+	conversation := model.renderConversation()
+	assert.Equal(t, 1, strings.Count(conversation, "检查这个项目 @~/Desktop/shot.png"))
+	assert.Contains(t, conversation, "image:shot.png")
+	assert.Empty(t, model.pendingMessages)
+}
+
+func TestCLIModelPreloadsLatestEntryAgentSession(t *testing.T) {
+	projectRoot := t.TempDir()
+	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+
+	oldSession, err := store.Load("lead", "cli_old")
+	require.NoError(t, err)
+	oldSession.Append(runtimesession.UserMessageEntry("旧会话"))
+	time.Sleep(time.Millisecond)
+
+	latestSession, err := store.Load("lead", "cli_latest")
+	require.NoError(t, err)
+	latestSession.Append(runtimesession.UserMessageEntry("最近会话"))
+
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
+
+	assert.Equal(t, "cli_latest", model.activeSessionID)
+	assert.Equal(t, "cli_latest", model.cliSessionID)
+	assert.Contains(t, model.renderConversation(), "最近会话")
+	assert.NotContains(t, model.renderConversation(), "旧会话")
+}
+
+func TestCLIModelSessionCommandCreatesAndUsesSession(t *testing.T) {
+	projectRoot := t.TempDir()
+	var sentText []string
+	var sentSession []string
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(text, sessionID string, _ ...string) {
+		sentText = append(sentText, text)
+		sentSession = append(sentSession, sessionID)
+	})
+
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	model.input.SetValue("/session fix-session")
+	model.input.CursorEnd()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+
+	assert.Equal(t, "fix-session", model.cliSessionID)
+	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+	assert.True(t, store.Exists("lead", "fix-session"))
+	assert.Empty(t, model.pendingMessages)
+	assert.NotContains(t, model.renderConversation(), "META")
+	assert.NotContains(t, model.renderConversation(), "已创建并切换到 session")
+	assert.Contains(t, model.renderInputPanel(model.panelWidth), "已创建并切换到 session fix-session")
+
+	model.input.SetValue("继续处理")
+	model.input.CursorEnd()
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+
+	assert.Equal(t, []string{"继续处理"}, sentText)
+	assert.Equal(t, []string{"fix-session"}, sentSession)
+	assert.NotContains(t, model.renderInputPanel(model.panelWidth), "已创建并切换到 session")
+}
+
+func TestCLIModelIgnoresStaleAssistantMessageFromPreviousSession(t *testing.T) {
+	projectRoot := t.TempDir()
+	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+	oldSession, err := store.Load("lead", "old-session")
+	require.NoError(t, err)
+	oldSession.Append(runtimesession.UserMessageEntry("旧问题"))
+
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	require.Equal(t, "old-session", model.cliSessionID)
+
+	model.input.SetValue("/session new-session")
+	model.input.CursorEnd()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+	require.Equal(t, "new-session", model.cliSessionID)
+
+	updated, _ = model.Update(cliAssistantMessageMsg{
+		Text:      "旧 session 迟到回复",
+		AgentID:   "lead",
+		SessionID: "old-session",
+		RunID:     "run_old",
+	})
+	model = updated.(*cliModel)
+
+	assert.NotContains(t, model.renderConversation(), "旧 session 迟到回复")
+	assert.Empty(t, model.pendingMessages)
+}
+
+func TestCLIModelInputPanelShowsSingleLineCommandHint(t *testing.T) {
+	model := newCLIModel("", "", func(string) {})
+
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+
+	panel := model.renderInputPanel(model.panelWidth)
+	assert.Contains(t, panel, "/session [id]")
+	assert.Contains(t, panel, "/quit")
+	assert.Contains(t, panel, "Enter send")
+	assert.Contains(t, panel, "Ctrl+J newline")
+	lines := strings.Split(panel, "\n")
+	hintLines := 0
+	for _, line := range lines {
+		if strings.Contains(line, "Enter send") || strings.Contains(line, "/session [id]") || strings.Contains(line, "/quit") {
+			hintLines++
+		}
+	}
+	assert.Equal(t, 1, hintLines)
+	assert.NotContains(t, panel, "/new")
+	assert.NotContains(t, panel, "/session-new")
+	assert.NotContains(t, panel, "/session new")
+	assert.NotContains(t, panel, "/stack")
+	assert.NotContains(t, panel, "/exit")
+}
+
+func TestCLIModelAllSlashCommandsAreEffective(t *testing.T) {
+	t.Run("session without id creates generated session", func(t *testing.T) {
+		projectRoot := t.TempDir()
+		model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		model = updated.(*cliModel)
+
+		model.input.SetValue("/session")
+		model.input.CursorEnd()
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+		executeCLICommand(cmd)
+
+		assert.True(t, strings.HasPrefix(model.cliSessionID, "cli_"))
+		store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+		assert.True(t, store.Exists("lead", model.cliSessionID))
+	})
+
+	t.Run("session with missing id creates that session", func(t *testing.T) {
+		projectRoot := t.TempDir()
+		model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		model = updated.(*cliModel)
+
+		model.input.SetValue("/session beta")
+		model.input.CursorEnd()
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+		executeCLICommand(cmd)
+
+		assert.Equal(t, "beta", model.cliSessionID)
+		store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+		assert.True(t, store.Exists("lead", "beta"))
+	})
+
+	t.Run("session with existing id reuses that session", func(t *testing.T) {
+		projectRoot := t.TempDir()
+		store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
+		existing, err := store.Load("lead", "alpha")
+		require.NoError(t, err)
+		existing.Append(runtimesession.UserMessageEntry("已有会话内容"))
+
+		model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		model = updated.(*cliModel)
+
+		model.input.SetValue("/session beta")
+		model.input.CursorEnd()
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+		executeCLICommand(cmd)
+		require.Equal(t, "beta", model.cliSessionID)
+
+		model.input.SetValue("/session alpha")
+		model.input.CursorEnd()
+		updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+		executeCLICommand(cmd)
+
+		assert.Equal(t, "alpha", model.cliSessionID)
+		assert.Contains(t, model.renderConversation(), "已有会话内容")
+	})
+
+	t.Run("session rejects multiple args", func(t *testing.T) {
+		model := newCLIModel("", "", func(string) {})
+
+		model.input.SetValue("/session one two")
+		model.input.CursorEnd()
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+		executeCLICommand(cmd)
+
+		assert.Empty(t, model.pendingMessages)
+		assert.Equal(t, "用法: /session [session-id]", model.sessionNotice)
+		assert.Contains(t, model.renderInputPanel(120), "用法: /session [session-id]")
+		assert.NotContains(t, model.renderConversation(), "META")
+	})
+
+	t.Run("quit", func(t *testing.T) {
+		model := newCLIModel("", "", func(string) {})
+		model.input.SetValue("/quit")
+		model.input.CursorEnd()
+
+		updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(*cliModel)
+
+		assert.NotNil(t, model)
+		if assert.NotNil(t, cmd) {
+			assert.IsType(t, tea.QuitMsg{}, cmd())
+		}
+	})
+}
+
 func TestCLIModelRendersSessionTranscriptCardsForStructuredEntries(t *testing.T) {
 	projectRoot := t.TempDir()
 	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
@@ -341,8 +759,9 @@ func TestCLIModelRendersSessionTranscriptCardsForStructuredEntries(t *testing.T)
 	sess.Append(runtimesession.ToolCallEntry("tool_1", "readfile", json.RawMessage(`{"path":"src/app.js"}`)))
 	sess.Append(runtimesession.ToolResultEntry("tool_1", "file content", "", nil))
 	sess.Append(runtimesession.AssistantMessageEntry("已完成阶段播报"))
+	sess.Append(runtimesession.MetaEntry("Run failed: browser click timed out"))
 
-	model := newCLIModel(projectRoot, "lead", func(string) {})
+	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*cliModel)
 
@@ -366,6 +785,8 @@ func TestCLIModelRendersSessionTranscriptCardsForStructuredEntries(t *testing.T)
 	assert.NotContains(t, conversation, "PHASE")
 	assert.NotContains(t, conversation, "PROGRESS")
 	assert.Contains(t, conversation, "已完成阶段播报")
+	assert.Contains(t, conversation, "META")
+	assert.Contains(t, conversation, "Run failed: browser click timed out")
 }
 
 func TestCLIModelSurfacesRuntimePhasesAndSubagentLifecycle(t *testing.T) {
@@ -527,6 +948,66 @@ func TestCLIModelHeaderAndStatusUseSameRuntimeSummary(t *testing.T) {
 	assert.Contains(t, header, "2 active / 0 done / 0 failed")
 }
 
+func TestCLIModelSeparatesTraceNodesByRunAndAgent(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "tech-lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_shared",
+			AgentID:   "tech-lead",
+			SessionID: "cli_local",
+			Name:      "run.started",
+			Timestamp: now,
+		},
+		{
+			RunID:         "run_shared",
+			AgentID:       "coder",
+			SessionID:     "agentcall_coder_shared",
+			ParentAgentID: "tech-lead",
+			Name:          "run.started",
+			Timestamp:     now.Add(time.Second),
+		},
+		{
+			RunID:         "run_shared",
+			AgentID:       "coder",
+			SessionID:     "agentcall_coder_shared",
+			ParentAgentID: "tech-lead",
+			Name:          "run.completed",
+			Timestamp:     now.Add(2 * time.Second),
+		},
+		{
+			RunID:     "run_shared",
+			AgentID:   "tech-lead",
+			SessionID: "cli_local",
+			Name:      "tool.called",
+			Timestamp: now.Add(3 * time.Second),
+			Payload: map[string]any{
+				"id":    "tool_after_child",
+				"tool":  "bash",
+				"input": "go test ./...",
+			},
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	parent := model.traceNodes[cliTraceKey("run_shared", "tech-lead")]
+	child := model.traceNodes[cliTraceKey("run_shared", "coder")]
+	require.NotNil(t, parent)
+	require.NotNil(t, child)
+	assert.Equal(t, "running", parent.status)
+	assert.Equal(t, "completed", child.status)
+	assert.Equal(t, 1, model.runningRunCount())
+	running, completed, failed := model.traceStatusCounts()
+	assert.Equal(t, 1, running)
+	assert.Equal(t, 1, completed)
+	assert.Equal(t, 0, failed)
+	assert.Equal(t, "tool active", model.runtimeStatusLabel())
+}
+
 func TestCLIModelSuppressesTransientRunningActivities(t *testing.T) {
 	model := newCLIModel("/tmp/demo-project", "lead", func(string) {})
 	now := time.Now()
@@ -579,7 +1060,7 @@ func TestCLIModelSuppressesTransientRunningActivities(t *testing.T) {
 	}
 
 	require.Empty(t, model.activities)
-	node := model.traceNodes["run_root"]
+	node := model.traceNodes[cliTraceKey("run_root", "lead")]
 	require.NotNil(t, node)
 	assert.Equal(t, "text.delta", node.lastEventName)
 	assert.Equal(t, "正在生成答复", node.lastEventSummary)
@@ -786,7 +1267,7 @@ func TestCLIModelTreatsRunAbortedAsTerminal(t *testing.T) {
 		model = updated.(*cliModel)
 	}
 
-	node := model.traceNodes["run_root"]
+	node := model.traceNodes[cliTraceKey("run_root", "tech-lead")]
 	require.NotNil(t, node)
 	assert.Equal(t, "aborted", node.status)
 	assert.Equal(t, 0, model.runningRunCount())
@@ -929,15 +1410,15 @@ func TestCLIModelArrowKeysMoveSelectedTraceNode(t *testing.T) {
 		model = updated.(*cliModel)
 	}
 
-	assert.Equal(t, "run_root", model.selectedTraceRunID)
+	assert.Equal(t, cliTraceKey("run_root", "lead"), model.selectedTraceKey)
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model = updated.(*cliModel)
-	assert.Equal(t, "run_root", model.selectedTraceRunID)
+	assert.Equal(t, cliTraceKey("run_root", "lead"), model.selectedTraceKey)
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyUp})
 	model = updated.(*cliModel)
-	assert.Equal(t, "run_root", model.selectedTraceRunID)
+	assert.Equal(t, cliTraceKey("run_root", "lead"), model.selectedTraceKey)
 }
 
 func TestCLIModelPreservesManualChatScrollOnRefresh(t *testing.T) {
@@ -1077,6 +1558,78 @@ func TestCLIModelEnterSendsInput(t *testing.T) {
 	assert.Equal(t, 1, model.input.Height())
 	assert.Equal(t, "status", model.messages[len(model.messages)-1].kind)
 	assert.Equal(t, "第一行", model.messages[len(model.messages)-2].text)
+	assert.NotContains(t, model.renderConversation(), "pending")
+}
+
+func TestCLIModelCtrlVAttachesClipboardImageAndSendsIt(t *testing.T) {
+	oldReader := cliClipboardImageReader
+	cliClipboardImageReader = func() (gateway.InputBlock, error) {
+		return gateway.InputBlock{
+			Type:     "image",
+			Name:     "clipboard.png",
+			MimeType: "image/png",
+			Data:     []byte{0x89, 'P', 'N', 'G'},
+			Meta:     map[string]any{"source": "clipboard"},
+		}, nil
+	}
+	defer func() { cliClipboardImageReader = oldReader }()
+
+	var sentText string
+	var sentBlocks []gateway.InputBlock
+	model := newCLIModelWithSession(t.TempDir(), "lead", nil, func(text, _ string, _ ...string) {
+		sentText = text
+	})
+	model.sendInputWithBlocks = func(text, _ string, blocks []gateway.InputBlock, _ ...string) {
+		sentText = text
+		sentBlocks = append([]gateway.InputBlock(nil), blocks...)
+	}
+
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	model = updated.(*cliModel)
+	for _, msg := range executeCLICommand(cmd) {
+		updated, _ = model.Update(msg)
+		model = updated.(*cliModel)
+	}
+
+	assert.Contains(t, model.renderInputPanel(model.panelWidth), "image:clipboard.png")
+	model.input.SetValue("看这张图")
+	model.input.CursorEnd()
+	updated, cmd = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	executeCLICommand(cmd)
+
+	assert.Equal(t, "看这张图", sentText)
+	require.Len(t, sentBlocks, 1)
+	assert.Equal(t, "image", sentBlocks[0].Type)
+	assert.Equal(t, "clipboard.png", sentBlocks[0].Name)
+	assert.Equal(t, []byte{0x89, 'P', 'N', 'G'}, sentBlocks[0].Data)
+	assert.Empty(t, model.composerAttachments)
+	assert.Contains(t, model.renderConversation(), "image:clipboard.png")
+}
+
+func TestCLIModelPasteImageCommandReportsClipboardError(t *testing.T) {
+	oldReader := cliClipboardImageReader
+	cliClipboardImageReader = func() (gateway.InputBlock, error) {
+		return gateway.InputBlock{}, fmt.Errorf("empty clipboard")
+	}
+	defer func() { cliClipboardImageReader = oldReader }()
+
+	model := newCLIModel("", "", func(string) {})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	model.input.SetValue("/paste-image")
+	model.input.CursorEnd()
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(*cliModel)
+	for _, msg := range executeCLICommand(cmd) {
+		updated, _ = model.Update(msg)
+		model = updated.(*cliModel)
+	}
+
+	assert.Contains(t, model.renderInputPanel(model.panelWidth), "剪贴板没有可用图片")
 }
 
 func TestCLIModelCtrlJAddsNewline(t *testing.T) {

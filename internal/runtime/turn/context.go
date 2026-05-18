@@ -59,6 +59,9 @@ func RebindContext(parent, source context.Context, t *Turn) context.Context {
 		if execute := tools.TaskToolExecutionFromContext(source); execute != nil {
 			ctx = tools.WithTaskToolExecution(ctx, execute)
 		}
+		if manager := tools.BackgroundProcessManagerFromContext(source); manager != nil {
+			ctx = tools.WithBackgroundProcessManager(ctx, manager)
+		}
 		if hook := runtimeactivity.HookFromContext(source); hook != nil {
 			ctx = runtimeactivity.WithHook(ctx, hook)
 		}

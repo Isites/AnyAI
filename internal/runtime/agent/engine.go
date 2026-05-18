@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -124,6 +125,9 @@ func (r *Runtime) normalizeRunContext(ctx context.Context, userMsg string) conte
 	if strings.TrimSpace(meta.SessionID) == "" && r != nil && r.Session != nil {
 		meta.SessionID = strings.TrimSpace(r.Session.ID)
 	}
+	if strings.TrimSpace(meta.AssetsBaseDir) == "" && r != nil && strings.TrimSpace(r.ProjectRoot) != "" {
+		meta.AssetsBaseDir = filepath.Join(strings.TrimSpace(r.ProjectRoot), "anyai", "assets")
+	}
 	if strings.TrimSpace(meta.CurrentRequest) == "" {
 		meta.CurrentRequest = strings.TrimSpace(userMsg)
 	}
@@ -187,9 +191,6 @@ func (r *Runtime) collectLLMResponse(
 				sawMeaningfulOutput = true
 				if progress != nil {
 					progress.SawToolCall = true
-					if event.ToolCall != nil && !toolMetadataForCall(r.Tools, event.ToolCall.Name).IsReadOnly() {
-						progress.SideEffectRisk = true
-					}
 				}
 				if event.ToolCall == nil || !isInlineGoalTool(event.ToolCall.Name) {
 					events <- AgentEvent{Type: EventToolCallRequested, ToolCall: event.ToolCall}

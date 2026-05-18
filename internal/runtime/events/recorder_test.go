@@ -87,6 +87,31 @@ func TestRecorderLifecycleEventsUpdateRunReadModel(t *testing.T) {
 	assert.Equal(t, completedAt, run.CompletedAt)
 }
 
+func TestRecorderIgnoresChildTraceLifecycleForParentRunStatus(t *testing.T) {
+	recorder := NewRecorder()
+	recorder.BeginRun(RunRecord{
+		ID:        "run_parent",
+		AgentID:   "lead",
+		SessionID: "session",
+	})
+
+	childCompletedAt := time.Now().UTC()
+	recorder.AppendEvent(EventRecord{
+		RunID:             "run_parent",
+		AgentID:           "worker",
+		SessionID:         "child-session",
+		TraceNodeID:       TraceNodeID("run_parent", "worker"),
+		ParentTraceNodeID: TraceNodeID("run_parent", "lead"),
+		Name:              EventRunCompleted,
+		Timestamp:         childCompletedAt,
+	})
+
+	run, ok := recorder.GetRun("run_parent")
+	require.True(t, ok)
+	assert.Equal(t, RunStatusRunning, run.Status)
+	assert.True(t, run.CompletedAt.IsZero())
+}
+
 func TestMemorySaveToolResultEmitsCapturedEvent(t *testing.T) {
 	run := RunRecord{ID: "run_memory", AgentID: "agent", SessionID: "session"}
 

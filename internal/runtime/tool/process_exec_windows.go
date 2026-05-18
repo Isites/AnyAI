@@ -17,3 +17,5 @@ func configureManagedCommand(cmd *exec.Cmd) {
 }
 
 func cleanupManagedCommand(_ *exec.Cmd) {}
+
+func managedProcessGroupAlive(_ *exec.Cmd) bool { return false }

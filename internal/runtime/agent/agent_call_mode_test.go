@@ -13,7 +13,7 @@ func TestAssembleSystemPromptChildAgentCallAddsDelegationBoundaries(t *testing.T
 			Name: "Coder",
 		},
 		Tools: ToolSurface{
-			Names: []string{"read_file", "save_output", "callagent"},
+			Names: []string{"read_file", "write_file", "callagent"},
 		},
 		Collaboration: CollaborationSurface{
 			RunMode:       "agent_call",

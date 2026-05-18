@@ -28,6 +28,7 @@ type RunRequest struct {
 	AgentID       string
 	Envelope      input.InputEnvelope
 	SessionID     string
+	MessageID     string
 	Images        []llm.ImageContent
 	TaskID        string
 	ParentAgentID string
@@ -43,6 +44,13 @@ type ManagedRun struct {
 	Events        <-chan runtimeevents.EventRecord
 	Cancel        context.CancelFunc
 	OwnsLifecycle bool
+}
+
+type SessionSnapshot struct {
+	AgentID string
+	ID      string
+	History []map[string]any
+	Events  []runtimeevents.EventRecord
 }
 
 // SubmissionSurface is the runtime ingress surface. It is the only surface
@@ -72,8 +80,10 @@ type MetadataReader interface {
 	EventStorageDir() string
 }
 
-// RunProjectionReader exposes recorder-backed run and run-tree read models.
-type RunProjectionReader interface {
+// RunVisibilityReader exposes runtime-owned run and run-tree read models.
+// Event and tree reads are consumer replay views: runtime augments raw
+// recorder state into the stable stream transports should consume.
+type RunVisibilityReader interface {
 	GetRun(runID string) (runtimeevents.RunRecord, bool)
 	ListRuns() []runtimeevents.RunRecord
 	ListRunEvents(runID string) []runtimeevents.EventRecord
@@ -81,12 +91,35 @@ type RunProjectionReader interface {
 	RunTree(runID string) ([]runtimeevents.RunNode, bool)
 }
 
-// SessionProjectionReader exposes persisted session state and session-scoped
-// event history.
+// RunReplayStreamSource exposes runtime-owned replay streams. Replay is a
+// runtime concern because it combines a snapshot with a de-duplicated live tail.
+type RunReplayStreamSource interface {
+	SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
+	SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error)
+}
+
+// RawRunProjectionReader exposes recorder-backed run and run-tree projections.
+// This is runtime-internal shape; gateway-facing readers use RunVisibilityReader.
+type RawRunProjectionReader interface {
+	ListRawRunEvents(runID string) []runtimeevents.EventRecord
+	GetRawRunTree(runID string) (runtimeevents.RunTreeRecord, bool)
+	RawRunTree(runID string) ([]runtimeevents.RunNode, bool)
+}
+
+// SessionProjectionReader exposes persisted session state for runtime-internal
+// callers that need the raw session object.
 type SessionProjectionReader interface {
 	ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord
 	ListSessions(agentID string) ([]session.SessionInfo, error)
 	LoadSession(agentID, sessionID string) (*session.Session, error)
+	LoadSessionSnapshot(agentID, sessionID string) (SessionSnapshot, error)
+}
+
+// SessionVisibilityReader exposes session read models for gateway consumers.
+type SessionVisibilityReader interface {
+	ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord
+	ListSessions(agentID string) ([]session.SessionInfo, error)
+	LoadSessionSnapshot(agentID, sessionID string) (SessionSnapshot, error)
 }
 
 // TaskProjectionReader exposes runtime task state.
@@ -102,21 +135,23 @@ type MemoryReader interface {
 	MemoryGet(id string, scope memory.SearchScope) (memory.Entry, bool)
 }
 
-// ProjectionReader is the raw runtime read model surface. Higher layers should
-// prefer gateway replay surfaces instead of exposing these projection records
-// directly to transport consumers.
+// ProjectionReader is the complete runtime read model surface. Raw recorder
+// internals remain behind runtime/projection; this port exposes runtime-owned
+// visibility models and snapshots.
 type ProjectionReader interface {
 	MetadataReader
-	RunProjectionReader
+	RunVisibilityReader
+	RunReplayStreamSource
+	RawRunProjectionReader
 	SessionProjectionReader
 	TaskProjectionReader
 	MemoryReader
 }
 
-// RunEventStreamSource exposes live run/run-tree event streams.
-type RunEventStreamSource interface {
-	SubscribeRun(runID string) (<-chan runtimeevents.EventRecord, func(), error)
-	SubscribeRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error)
+// RawRunEventStreamSource exposes raw live run/run-tree event streams.
+type RawRunEventStreamSource interface {
+	SubscribeRawRun(runID string) (<-chan runtimeevents.EventRecord, func(), error)
+	SubscribeRawRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error)
 }
 
 // SessionEventStreamSource exposes live session event streams.
@@ -129,11 +164,11 @@ type TaskEventStreamSource interface {
 	SubscribeTask(taskID string) (<-chan runtimeevents.EventRecord, func(), error)
 }
 
-// ProjectionStreamSource exposes raw live event streams derived from runtime
-// projections. Gateway consumes these streams and turns them into replay
-// surfaces for channel/http consumers.
+// ProjectionStreamSource exposes live event streams derived from runtime
+// projections. Run streams here are raw runtime streams; gateway-facing code
+// should depend on RunReplayStreamSource instead.
 type ProjectionStreamSource interface {
-	RunEventStreamSource
+	RawRunEventStreamSource
 	SessionEventStreamSource
 	TaskEventStreamSource
 }
@@ -168,6 +203,29 @@ type RuntimeController interface {
 	ExecutionController
 }
 
+// GatewayProjectionReader is the runtime visibility surface consumed by
+// gateway. It intentionally excludes raw session objects and raw run streams.
+type GatewayProjectionReader interface {
+	MetadataReader
+	RunVisibilityReader
+	RunReplayStreamSource
+	SessionVisibilityReader
+	TaskProjectionReader
+	MemoryReader
+}
+
+// GatewayController is the runtime control surface consumed by gateway.
+type GatewayController interface {
+	RebuildEventProjections() error
+	CreateSession(agentID, requestedKey, prefix string) (string, error)
+	DeleteSession(agentID, sessionID string) error
+	MemoryStaleCleanup(now time.Time) (int, error)
+	MemoryReindex() (int, error)
+	MemoryPromoteEligible(now time.Time) (int, error)
+	CancelRun(runID string) error
+	CancelTask(taskID string) error
+}
+
 // EventAppender is the narrow event sink used by runtime-internal coordinators.
 type EventAppender interface {
 	AppendEvent(record runtimeevents.EventRecord)
@@ -183,13 +241,15 @@ type Runtime interface {
 	RuntimeController
 }
 
-// GatewayRuntime is the raw runtime surface consumed by gateway. Gateway owns
-// route/control/observe adaptation and exposes narrower facades to channels,
-// HTTP APIs, and UIs.
+// GatewayRuntime is the runtime surface consumed by gateway. Gateway owns
+// route/control/observe DTO adaptation and exposes narrower facades to
+// channels, HTTP APIs, and UIs; runtime owns replay, projection, session
+// snapshots, and control behavior.
 type GatewayRuntime interface {
-	ProjectionReader
-	ProjectionStreamSource
-	RuntimeController
+	GatewayProjectionReader
+	SessionEventStreamSource
+	TaskEventStreamSource
+	GatewayController
 	StartIngressRun(ctx context.Context, req IngressRequest) (*ManagedRun, error)
 }
 

@@ -208,6 +208,9 @@ func RegisterCLIChannel(core *CoreRuntime, entryAgentID string, nonInteractive b
 	if nonInteractive {
 		cliChan = channel.NewHeadlessCLIChannel(projectRoot, entryAgentID)
 	}
+	if core.Gateway != nil {
+		cliChan.SetSessionSurface(core.Gateway)
+	}
 	core.ChannelManager.Register(cliChan)
 	return cliChan
 }

@@ -17,13 +17,14 @@ import (
 type EntryType string
 
 const (
-	EntryTypeMessage    EntryType = "message"
-	EntryTypeToolCall   EntryType = "tool_call"
-	EntryTypeToolResult EntryType = "tool_result"
-	EntryTypeMeta       EntryType = "meta"
-	EntryTypeCompaction EntryType = "compaction"
-	EntryTypePlan       EntryType = "plan"
-	EntryTypeTodo       EntryType = "todo"
+	EntryTypeMessage        EntryType = "message"
+	EntryTypeToolCall       EntryType = "tool_call"
+	EntryTypeToolResult     EntryType = "tool_result"
+	EntryTypeMeta           EntryType = "meta"
+	EntryTypeCompaction     EntryType = "compaction"
+	EntryTypeRuntimeControl EntryType = "runtime_control"
+	EntryTypePlan           EntryType = "plan"
+	EntryTypeTodo           EntryType = "todo"
 )
 
 // SessionEntry is a single node in the session DAG.
@@ -47,10 +48,15 @@ type EntryRefs struct {
 	PlanID string
 }
 
-// ImageData holds a base64-encoded image for session persistence.
+// ImageData holds image metadata for session persistence. Data is only used by
+// legacy or transient in-memory entries; durable replay stores compact refs.
 type ImageData struct {
+	ID       string `json:"id,omitempty"`
 	MimeType string `json:"mime_type"`
-	Data     string `json:"data"` // base64-encoded
+	Data     string `json:"data,omitempty"` // base64-encoded legacy payload
+	Path     string `json:"path,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Size     int    `json:"size,omitempty"`
 }
 
 // MessageData holds text message content.
@@ -82,6 +88,13 @@ type CompactionData struct {
 	Text            string `json:"text"`
 	Trigger         string `json:"trigger,omitempty"`
 	LegacyHeuristic bool   `json:"legacy_heuristic,omitempty"`
+}
+
+// RuntimeControlData stores runtime-authored control text for audit without
+// treating it as a normal user turn in future model transcripts.
+type RuntimeControlData struct {
+	Kind string `json:"kind,omitempty"`
+	Text string `json:"text"`
 }
 
 // PlanData stores a structured plan snapshot for the session.
@@ -125,6 +138,21 @@ func NewSession(agentID, sessionID string) *Session {
 
 // Append adds an entry to the session.
 func (s *Session) Append(entry SessionEntry) {
+	s.append(entry, nil, true)
+}
+
+// AppendTransient adds an entry to in-memory history without persisting it.
+func (s *Session) AppendTransient(entry SessionEntry) {
+	s.append(entry, nil, false)
+}
+
+// AppendWithPersistedEntry appends one in-memory entry while persisting a
+// compact equivalent to disk/subscribers.
+func (s *Session) AppendWithPersistedEntry(entry, persisted SessionEntry) {
+	s.append(entry, &persisted, true)
+}
+
+func (s *Session) append(entry SessionEntry, persisted *SessionEntry, persist bool) {
 	if entry.ID == "" {
 		entry.ID = generateID("e")
 	}
@@ -135,13 +163,27 @@ func (s *Session) Append(entry SessionEntry) {
 		entry.ParentID = s.leafID
 	}
 	entry = withResolvedEntryRefs(entry, s.active)
+	if persisted != nil {
+		normalized := *persisted
+		normalized.ID = entry.ID
+		normalized.ParentID = entry.ParentID
+		normalized.Timestamp = entry.Timestamp
+		normalized.Role = entry.Role
+		normalized.Type = entry.Type
+		normalized = withResolvedEntryRefs(normalized, s.active)
+		persisted = &normalized
+	}
 
 	s.entries = append(s.entries, entry)
 	s.entryMap[entry.ID] = &s.entries[len(s.entries)-1]
 	s.leafID = entry.ID
 
 	// Persist if store is set
-	if s.store != nil {
+	if persist && s.store != nil {
+		if persisted != nil {
+			s.store.AppendEntry(s, *persisted)
+			return
+		}
 		s.store.AppendEntry(s, entry)
 	}
 }
@@ -271,6 +313,10 @@ func ApplyEntryRefs(entry SessionEntry, refs EntryRefs) SessionEntry {
 	return withResolvedEntryRefs(entry, refs)
 }
 
+func NewEntryID() string {
+	return generateID("e")
+}
+
 // Helper constructors for common entry types
 
 // UserMessageEntry creates a user message entry.
@@ -283,6 +329,12 @@ func UserMessageEntry(text string) SessionEntry {
 	}
 }
 
+func UserMessageEntryWithID(id, text string) SessionEntry {
+	entry := UserMessageEntry(text)
+	entry.ID = strings.TrimSpace(id)
+	return entry
+}
+
 // UserMessageWithImagesEntry creates a user message entry with image attachments.
 func UserMessageWithImagesEntry(text string, images []ImageData) SessionEntry {
 	data, _ := json.Marshal(MessageData{Text: text, Images: images})
@@ -291,6 +343,12 @@ func UserMessageWithImagesEntry(text string, images []ImageData) SessionEntry {
 		Role: "user",
 		Data: data,
 	}
+}
+
+func UserMessageWithImagesEntryWithID(id, text string, images []ImageData) SessionEntry {
+	entry := UserMessageWithImagesEntry(text, images)
+	entry.ID = strings.TrimSpace(id)
+	return entry
 }
 
 // AssistantMessageEntry creates an assistant message entry.
@@ -385,6 +443,103 @@ func CompactionEntry(data CompactionData) SessionEntry {
 	}
 }
 
+// RuntimeControlEntry creates a runtime-authored control entry.
+func RuntimeControlEntry(kind, text string) SessionEntry {
+	payload, _ := json.Marshal(RuntimeControlData{
+		Kind: strings.TrimSpace(kind),
+		Text: strings.TrimSpace(text),
+	})
+	return SessionEntry{
+		Type: EntryTypeRuntimeControl,
+		Role: "system",
+		Data: payload,
+	}
+}
+
+// RuntimeControlText extracts runtime-authored control text from either the
+// structured runtime_control entry or legacy user messages that carried the
+// same control prompt markers.
+func RuntimeControlText(entry SessionEntry) (string, bool) {
+	switch entry.Type {
+	case EntryTypeRuntimeControl:
+		var data RuntimeControlData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			return "", false
+		}
+		text := strings.TrimSpace(data.Text)
+		return text, text != ""
+	case EntryTypeMessage:
+		if strings.TrimSpace(entry.Role) != "user" {
+			return "", false
+		}
+		var data MessageData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			return "", false
+		}
+		text := strings.TrimSpace(data.Text)
+		if !IsRuntimeControlText(text) {
+			return "", false
+		}
+		return text, true
+	default:
+		return "", false
+	}
+}
+
+// IsRuntimeControlEntry reports whether an entry carries structured or legacy
+// runtime control text.
+func IsRuntimeControlEntry(entry SessionEntry) bool {
+	_, ok := RuntimeControlText(entry)
+	return ok
+}
+
+func HistoryEndsWithRuntimeControl(history []SessionEntry) bool {
+	if len(history) == 0 {
+		return false
+	}
+	return IsRuntimeControlEntry(history[len(history)-1])
+}
+
+// IsRuntimeControlText recognizes legacy control prompts that were stored as
+// normal user messages before runtime_control entries existed.
+func IsRuntimeControlText(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasPrefix(text, "[Runtime goal continuation]") ||
+		strings.HasPrefix(text, "[Runtime hard stop]")
+}
+
+func ModelVisibleEntries(history []SessionEntry) []SessionEntry {
+	if len(history) == 0 {
+		return nil
+	}
+	visible := make([]SessionEntry, 0, len(history))
+	for _, entry := range history {
+		if IsRuntimeControlEntry(entry) {
+			continue
+		}
+		visible = append(visible, entry)
+	}
+	return visible
+}
+
+func VisibleUserMessages(history []SessionEntry) []MessageData {
+	if len(history) == 0 {
+		return nil
+	}
+	messages := make([]MessageData, 0)
+	for _, entry := range history {
+		if entry.Type != EntryTypeMessage || strings.TrimSpace(entry.Role) != "user" || IsRuntimeControlEntry(entry) {
+			continue
+		}
+		var msg MessageData
+		if err := json.Unmarshal(entry.Data, &msg); err != nil {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	return messages
+}
+
 // TodoEntry creates a todo state entry.
 func TodoEntry(item TodoData) SessionEntry {
 	data, _ := json.Marshal(item)
@@ -431,6 +586,9 @@ func BuildRollingSummary(history []SessionEntry) string {
 				}
 			}
 		case EntryTypeMessage:
+			if IsRuntimeControlEntry(entry) {
+				continue
+			}
 			var msg MessageData
 			if err := json.Unmarshal(entry.Data, &msg); err != nil {
 				continue

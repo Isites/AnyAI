@@ -4,13 +4,8 @@ import (
 	"context"
 
 	"github.com/Isites/anyai/internal/config"
+	runtimemcp "github.com/Isites/anyai/internal/runtime/mcp"
 )
-
-// AssistantOutputProvider exposes the latest assistant-authored text so tools
-// can persist large artifacts without repeating them inside JSON arguments.
-type AssistantOutputProvider interface {
-	LatestAssistantMessageText() (string, bool)
-}
 
 // GoalManager exposes runtime-managed goal completion to tools without
 // importing the task package into the tool layer.
@@ -28,8 +23,9 @@ type ExtraToolDeps struct {
 	InputManifestProvider InputManifestProvider
 	PlanStore             PlanStore
 	TodoStore             TodoStore
-	AssistantOutput       AssistantOutputProvider
 	GoalManager           GoalManager
+	MCPManager            MCPManager
+	MCPTools              []runtimemcp.ToolDescriptor
 }
 
 // BuildAgentRegistry builds a workspace-aware registry for a specific agent.
@@ -69,12 +65,7 @@ func BuildAgentRegistryWithExtras(cfg *config.Config, agentCfg *config.AgentConf
 	RegisterInputTools(reg, extras.AttachmentProvider, extras.InputManifestProvider)
 	RegisterPlanTodoTools(reg, extras.PlanStore, extras.TodoStore)
 	RegisterGoalTools(reg, extras.GoalManager)
-	if extras.AssistantOutput != nil {
-		reg.Register(&SaveOutputTool{
-			WorkDir:        agentCfg.Workspace,
-			OutputProvider: extras.AssistantOutput,
-		})
-	}
+	RegisterMCPTools(reg, extras.MCPManager, extras.MCPTools)
 
 	return reg
 }
@@ -96,9 +87,7 @@ func ExecutorForAgentWithExtras(cfg *config.Config, agentCfg *config.AgentConfig
 	}
 	allow := append([]string(nil), agentCfg.Tools.Allow...)
 	if len(allow) == 0 {
-		if extras.SkillProvider != nil && !includesTool(allow, "skill_get") {
-			allow = append(allow, "skill_get")
-		}
+		return NewFilteredRegistry(reg, Policy{Deny: agentCfg.Tools.Deny})
 	} else {
 		if extras.GoalManager != nil && !includesTool(allow, "goal_complete") {
 			allow = append(allow, "goal_complete")

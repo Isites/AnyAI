@@ -2,14 +2,13 @@ package execution
 
 import (
 	"context"
-	"encoding/base64"
 	"strings"
 	"time"
 
 	"github.com/Isites/anyai/internal/runtime/agent"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	runtimefactory "github.com/Isites/anyai/internal/runtime/factory"
-	"github.com/Isites/anyai/internal/runtime/llm"
+	"github.com/Isites/anyai/internal/runtime/input"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/Isites/anyai/internal/runtime/session"
 	runtimesessionstate "github.com/Isites/anyai/internal/runtime/session/state"
@@ -30,6 +29,14 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 	if runID == "" {
 		runID = tools.NewRunID()
 	}
+	prepared, _, err := input.PrepareEnvelope(req.Envelope, input.PrepareOptions{
+		RunID:   runID,
+		BaseDir: input.ProjectAssetsDir(deps.Config),
+	})
+	if err != nil {
+		return nil, err
+	}
+	req.Envelope = prepared
 	parentMeta := tools.RuntimeContextFrom(ctx)
 	sessionID := strings.TrimSpace(req.SessionID)
 	if sessionID == "" {
@@ -140,11 +147,14 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 		AgentID:        resolved.Agent.ID,
 		SessionID:      sessionID,
 		TaskID:         firstNonEmpty(strings.TrimSpace(req.TaskID), strings.TrimSpace(parentMeta.TaskID)),
+		InputMessageID: strings.TrimSpace(req.MessageID),
+		AssetsBaseDir:  input.ProjectAssetsDir(deps.Config),
 		CurrentRequest: strings.TrimSpace(inputText),
 		CallChain:      callChain,
 		Depth:          depth,
 	}
 	runCtx = tools.WithRuntimeContext(runCtx, runMeta)
+	runCtx = tools.WithRuntimeInputBlocks(runCtx, req.Envelope.Blocks)
 
 	events, err := rt.Run(runCtx, inputText, inputImages)
 	if err != nil {
@@ -160,7 +170,7 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 		if ownsLifecycle {
 			deps.Recorder.BeginRun(runRecord)
 		}
-		if payload := sessionInputPayload(inputText, inputImages, runMeta); payload != nil {
+		if payload := sessionInputPayload(inputText, req.Envelope, runMeta); payload != nil {
 			deps.Recorder.AppendEvent(runtimeevents.EventRecord{
 				RunID:     runRecord.ID,
 				AgentID:   runRecord.AgentID,
@@ -212,6 +222,7 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 			if deps.Recorder != nil && ownsLifecycle {
 				deps.Recorder.FinishRun(runID, status, finalOutput, errMsg)
 			}
+			appendSessionTerminalMeta(sess, status, errMsg)
 			if deps.Pipeline != nil && ownsLifecycle {
 				deps.Pipeline.CaptureSessionEnd(runRecord, sess, status, finalOutput, errMsg)
 			}
@@ -263,6 +274,25 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 		Cancel:        cancel,
 		OwnsLifecycle: ownsLifecycle,
 	}, nil
+}
+
+func appendSessionTerminalMeta(sess *session.Session, status runtimeevents.RunStatus, errMsg string) {
+	if sess == nil {
+		return
+	}
+	errMsg = strings.TrimSpace(errMsg)
+	switch status {
+	case runtimeevents.RunStatusFailed:
+		if errMsg == "" {
+			errMsg = "run failed"
+		}
+		sess.Append(session.MetaEntry("Run failed: " + errMsg))
+	case runtimeevents.RunStatusAborted:
+		if errMsg == "" {
+			errMsg = "run aborted"
+		}
+		sess.Append(session.MetaEntry("Run aborted: " + errMsg))
+	}
 }
 
 func ensureManagedRunDeps(deps runtimeport.ExecutionDeps) runtimeport.ExecutionDeps {
@@ -325,7 +355,7 @@ func recordAttachmentResolution(recorder *runtimeevents.Recorder, run runtimeeve
 			continue
 		}
 		switch strings.TrimSpace(block.Type) {
-		case "file", "image", "pdf":
+		case "file", "image", "pdf", "dir":
 		default:
 			continue
 		}
@@ -355,7 +385,7 @@ func recordAttachmentResolution(recorder *runtimeevents.Recorder, run runtimeeve
 	}
 }
 
-func sessionInputPayload(text string, images []llm.ImageContent, meta tools.RuntimeContext) map[string]any {
+func sessionInputPayload(text string, env input.InputEnvelope, meta tools.RuntimeContext) map[string]any {
 	text = strings.TrimSpace(text)
 	payload := map[string]any{}
 	if text != "" {
@@ -367,17 +397,33 @@ func sessionInputPayload(text string, images []llm.ImageContent, meta tools.Runt
 	if taskID := strings.TrimSpace(meta.TaskID); taskID != "" {
 		payload["task_id"] = taskID
 	}
-	if len(images) > 0 {
-		items := make([]map[string]any, 0, len(images))
-		for _, image := range images {
-			if len(image.Data) == 0 && strings.TrimSpace(image.MimeType) == "" {
-				continue
+	if messageID := strings.TrimSpace(meta.InputMessageID); messageID != "" {
+		payload["entry_id"] = messageID
+	}
+	if refs := session.ImageRefsFromBlocks(env.Blocks); len(refs) > 0 {
+		items := make([]map[string]any, 0, len(refs))
+		for _, image := range refs {
+			item := map[string]any{}
+			if id := strings.TrimSpace(image.ID); id != "" {
+				item["id"] = id
 			}
-			item := map[string]any{
-				"data": base64.StdEncoding.EncodeToString(image.Data),
+			if name := strings.TrimSpace(image.Name); name != "" {
+				item["name"] = name
 			}
 			if mimeType := strings.TrimSpace(image.MimeType); mimeType != "" {
 				item["mime_type"] = mimeType
+			}
+			if path := strings.TrimSpace(image.Path); path != "" {
+				item["path"] = path
+			}
+			if id := strings.TrimSpace(image.ID); id != "" {
+				item["attachment_id"] = id
+			}
+			if image.Size > 0 {
+				item["size"] = image.Size
+			}
+			if len(item) == 0 {
+				continue
 			}
 			items = append(items, item)
 		}
@@ -433,7 +479,7 @@ func shouldResetManagedRunOutputForTool(event agent.AgentEvent) bool {
 
 func shouldResetOutputForTool(toolName string) bool {
 	switch strings.TrimSpace(toolName) {
-	case "goal_complete", "await_user_input", "save_output":
+	case "goal_complete", "await_user_input":
 		return false
 	default:
 		return true

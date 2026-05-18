@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Isites/anyai/internal/runtime/llm"
@@ -11,6 +12,35 @@ import (
 )
 
 const maxToolResultLen = 10000 // truncate tool results longer than this
+
+type transcriptBuilder struct {
+	history          []session.SessionEntry
+	policy           transcriptPolicy
+	runtimeDirective string
+}
+
+func newTranscriptBuilder(history []session.SessionEntry, policy transcriptPolicy) transcriptBuilder {
+	return transcriptBuilder{
+		history: append([]session.SessionEntry(nil), history...),
+		policy:  policy,
+	}
+}
+
+func (b transcriptBuilder) WithRuntimeDirective(text string) transcriptBuilder {
+	b.runtimeDirective = strings.TrimSpace(text)
+	return b
+}
+
+func (b transcriptBuilder) Build() preparedTranscript {
+	prepared := prepareTranscript(assembleMessages(b.history), b.policy)
+	if b.runtimeDirective != "" {
+		prepared.Messages = append(prepared.Messages, llm.Message{
+			Role:    llm.MessageRoleRuntime,
+			Content: b.runtimeDirective,
+		})
+	}
+	return prepared
+}
 
 // detectImageMIME returns the actual MIME type based on magic bytes.
 // Falls back to the provided hint if the format is unrecognized.
@@ -36,6 +66,7 @@ func detectImageMIME(data []byte, hint string) string {
 // (e.g. from interrupted sessions) get synthetic error results injected.
 func assembleMessages(history []session.SessionEntry) []llm.Message {
 	history = session.RepairLeadingFragment(history)
+	history = session.ModelVisibleEntries(history)
 	var msgs []llm.Message
 	knownToolCalls := make(map[string]struct{})
 
@@ -48,7 +79,7 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 				continue
 			}
 			msgs = append(msgs, llm.Message{
-				Role:    "user",
+				Role:    llm.MessageRoleUser,
 				Content: "[Session Summary]\n" + md.Text,
 			})
 
@@ -62,7 +93,7 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 				continue
 			}
 			msgs = append(msgs, llm.Message{
-				Role:    "user",
+				Role:    llm.MessageRoleUser,
 				Content: compactionSummaryPrefix + text,
 			})
 
@@ -79,14 +110,14 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 				Content: md.Text,
 			}
 			// Convert session images to LLM image content
-			if entry.Role == "user" {
+			if llm.IsUserRole(entry.Role) {
 				for _, img := range md.Images {
-					data, err := base64.StdEncoding.DecodeString(img.Data)
-					if err != nil {
+					data, mimeType := sessionImageContent(img)
+					if len(data) == 0 {
 						continue
 					}
 					msg.Images = append(msg.Images, llm.ImageContent{
-						MimeType: detectImageMIME(data, img.MimeType),
+						MimeType: detectImageMIME(data, mimeType),
 						Data:     data,
 					})
 				}
@@ -100,8 +131,8 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 			}
 			// Tool calls are part of the assistant turn — merge into the last assistant message
 			// or create one if needed
-			if len(msgs) == 0 || msgs[len(msgs)-1].Role != "assistant" {
-				msgs = append(msgs, llm.Message{Role: "assistant"})
+			if len(msgs) == 0 || !llm.IsAssistantRole(msgs[len(msgs)-1].Role) {
+				msgs = append(msgs, llm.Message{Role: llm.MessageRoleAssistant})
 			}
 			msgs[len(msgs)-1].ToolCalls = append(msgs[len(msgs)-1].ToolCalls, llm.ToolCall{
 				ID:    td.ID,
@@ -121,7 +152,7 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 			if strings.TrimSpace(tr.ToolCallID) != "" {
 				if _, ok := knownToolCalls[tr.ToolCallID]; !ok {
 					msgs = append(msgs, llm.Message{
-						Role:    "user",
+						Role:    llm.MessageRoleUser,
 						Content: "[Recovered orphaned tool result]\n" + content,
 						IsError: tr.IsError || tr.Error != "",
 					})
@@ -129,19 +160,19 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 				}
 			}
 			msg := llm.Message{
-				Role:       "user",
+				Role:       llm.MessageRoleUser,
 				Content:    content,
 				ToolCallID: tr.ToolCallID,
 				IsError:    tr.IsError,
 			}
 			// Convert session images to LLM image content
 			for _, img := range tr.Images {
-				data, err := base64.StdEncoding.DecodeString(img.Data)
-				if err != nil {
+				data, mimeType := sessionImageContent(img)
+				if len(data) == 0 {
 					continue
 				}
 				msg.Images = append(msg.Images, llm.ImageContent{
-					MimeType: detectImageMIME(data, img.MimeType),
+					MimeType: detectImageMIME(data, mimeType),
 					Data:     data,
 				})
 			}
@@ -153,6 +184,26 @@ func assembleMessages(history []session.SessionEntry) []llm.Message {
 	msgs = injectMissingToolResults(msgs)
 
 	return msgs
+}
+
+func sessionImageContent(img session.ImageData) ([]byte, string) {
+	mimeType := strings.TrimSpace(img.MimeType)
+	if dataText := strings.TrimSpace(img.Data); dataText != "" {
+		data, err := base64.StdEncoding.DecodeString(dataText)
+		if err != nil {
+			return nil, mimeType
+		}
+		return data, mimeType
+	}
+	path := strings.TrimSpace(img.Path)
+	if path == "" {
+		return nil, mimeType
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, mimeType
+	}
+	return data, mimeType
 }
 
 func formatToolResultContent(tr session.ToolResultData) string {
@@ -341,7 +392,7 @@ func injectMissingToolResults(msgs []llm.Message) []llm.Message {
 		return msgs
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != "assistant" || len(last.ToolCalls) == 0 {
+	if !llm.IsAssistantRole(last.Role) || len(last.ToolCalls) == 0 {
 		return msgs
 	}
 
@@ -351,7 +402,7 @@ func injectMissingToolResults(msgs []llm.Message) []llm.Message {
 	// The assistant message is the last one, so there are no results yet.
 	for _, tc := range last.ToolCalls {
 		msgs = append(msgs, llm.Message{
-			Role:       "user",
+			Role:       llm.MessageRoleUser,
 			Content:    "(tool execution was interrupted)",
 			ToolCallID: tc.ID,
 			IsError:    true,

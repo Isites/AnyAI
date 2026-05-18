@@ -21,6 +21,10 @@ var privateNetworks = []string{
 
 var parsedPrivateNets []*net.IPNet
 
+type urlValidationOptions struct {
+	AllowExplicitLoopback bool
+}
+
 func init() {
 	for _, cidr := range privateNetworks {
 		_, ipNet, err := net.ParseCIDR(cidr)
@@ -44,6 +48,16 @@ func isPrivateIP(ip net.IP) bool {
 // network address. This prevents SSRF attacks that could access cloud metadata
 // endpoints, localhost services, or internal network resources.
 func validateURLNotInternal(rawURL string) error {
+	return validateURLAccess(rawURL, urlValidationOptions{})
+}
+
+// validateBrowserURL allows browser automation against explicit local dev
+// loopback URLs while still blocking metadata, link-local, and private networks.
+func validateBrowserURL(rawURL string) error {
+	return validateURLAccess(rawURL, urlValidationOptions{AllowExplicitLoopback: true})
+}
+
+func validateURLAccess(rawURL string, opts urlValidationOptions) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -60,17 +74,37 @@ func validateURLNotInternal(rawURL string) error {
 		return fmt.Errorf("access to internal metadata endpoint is blocked")
 	}
 
-	// Resolve hostname to IP addresses
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return fmt.Errorf("cannot resolve hostname %q — blocking to prevent SSRF", host)
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		// Resolve hostname to IP addresses
+		resolved, err := net.LookupIP(host)
+		if err != nil {
+			return fmt.Errorf("cannot resolve hostname %q — blocking to prevent SSRF", host)
+		}
+		ips = resolved
 	}
 
 	for _, ip := range ips {
 		if isPrivateIP(ip) {
+			if opts.AllowExplicitLoopback && ip.IsLoopback() && isExplicitLoopbackHost(host) {
+				continue
+			}
 			return fmt.Errorf("access to internal address %s (%s) is blocked", host, ip)
 		}
 	}
 
 	return nil
+}
+
+func isExplicitLoopbackHost(host string) bool {
+	lower := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }

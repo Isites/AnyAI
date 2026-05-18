@@ -305,12 +305,10 @@ func (r *DependencySet) SetResources(resources *runtimeresources.Catalog) {
 	if recorder != nil {
 		payload := map[string]any{
 			"agent_count":        0,
-			"system_skill_count": 0,
 			"shared_skill_count": 0,
 		}
 		if resources != nil {
 			payload["agent_count"] = len(resources.Agents())
-			payload["system_skill_count"] = len(resources.SystemSkills())
 			payload["shared_skill_count"] = len(resources.SharedSkills())
 		}
 		r.appendSystemEvent(recorder, "resources.reindexed", payload)

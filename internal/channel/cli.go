@@ -4,19 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime"
+	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
-	"github.com/Isites/anyai/internal/config"
 	"github.com/Isites/anyai/internal/gateway"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	"github.com/Isites/anyai/internal/runtime/input"
+	runtimeinput "github.com/Isites/anyai/internal/runtime/input"
 	runtimesession "github.com/Isites/anyai/internal/runtime/session"
-	runtimesessionevents "github.com/Isites/anyai/internal/runtime/sessionevents"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -138,10 +141,17 @@ type CLIChannel struct {
 	program      *tea.Program
 	projectRoot  string
 	entryAgentID string
+	sessions     CLISessionSurface
 	headless     bool
 	mu           sync.Mutex
 	once         sync.Once
 	shutdown     chan struct{}
+}
+
+type CLISessionSurface interface {
+	ListSessions(agentID string) ([]gateway.SessionInfo, error)
+	LoadSession(agentID, sessionID string) (gateway.SessionView, error)
+	CreateSession(agentID, requestedKey, prefix string) (string, error)
 }
 
 // InjectMessage enqueues a synthetic inbound message for the headless CLI
@@ -175,6 +185,9 @@ func (c *CLIChannel) InjectMessage(msg gateway.InboundMessage) error {
 	if msg.Timestamp.IsZero() {
 		msg.Timestamp = time.Now()
 	}
+	if len(msg.Blocks) == 0 && len(msg.Media) == 0 {
+		msg.Text, msg.Blocks = ParseCLIInput(msg.Text)
+	}
 
 	defer func() {
 		if recover() != nil {
@@ -191,20 +204,32 @@ func (c *CLIChannel) InjectMessage(msg gateway.InboundMessage) error {
 // InjectText is a convenience wrapper around InjectMessage that targets the
 // default local sender.
 func (c *CLIChannel) InjectText(text string) error {
-	return c.InjectMessage(gateway.InboundMessage{Text: text})
+	cleanText, blocks := ParseCLIInput(text)
+	return c.InjectMessage(gateway.InboundMessage{Text: cleanText, Blocks: blocks})
 }
 
 type cliAssistantMessageMsg struct {
-	Text string
+	Text      string
+	AgentID   string
+	SessionID string
+	RunID     string
 }
 
 type cliRunEventMsg struct {
 	Event gateway.RunEvent
 }
 
+type cliClipboardImageMsg struct {
+	Block gateway.InputBlock
+	Err   error
+}
+
 type cliQuitMsg struct{}
 
+var cliClipboardImageReader = readCLIClipboardImageFromSystem
+
 type cliConversationEntry struct {
+	messageID    string
 	kind         string
 	role         string
 	text         string
@@ -232,6 +257,7 @@ type cliActivityEntry struct {
 	at        time.Time
 	depth     int
 	runID     string
+	traceKey  string
 	eventName string
 }
 
@@ -246,9 +272,11 @@ type cliCallFrame struct {
 }
 
 type cliTraceNode struct {
+	traceKey         string
 	runID            string
 	agentID          string
 	sessionID        string
+	parentTraceKey   string
 	parentRunID      string
 	parentAgentID    string
 	status           string
@@ -288,34 +316,40 @@ type cliRuntimeSummary struct {
 	EventsVisible   int
 }
 
+const cliCommandHintText = "Enter send  •  Ctrl+J newline  •  Ctrl+V image  •  Alt+Up/Down hist  •  /session [id]  •  /paste-image  •  /quit"
+
 type cliModel struct {
-	projectRoot        string
-	entryAgentID       string
-	sessionStore       *runtimesession.Store
-	input              textarea.Model
-	spinner            spinner.Model
-	chatView           viewport.Model
-	traceView          viewport.Model
-	width              int
-	height             int
-	ready              bool
-	panelWidth         int
-	chatHeight         int
-	traceHeight        int
-	statusEntry        cliConversationEntry
-	sessionMessages    []cliConversationEntry
-	pendingMessages    []cliConversationEntry
-	activeSessionAgent string
-	activeSessionID    string
-	pendingBaseline    int
-	messages           []cliConversationEntry
-	activities         []cliActivityEntry
-	traceNodes         map[string]*cliTraceNode
-	sendInput          func(string)
-	lastTreeRunID      string
-	inspectorCollapsed bool
-	selectedTraceRunID string
-	callStackExpanded  bool
+	projectRoot         string
+	entryAgentID        string
+	sessions            CLISessionSurface
+	input               textarea.Model
+	spinner             spinner.Model
+	chatView            viewport.Model
+	traceView           viewport.Model
+	width               int
+	height              int
+	ready               bool
+	panelWidth          int
+	chatHeight          int
+	traceHeight         int
+	statusEntry         cliConversationEntry
+	sessionMessages     []cliConversationEntry
+	pendingMessages     []cliConversationEntry
+	sessionNotice       string
+	activeSessionAgent  string
+	activeSessionID     string
+	cliSessionID        string
+	pendingBaseline     int
+	messages            []cliConversationEntry
+	activities          []cliActivityEntry
+	traceNodes          map[string]*cliTraceNode
+	sendInput           func(string, string, ...string)
+	sendInputWithBlocks func(string, string, []gateway.InputBlock, ...string)
+	lastTreeTraceKey    string
+	inspectorCollapsed  bool
+	selectedTraceKey    string
+	callStackExpanded   bool
+	composerAttachments []gateway.InputBlock
 	// Input history for up/down navigation
 	inputHistory []string
 	historyIndex int // -1 means at current input, >=0 means navigating history
@@ -330,6 +364,15 @@ func NewCLIChannel(projectRoot, entryAgentID string) *CLIChannel {
 // startup-path tests that should not launch a real TUI.
 func NewHeadlessCLIChannel(projectRoot, entryAgentID string) *CLIChannel {
 	return newCLIChannel(projectRoot, entryAgentID, true)
+}
+
+func (c *CLIChannel) SetSessionSurface(surface CLISessionSurface) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessions = surface
 }
 
 func newCLIChannel(projectRoot, entryAgentID string, headless bool) *CLIChannel {
@@ -360,7 +403,8 @@ func (c *CLIChannel) Connect(ctx context.Context) error {
 
 		return nil
 	}
-	model := newCLIModel(c.projectRoot, c.entryAgentID, c.enqueueInput)
+	model := newCLIModelWithSession(c.projectRoot, c.entryAgentID, c.sessions, c.enqueueInput)
+	model.sendInputWithBlocks = c.enqueueInputWithBlocks
 	program := tea.NewProgram(model, tea.WithAltScreen())
 	c.program = program
 	c.status = gateway.StatusConnected
@@ -387,8 +431,17 @@ func (c *CLIChannel) Disconnect() error {
 }
 
 func (c *CLIChannel) Send(_ context.Context, msg gateway.OutboundMessage) error {
-	c.dispatch(cliAssistantMessageMsg{Text: msg.Text})
+	c.dispatch(cliAssistantMessageMsg{
+		Text:      msg.Text,
+		AgentID:   msg.AgentID,
+		SessionID: msg.SessionID,
+		RunID:     msg.RunID,
+	})
 	return nil
+}
+
+func (c *CLIChannel) WantsFinalResponseSend() bool {
+	return false
 }
 
 func (c *CLIChannel) HandleRunEvent(_ context.Context, event gateway.RunEvent) error {
@@ -411,14 +464,37 @@ func (c *CLIChannel) Done() <-chan struct{} {
 	return c.shutdown
 }
 
-func (c *CLIChannel) enqueueInput(text string) {
+func (c *CLIChannel) enqueueInput(text, sessionID string, messageID ...string) {
+	c.enqueueInputWithBlocks(text, sessionID, nil, messageID...)
+}
+
+func (c *CLIChannel) enqueueInputWithBlocks(text, sessionID string, extraBlocks []gateway.InputBlock, messageID ...string) {
+	cleanText, blocks := ParseCLIInput(text)
+	if len(extraBlocks) > 0 {
+		blocks = append(blocks, extraBlocks...)
+	}
+	msgID := ""
+	if len(messageID) > 0 {
+		msgID = strings.TrimSpace(messageID[0])
+	}
+	if summary := summarizeCLIInputBlocks(blocks); summary != "" {
+		c.dispatch(cliRunEventMsg{Event: gateway.RunEvent{
+			Name:      "cli.input.attachments",
+			Timestamp: time.Now(),
+			Payload: map[string]any{
+				"summary": summary,
+			},
+		}})
+	}
 	c.inbound <- gateway.InboundMessage{
 		Channel:    "cli",
+		SessionID:  strings.TrimSpace(sessionID),
+		MessageID:  msgID,
 		ChatType:   gateway.ChatTypeDirect,
 		SenderID:   "local",
 		SenderName: "User",
-		Text:       text,
-		Blocks:     ParseCLIReferences(text),
+		Text:       cleanText,
+		Blocks:     blocks,
 		Timestamp:  time.Now(),
 	}
 }
@@ -456,8 +532,16 @@ func (c *CLIChannel) shutdownInternal() {
 }
 
 func newCLIModel(projectRoot, entryAgentID string, sendInput func(string)) *cliModel {
+	return newCLIModelWithSession(projectRoot, entryAgentID, nil, func(text, _ string, _ ...string) {
+		if sendInput != nil {
+			sendInput(text)
+		}
+	})
+}
+
+func newCLIModelWithSession(projectRoot, entryAgentID string, sessions CLISessionSurface, sendInput func(string, string, ...string)) *cliModel {
 	in := textarea.New()
-	// in.Placeholder = "输入自然语言，支持 @file /path、@dir /path、@url https://..."
+	// in.Placeholder = "输入自然语言，支持 @file /path、@image /path、@pdf /path、@dir /path、@url https://..."
 	in.Prompt = "› "
 	in.ShowLineNumbers = false
 	in.SetHeight(cliComposeMinRows)
@@ -483,34 +567,36 @@ func newCLIModel(projectRoot, entryAgentID string, sendInput func(string)) *cliM
 	sp.Style = cliRunningStyle
 
 	model := &cliModel{
-		projectRoot:        projectRoot,
-		entryAgentID:       entryAgentID,
-		sessionStore:       newCLISessionStore(projectRoot),
-		input:              in,
-		spinner:            sp,
-		traceNodes:         make(map[string]*cliTraceNode),
-		sendInput:          sendInput,
+		projectRoot:  projectRoot,
+		entryAgentID: entryAgentID,
+		sessions:     sessions,
+		input:        in,
+		spinner:      sp,
+		traceNodes:   make(map[string]*cliTraceNode),
+		sendInput:    sendInput,
+		sendInputWithBlocks: func(text, sessionID string, blocks []gateway.InputBlock, messageID ...string) {
+			if sendInput != nil {
+				sendInput(text, sessionID, messageID...)
+			}
+		},
 		inspectorCollapsed: true,
 		statusEntry: cliConversationEntry{
 			// This is a UI-only status card. The actual LLM system prompt is
 			// assembled inside the shared agent runtime.
 			kind: "status",
 			role: "status",
-			text: "AnyAI CLI 已就绪。Enter 发送，Ctrl+J 换行，Alt+↑↓ 历史，/quit 退出。",
+			text: cliStartupHelpText(),
 			at:   time.Now(),
 		},
 		historyIndex: -1,
 	}
+	model.preloadStartupSession()
 	model.rebuildConversation()
 	return model
 }
 
-func newCLISessionStore(projectRoot string) *runtimesession.Store {
-	root := strings.TrimSpace(projectRoot)
-	if root == "" {
-		return nil
-	}
-	return runtimesession.NewStore(filepath.Join(config.ProjectDataDir(root), "sessions"))
+func cliStartupHelpText() string {
+	return "AnyAI CLI 已就绪。  " + cliCommandHintText
 }
 
 func summarizeCLIConversationValue(value any) string {
@@ -632,7 +718,7 @@ func summarizeCLITodoUpdate(status, content string) string {
 	return label + "：" + task
 }
 
-func cliConversationEntriesFromSessionEvents(events []runtimeevents.EventRecord) []cliConversationEntry {
+func cliConversationEntriesFromSessionEvents(events []gateway.Event) []cliConversationEntry {
 	items := make([]cliConversationEntry, 0, len(events))
 	toolSlots := make(map[string]int)
 
@@ -640,54 +726,77 @@ func cliConversationEntriesFromSessionEvents(events []runtimeevents.EventRecord)
 		at := event.Timestamp
 		if at.IsZero() {
 			at = time.Now()
+		} else {
+			at = at.Local()
 		}
 		switch strings.TrimSpace(event.Name) {
-		case runtimeevents.EventSessionInputStored:
+		case "session.input.stored":
+			text := strings.TrimSpace(payloadString(event.Payload, "text"))
+			attachments := summarizeCLISessionAttachments(event.Payload)
+			if text == "" {
+				text = attachments
+			} else if attachments != "" {
+				text += "\n" + attachments
+			}
+			if text == "" {
+				continue
+			}
+			items = append(items, cliConversationEntry{
+				messageID: payloadString(event.Payload, "entry_id"),
+				kind:      "message",
+				role:      "user",
+				text:      text,
+				at:        at,
+			})
+		case "session.output.stored":
 			text := strings.TrimSpace(payloadString(event.Payload, "text"))
 			if text == "" {
 				continue
 			}
 			items = append(items, cliConversationEntry{
-				kind: "message",
-				role: "user",
-				text: text,
-				at:   at,
+				messageID: payloadString(event.Payload, "entry_id"),
+				kind:      "message",
+				role:      "assistant",
+				text:      cliConversationAgentText(event.AgentID, text),
+				at:        at,
 			})
-		case runtimeevents.EventSessionOutputStored:
+		case "session.meta.stored":
 			text := strings.TrimSpace(payloadString(event.Payload, "text"))
 			if text == "" {
 				continue
 			}
 			items = append(items, cliConversationEntry{
-				kind: "message",
-				role: "assistant",
-				text: cliConversationAgentText(event.AgentID, text),
-				at:   at,
+				messageID: payloadString(event.Payload, "entry_id"),
+				kind:      "meta",
+				role:      nonEmptyCLI(payloadString(event.Payload, "role"), "system"),
+				text:      text,
+				at:        at,
 			})
-		case runtimeevents.EventAgentCallCompleted, runtimeevents.EventAgentCallFailed:
+		case "agent.call.completed", "agent.call.failed":
 			target := nonEmptyCLI(payloadString(event.Payload, "target_agent"), payloadString(event.Payload, "agent"))
 			text := nonEmptyCLI(payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"))
 			if strings.TrimSpace(target) == "" || strings.TrimSpace(text) == "" {
 				continue
 			}
 			items = append(items, cliConversationEntry{
-				kind: "message",
-				role: "assistant",
-				text: cliConversationAgentText(target, text),
-				at:   at,
+				messageID: payloadString(event.Payload, "entry_id"),
+				kind:      "message",
+				role:      "assistant",
+				text:      cliConversationAgentText(target, text),
+				at:        at,
 			})
-		case runtimeevents.EventToolCallStarted, runtimeevents.EventToolCompleted, runtimeevents.EventToolFailed:
-			toolName := strings.TrimSpace(runtimeevents.ToolName(event))
+		case "tool.call.started", "tool.completed", "tool.failed":
+			toolName := strings.TrimSpace(gatewayEventToolName(event))
 			if shouldHideCLIConversationTool(toolName) {
 				continue
 			}
 			callID := strings.TrimSpace(payloadString(event.Payload, "id"))
 			key := cliConversationToolKey(event.RunID, event.AgentID, event.SessionID, callID, toolName)
 			status := "running"
-			if event.Name == runtimeevents.EventToolCompleted {
+			if event.Name == "tool.completed" {
 				status = "success"
 			}
-			if event.Name == runtimeevents.EventToolFailed || strings.TrimSpace(payloadString(event.Payload, "error")) != "" {
+			if event.Name == "tool.failed" || strings.TrimSpace(payloadString(event.Payload, "error")) != "" {
 				status = "failed"
 			}
 			label := cliConversationToolLabel(event.AgentID, toolName, status)
@@ -700,6 +809,7 @@ func cliConversationEntriesFromSessionEvents(events []runtimeevents.EventRecord)
 				continue
 			}
 			items = append(items, cliConversationEntry{
+				messageID:  payloadString(event.Payload, "entry_id"),
 				kind:       "tool_call",
 				role:       "assistant",
 				tool:       label,
@@ -722,6 +832,23 @@ func cliConversationAgentText(agentID, text string) string {
 	return "[" + agentID + "] " + text
 }
 
+func summarizeCLISessionAttachments(payload map[string]any) string {
+	items := payloadEntries(payload, "attachments")
+	if len(items) == 0 {
+		items = payloadEntries(payload, "images")
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	labels := make([]string, 0, len(items))
+	for _, item := range items {
+		typ := nonEmptyCLI(payloadString(item, "type"), "image")
+		name := nonEmptyCLI(payloadString(item, "name"), filepath.Base(payloadString(item, "path")), payloadString(item, "id"), payloadString(item, "attachment_id"), "attachment")
+		labels = append(labels, typ+":"+name)
+	}
+	return "附件: " + strings.Join(labels, "  •  ")
+}
+
 func cliConversationToolKey(parts ...string) string {
 	filtered := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -731,6 +858,18 @@ func cliConversationToolKey(parts ...string) string {
 		}
 	}
 	return strings.Join(filtered, ":")
+}
+
+func gatewayEventToolName(event gateway.Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	for _, key := range []string{"tool", "name", "tool_name"} {
+		if value, ok := event.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func cliConversationToolLabel(agentID, toolName, status string) string {
@@ -756,6 +895,34 @@ func shouldHideCLIConversationTool(name string) bool {
 
 func (m *cliModel) Init() tea.Cmd {
 	return tea.Batch(m.input.Focus(), textarea.Blink, m.spinner.Tick)
+}
+
+func (m *cliModel) attachComposerBlock(block gateway.InputBlock) bool {
+	block.Type = strings.TrimSpace(block.Type)
+	if block.Type == "" {
+		block.Type = "image"
+	}
+	if block.Type != "image" && block.Type != "file" && block.Type != "pdf" && block.Type != "dir" {
+		return false
+	}
+	key := cliInputBlockKey(block)
+	if key != "" {
+		for _, existing := range m.composerAttachments {
+			if cliInputBlockKey(existing) == key {
+				return false
+			}
+		}
+	}
+	m.composerAttachments = append(m.composerAttachments, block)
+	m.setSessionNotice(summarizeCLIInputBlocks([]gateway.InputBlock{block}))
+	return true
+}
+
+func (m *cliModel) pasteClipboardImageCmd() tea.Cmd {
+	return func() tea.Msg {
+		block, err := cliClipboardImageReader()
+		return cliClipboardImageMsg{Block: block, Err: err}
+	}
 }
 
 func (m *cliModel) rebuildConversation() {
@@ -809,6 +976,20 @@ func (m *cliModel) appendPendingConversation(entry cliConversationEntry) {
 	m.rebuildConversation()
 }
 
+func (m *cliModel) setSessionNotice(text string) {
+	if m == nil {
+		return
+	}
+	m.sessionNotice = strings.TrimSpace(text)
+}
+
+func (m *cliModel) clearSessionNotice() {
+	if m == nil {
+		return
+	}
+	m.sessionNotice = ""
+}
+
 func (m *cliModel) setActiveSession(agentID, sessionID string) {
 	agentID = strings.TrimSpace(agentID)
 	sessionID = strings.TrimSpace(sessionID)
@@ -816,16 +997,106 @@ func (m *cliModel) setActiveSession(agentID, sessionID string) {
 		return
 	}
 	if m.activeSessionAgent == agentID && m.activeSessionID == sessionID {
+		if strings.TrimSpace(m.cliSessionID) == "" {
+			m.cliSessionID = sessionID
+		}
 		return
 	}
 	resetPending := m.activeSessionID != "" && (m.activeSessionAgent != agentID || m.activeSessionID != sessionID)
 	m.activeSessionAgent = agentID
 	m.activeSessionID = sessionID
+	if agentID == strings.TrimSpace(m.entryAgentID) || strings.TrimSpace(m.cliSessionID) == "" {
+		m.cliSessionID = sessionID
+	}
 	m.sessionMessages = nil
 	if resetPending {
 		m.pendingMessages = nil
 		m.pendingBaseline = 0
 	}
+}
+
+func (m *cliModel) preloadStartupSession() {
+	if m == nil || m.sessions == nil {
+		return
+	}
+	agentID := strings.TrimSpace(m.entryAgentID)
+	if agentID == "" {
+		return
+	}
+	infos, err := m.sessions.ListSessions(agentID)
+	if err != nil || len(infos) == 0 {
+		return
+	}
+	sort.SliceStable(infos, func(i, j int) bool {
+		return infos[i].LastActivity.After(infos[j].LastActivity)
+	})
+	sessionID := strings.TrimSpace(infos[0].ID)
+	if sessionID == "" {
+		return
+	}
+	m.activeSessionAgent = agentID
+	m.activeSessionID = sessionID
+	m.cliSessionID = sessionID
+	m.syncActiveSessionConversation()
+}
+
+func (m *cliModel) defaultSubmissionSessionID() string {
+	if strings.TrimSpace(m.cliSessionID) != "" {
+		return strings.TrimSpace(m.cliSessionID)
+	}
+	return ""
+}
+
+func (m *cliModel) switchOrCreateSession(requested string) string {
+	if m == nil {
+		return ""
+	}
+	agentID := strings.TrimSpace(m.entryAgentID)
+	if agentID == "" {
+		agentID = "default"
+	}
+	sessionID := sanitizeCLISessionID(requested)
+	createOnly := sessionID == ""
+	if sessionID == "" {
+		sessionID = defaultCLISessionID(time.Now())
+	}
+	if m.sessions != nil {
+		if !createOnly {
+			if _, err := m.sessions.LoadSession(agentID, sessionID); err == nil {
+				m.setActiveSession(agentID, sessionID)
+				m.syncActiveSessionConversation()
+				m.setSessionNotice("已切换到 session " + sessionID)
+				return sessionID
+			}
+			if key, err := m.sessions.CreateSession(agentID, sessionID, "cli"); err == nil {
+				sessionID = key
+				createOnly = true
+			} else {
+				m.setSessionNotice("创建 session 失败: " + err.Error())
+				return ""
+			}
+		} else {
+			key, err := m.sessions.CreateSession(agentID, "", "cli")
+			if err != nil {
+				m.setSessionNotice("创建 session 失败: " + err.Error())
+				return ""
+			}
+			sessionID = key
+		}
+	}
+	m.activeSessionAgent = agentID
+	m.activeSessionID = sessionID
+	m.cliSessionID = sessionID
+	m.sessionMessages = nil
+	m.pendingMessages = nil
+	m.pendingBaseline = 0
+	if createOnly {
+		m.setSessionNotice("已创建并切换到 session " + sessionID)
+	} else {
+		m.setSessionNotice("已切换到 session " + sessionID)
+	}
+	m.rebuildConversation()
+	return sessionID
 }
 
 func (m *cliModel) reconcilePendingConversation() {
@@ -849,10 +1120,19 @@ func (m *cliModel) reconcilePendingConversation() {
 	for _, pending := range m.pendingMessages {
 		kind := strings.TrimSpace(pending.kind)
 		role := strings.TrimSpace(pending.role)
+		messageID := strings.TrimSpace(pending.messageID)
 		text := normalizeCLIConversationMatchText(role, pending.text)
 		matched := false
 		for idx, persisted := range recent {
 			if used[idx] {
+				continue
+			}
+			if messageID != "" {
+				if strings.TrimSpace(persisted.messageID) == messageID {
+					used[idx] = true
+					matched = true
+					break
+				}
 				continue
 			}
 			if strings.TrimSpace(persisted.kind) != kind {
@@ -875,23 +1155,23 @@ func (m *cliModel) reconcilePendingConversation() {
 	m.pendingMessages = filtered
 }
 
-func (m *cliModel) syncActiveSessionConversation() {
-	if m == nil || m.sessionStore == nil {
-		return
+func (m *cliModel) syncActiveSessionConversation() bool {
+	if m == nil || m.sessions == nil {
+		return false
 	}
 	agentID := strings.TrimSpace(m.activeSessionAgent)
 	sessionID := strings.TrimSpace(m.activeSessionID)
 	if agentID == "" || sessionID == "" {
-		return
+		return false
 	}
-	sess, err := m.sessionStore.Load(agentID, sessionID)
+	view, err := m.sessions.LoadSession(agentID, sessionID)
 	if err != nil {
-		return
+		return false
 	}
-	events := runtimesessionevents.HistoryEventRecords(agentID, sessionID, sess.History())
-	m.sessionMessages = cliConversationEntriesFromSessionEvents(events)
+	m.sessionMessages = cliConversationEntriesFromSessionEvents(view.Events)
 	m.reconcilePendingConversation()
 	m.rebuildConversation()
+	return true
 }
 
 func (m *cliModel) hasAssistantSessionMessage(text string) bool {
@@ -960,6 +1240,10 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyCtrlD, tea.KeyEsc:
 			return m, tea.Quit
+		case tea.KeyCtrlV:
+			m.setSessionNotice("正在读取剪贴板图片...")
+			m.refreshViewports()
+			return m, m.pasteClipboardImageCmd()
 		case tea.KeyUp:
 			if msg.Alt {
 				if len(m.inputHistory) > 0 && m.historyIndex < len(m.inputHistory)-1 {
@@ -999,6 +1283,20 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case cliAssistantMessageMsg:
 		text := strings.TrimSpace(msg.Text)
 		if text != "" {
+			msgAgentID := strings.TrimSpace(msg.AgentID)
+			msgSessionID := strings.TrimSpace(msg.SessionID)
+			if msgSessionID != "" {
+				activeAgentID := strings.TrimSpace(m.activeSessionAgent)
+				activeSessionID := strings.TrimSpace(m.activeSessionID)
+				sameAgent := msgAgentID == "" || activeAgentID == "" || msgAgentID == activeAgentID
+				if activeSessionID != "" && (msgSessionID != activeSessionID || !sameAgent) {
+					m.refreshViewports()
+					return m, nil
+				}
+				if activeSessionID == "" {
+					m.setActiveSession(nonEmptyCLI(msgAgentID, m.entryAgentID), msgSessionID)
+				}
+			}
 			m.syncActiveSessionConversation()
 			if !m.hasAssistantSessionMessage(text) {
 				m.appendPendingConversation(cliConversationEntry{
@@ -1017,9 +1315,28 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setActiveSession(msg.Event.AgentID, msg.Event.SessionID)
 		}
 		if shouldSyncCLIConversation(msg.Event) {
-			m.syncActiveSessionConversation()
+			if !m.syncActiveSessionConversation() {
+				m.rebuildConversation()
+			}
+		} else {
+			m.rebuildConversation()
 		}
 		m.refreshViewports()
+		return m, nil
+	case cliClipboardImageMsg:
+		if msg.Err != nil {
+			m.setSessionNotice("剪贴板没有可用图片：" + msg.Err.Error())
+			m.refreshViewports()
+			return m, nil
+		}
+		if !m.attachComposerBlock(msg.Block) {
+			m.setSessionNotice("剪贴板图片已在当前输入中")
+		}
+		if m.width > 0 && m.height > 0 {
+			m.resize()
+		} else {
+			m.refreshViewports()
+		}
 		return m, nil
 	case cliQuitMsg:
 		return m, tea.Quit
@@ -1052,11 +1369,19 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *cliModel) submitInput(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
-	if text == "" {
+	attachments := append([]gateway.InputBlock(nil), m.composerAttachments...)
+	if text == "" && len(attachments) == 0 {
 		return m, nil
 	}
-	if text == "/quit" || text == "/exit" {
-		return m, tea.Quit
+	if handled, cmd := m.handleLocalCommand(text); handled {
+		m.input.Reset()
+		if m.width > 0 && m.height > 0 {
+			m.resize()
+		} else {
+			m.syncInputHeight()
+			m.refreshViewports()
+		}
+		return m, cmd
 	}
 	// Save non-command input to history
 	if !strings.HasPrefix(text, "/") {
@@ -1067,13 +1392,18 @@ func (m *cliModel) submitInput(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		}
 		m.historyIndex = -1
 	}
+	sessionID := strings.TrimSpace(m.defaultSubmissionSessionID())
+	messageID := runtimesession.NewEntryID()
 	m.appendPendingConversation(cliConversationEntry{
-		kind: "message",
-		role: "user",
-		text: text,
-		at:   time.Now(),
+		messageID: messageID,
+		kind:      "message",
+		role:      "user",
+		text:      cliPendingInputText(text, attachments),
+		at:        time.Now(),
 	})
+	m.clearSessionNotice()
 	m.input.Reset()
+	m.composerAttachments = nil
 	if m.width > 0 && m.height > 0 {
 		m.resize()
 	} else {
@@ -1081,10 +1411,43 @@ func (m *cliModel) submitInput(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
 		m.refreshViewports()
 	}
 	cmds = append(cmds, func() tea.Msg {
-		m.sendInput(text)
+		if m.sendInputWithBlocks != nil {
+			m.sendInputWithBlocks(text, sessionID, attachments, messageID)
+		} else if m.sendInput != nil {
+			m.sendInput(text, sessionID, messageID)
+		}
 		return nil
 	})
 	return m, tea.Batch(cmds...)
+}
+
+func (m *cliModel) handleLocalCommand(text string) (bool, tea.Cmd) {
+	text = strings.TrimSpace(text)
+	if text == "" || !strings.HasPrefix(text, "/") {
+		return false, nil
+	}
+	fields := strings.Fields(text)
+	cmd := strings.ToLower(strings.TrimSpace(fields[0]))
+	switch cmd {
+	case "/session":
+		if len(fields) > 2 {
+			m.setSessionNotice("用法: /session [session-id]")
+			return true, nil
+		}
+		name := ""
+		if len(fields) == 2 {
+			name = fields[1]
+		}
+		m.switchOrCreateSession(name)
+		return true, nil
+	case "/paste-image":
+		m.setSessionNotice("正在读取剪贴板图片...")
+		return true, m.pasteClipboardImageCmd()
+	case "/quit":
+		return true, tea.Quit
+	default:
+		return false, nil
+	}
 }
 
 func (m *cliModel) View() string {
@@ -1117,7 +1480,7 @@ func (m *cliModel) resize() {
 	}
 
 	m.syncInputHeight()
-	availableHeight := totalHeight - cliHeaderHeight - cliInputPanelHeight(m.input.Height()) - cliBodyGap
+	availableHeight := totalHeight - cliHeaderHeight - m.inputPanelHeight() - cliBodyGap
 	if availableHeight < cliChatMinHeight {
 		availableHeight = cliChatMinHeight
 	}
@@ -1149,8 +1512,15 @@ func (m *cliModel) resize() {
 	m.refreshViewports()
 }
 
-func cliInputPanelHeight(inputRows int) int {
-	return inputRows + cliInputPanelStyle.GetVerticalFrameSize() + 1
+func (m *cliModel) inputPanelHeight() int {
+	return m.input.Height() + cliInputPanelStyle.GetVerticalFrameSize() + 2 + m.inputPanelExtraRows()
+}
+
+func (m *cliModel) inputPanelExtraRows() int {
+	if len(m.composerAttachments) > 0 {
+		return 1
+	}
+	return 0
 }
 
 func desiredCLIComposeRows(lineCount int) int {
@@ -1223,12 +1593,13 @@ func (m *cliModel) renderHeader(width int) string {
 		" ",
 		cliHeaderSubtitleStyle.Render("single-column agent + tool timeline"),
 	)
-	right := cliHintStyle.Render("PgUp/PgDn page  •  Alt+Up/Down history  •  Esc quit")
+	right := cliHintStyle.Render("PgUp/PgDn page  •  Alt+Up/Down history  •  /session [id]  •  Esc quit")
 
 	line1 := cliTopBarStyle.Width(width).Render(alignInline(width, left, right))
 	line2 := renderHeaderRow(width, []string{
 		renderHeaderBadge("project", projectLabel),
 		renderHeaderBadge("agent", entryAgent),
+		renderHeaderBadge("session", shortID(m.cliSessionID)),
 		renderHeaderBadge("state", status),
 	})
 	line3 := renderHeaderRow(width, []string{
@@ -1270,14 +1641,32 @@ func (m *cliModel) renderPanel(title, meta, content string, width, height int) s
 
 func (m *cliModel) renderInputPanel(width int) string {
 	innerWidth := max(10, width-cliInputPanelStyle.GetHorizontalFrameSize())
+	title := cliPanelHeaderTitleStyle.Render("Compose")
+	notice := strings.TrimSpace(m.sessionNotice)
+	if notice != "" {
+		prefix := cliMetaKeyStyle.Render("session ")
+		notice = cliMutedStyle.Render(trimCLITextToWidth(notice, max(1, innerWidth-lipgloss.Width(title)-1-lipgloss.Width(prefix))))
+		notice = lipgloss.JoinHorizontal(lipgloss.Left, prefix, notice)
+	}
 	header := alignInline(
 		innerWidth,
-		cliPanelHeaderTitleStyle.Render("Compose"),
-		cliPanelHeaderMetaStyle.Render("Enter send  •  Ctrl+J newline  •  /quit exit"),
+		title,
+		notice,
 	)
-	content := lipgloss.JoinVertical(lipgloss.Left,
+	attachmentLine := ""
+	if summary := summarizeCLIInputBlocks(m.composerAttachments); summary != "" {
+		attachmentLine = cliMutedStyle.Render(trimCLITextToWidth(summary, innerWidth))
+	}
+	parts := []string{
 		lipgloss.NewStyle().Width(innerWidth).Render(header),
 		m.input.View(),
+	}
+	if attachmentLine != "" {
+		parts = append(parts, attachmentLine)
+	}
+	parts = append(parts, cliMutedStyle.Render(trimCLITextToWidth(cliCommandHintText, innerWidth)))
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		parts...,
 	)
 	return cliInputPanelStyle.Width(width).Render(content)
 }
@@ -1383,15 +1772,6 @@ func renderCLIConversationEntry(entry cliConversationEntry, width int) string {
 		" ",
 		cliMutedStyle.Render(entry.at.Format("15:04:05")),
 	)
-	if entry.pending {
-		header = lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			header,
-			" ",
-			cliMetaBadgeStyle.Render("pending"),
-		)
-	}
-
 	lines := []string{header}
 	kind := strings.TrimSpace(entry.kind)
 	switch kind {
@@ -1543,7 +1923,7 @@ func (m *cliModel) focusTraceNode() *cliTraceNode {
 		if node == nil {
 			continue
 		}
-		if selected == nil || m.preferCLITraceNode(node, selected, m.lastTreeRunID) {
+		if selected == nil || m.preferCLITraceNode(node, selected, m.lastTreeTraceKey) {
 			selected = node
 		}
 	}
@@ -1551,14 +1931,14 @@ func (m *cliModel) focusTraceNode() *cliTraceNode {
 }
 
 func (m *cliModel) selectedTraceNode() *cliTraceNode {
-	if strings.TrimSpace(m.selectedTraceRunID) != "" {
-		if node := m.traceNodes[m.selectedTraceRunID]; node != nil {
+	if strings.TrimSpace(m.selectedTraceKey) != "" {
+		if node := m.traceNodes[m.selectedTraceKey]; node != nil {
 			return node
 		}
 	}
 	node := m.focusTraceNode()
 	if node != nil {
-		m.selectedTraceRunID = node.runID
+		m.selectedTraceKey = node.traceKey
 	}
 	return node
 }
@@ -1603,7 +1983,7 @@ func (m *cliModel) moveTraceSelection(delta int) {
 	index := 0
 	if current != nil {
 		for i, node := range nodes {
-			if node != nil && node.runID == current.runID {
+			if node != nil && node.traceKey == current.traceKey {
 				index = i
 				break
 			}
@@ -1617,7 +1997,7 @@ func (m *cliModel) moveTraceSelection(delta int) {
 		index = len(nodes) - 1
 	}
 	if nodes[index] != nil {
-		m.selectedTraceRunID = nodes[index].runID
+		m.selectedTraceKey = nodes[index].traceKey
 	}
 }
 
@@ -1630,7 +2010,7 @@ func (m *cliModel) flattenTraceNodes() []*cliTraceNode {
 				continue
 			}
 			flat = append(flat, node)
-			visit(m.childTraceNodes(node.runID))
+			visit(m.childTraceNodes(node.traceKey))
 		}
 	}
 	visit(m.sortedTraceRoots())
@@ -1661,7 +2041,7 @@ func (m *cliModel) renderSelectedTracePanel(width int) string {
 		lines = append(lines, cliMutedStyle.Width(width).Render(wrapCLIText("last event: "+trimForDisplay(last, 180), width)))
 	}
 
-	if strings.TrimSpace(node.parentRunID) == "" {
+	if strings.TrimSpace(node.parentTraceKey) == "" {
 		lines = append(lines, cliMutedStyle.Width(width).Render("entry node"))
 	} else {
 		parent := nonEmptyCLI(node.parentAgentID, shortID(node.parentRunID))
@@ -1697,7 +2077,7 @@ func (m *cliModel) renderSelectedTraceTimeline(width int) string {
 	var related []cliActivityEntry
 	for i := len(m.activities) - 1; i >= 0; i-- {
 		item := m.activities[i]
-		if item.runID == node.runID {
+		if item.traceKey == node.traceKey {
 			related = append([]cliActivityEntry{item}, related...)
 		}
 	}
@@ -1732,10 +2112,10 @@ func (m *cliModel) tracePath(node *cliTraceNode) []*cliTraceNode {
 	current := node
 	for current != nil {
 		reversed = append(reversed, current)
-		if strings.TrimSpace(current.parentRunID) == "" {
+		if strings.TrimSpace(current.parentTraceKey) == "" {
 			break
 		}
-		current = m.traceNodes[current.parentRunID]
+		current = m.traceNodes[current.parentTraceKey]
 	}
 	path := make([]*cliTraceNode, 0, len(reversed))
 	for i := len(reversed) - 1; i >= 0; i-- {
@@ -1901,7 +2281,7 @@ func (m *cliModel) renderLatestCallStack(width int) string {
 		}
 	}
 
-	lines = append(lines, "", cliHintStyle.Width(width).Render("F3 或 /stack 可切换调用栈细节。F2 切换 split / full，两种布局展示的是同一份上下文内容。"))
+	lines = append(lines, "", cliHintStyle.Width(width).Render("F3 可切换调用栈细节。F2 切换 split / full，两种布局展示的是同一份上下文内容。"))
 	return strings.Join(lines, "\n")
 }
 
@@ -1987,13 +2367,18 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
+	if strings.TrimSpace(event.Name) == "cli.input.attachments" {
+		m.addActivity(formatCLIEventTitle(event), m.formatCLIEventDetail(event), event.Timestamp, toneForEvent(event), 0, "", "", event.Name)
+		return
+	}
+	traceKey := cliTraceKeyForEvent(event)
 	previousEventName := ""
 	if strings.TrimSpace(event.RunID) != "" {
-		if existing := m.traceNodes[event.RunID]; existing != nil {
+		if existing := m.traceNodes[traceKey]; existing != nil {
 			previousEventName = existing.lastEventName
 		}
 		node := m.ensureTraceNode(event)
-		m.lastTreeRunID = m.treeRunIDForNode(node)
+		m.lastTreeTraceKey = m.treeTraceKeyForNode(node)
 		node.eventCount++
 		if !cliSuppressTraceSummaryEvent(event.Name) {
 			node.lastEventName = event.Name
@@ -2106,12 +2491,12 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 		default:
 			node.status = coalesceCLIStatus(node.status, "running")
 		}
-		if strings.TrimSpace(m.selectedTraceRunID) == "" {
-			m.selectedTraceRunID = node.runID
+		if strings.TrimSpace(m.selectedTraceKey) == "" {
+			m.selectedTraceKey = node.traceKey
 		}
 	}
 
-	depth := m.runDepth(event.RunID)
+	depth := m.runDepth(traceKey)
 	if !cliDisplayActivityEvent(event.Name) {
 		return
 	}
@@ -2121,10 +2506,10 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 			return
 		}
 	}
-	m.addActivity(formatCLIEventTitle(event), m.formatCLIEventDetail(event), event.Timestamp, toneForEvent(event), depth, event.RunID, event.Name)
+	m.addActivity(formatCLIEventTitle(event), m.formatCLIEventDetail(event), event.Timestamp, toneForEvent(event), depth, event.RunID, traceKey, event.Name)
 }
 
-func (m *cliModel) addActivity(title, detail string, at time.Time, tone string, depth int, runID, eventName string) {
+func (m *cliModel) addActivity(title, detail string, at time.Time, tone string, depth int, runID, traceKey, eventName string) {
 	m.activities = append(m.activities, cliActivityEntry{
 		title:     title,
 		detail:    detail,
@@ -2132,6 +2517,7 @@ func (m *cliModel) addActivity(title, detail string, at time.Time, tone string, 
 		at:        at,
 		depth:     depth,
 		runID:     runID,
+		traceKey:  traceKey,
 		eventName: eventName,
 	})
 	if len(m.activities) > cliMaxActivities {
@@ -2140,9 +2526,11 @@ func (m *cliModel) addActivity(title, detail string, at time.Time, tone string, 
 }
 
 func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
-	node, ok := m.traceNodes[event.RunID]
+	traceKey := cliTraceKeyForEvent(event)
+	node, ok := m.traceNodes[traceKey]
 	if !ok {
 		node = &cliTraceNode{
+			traceKey:         traceKey,
 			runID:            event.RunID,
 			agentID:          event.AgentID,
 			sessionID:        event.SessionID,
@@ -2157,7 +2545,10 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 			backgroundTasks:  make(map[string]cliBackgroundTask),
 			callFrames:       nil,
 		}
-		m.traceNodes[event.RunID] = node
+		m.traceNodes[traceKey] = node
+	}
+	if node.traceKey == "" {
+		node.traceKey = traceKey
 	}
 	if node.agentID == "" {
 		node.agentID = event.AgentID
@@ -2168,12 +2559,33 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 	if node.parentAgentID == "" {
 		node.parentAgentID = event.ParentAgentID
 	}
-	if node.parentRunID == "" &&
+	if strings.TrimSpace(event.ParentTraceNodeID) == "" &&
+		node.parentRunID == "" &&
 		strings.TrimSpace(node.runID) != "" &&
-		strings.TrimSpace(node.runID) != strings.TrimSpace(m.lastTreeRunID) &&
+		strings.TrimSpace(node.traceKey) != strings.TrimSpace(m.lastTreeTraceKey) &&
 		strings.TrimSpace(node.parentAgentID) != "" &&
-		strings.TrimSpace(m.lastTreeRunID) != "" {
-		node.parentRunID = m.lastTreeRunID
+		strings.TrimSpace(m.lastTreeTraceKey) != "" {
+		node.parentTraceKey = m.lastTreeTraceKey
+		if parent := m.traceNodes[m.lastTreeTraceKey]; parent != nil {
+			node.parentRunID = parent.runID
+		}
+	}
+	if parentKey := strings.TrimSpace(event.ParentTraceNodeID); parentKey != "" && parentKey != node.traceKey {
+		node.parentTraceKey = parentKey
+		if parent := m.traceNodes[parentKey]; parent != nil {
+			node.parentRunID = parent.runID
+			if node.parentAgentID == "" {
+				node.parentAgentID = parent.agentID
+			}
+		}
+	}
+	if node.parentTraceKey == "" && node.parentRunID != "" {
+		node.parentTraceKey = m.findTraceKeyByRunID(node.parentRunID)
+	}
+	if node.parentRunID == "" && node.parentTraceKey != "" {
+		if parent := m.traceNodes[node.parentTraceKey]; parent != nil {
+			node.parentRunID = parent.runID
+		}
 	}
 	if node.startedAt.IsZero() {
 		node.startedAt = event.Timestamp
@@ -2188,6 +2600,38 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 		node.backgroundTasks = make(map[string]cliBackgroundTask)
 	}
 	return node
+}
+
+func cliTraceKey(runID, agentID string) string {
+	runID = strings.TrimSpace(runID)
+	agentID = strings.TrimSpace(agentID)
+	if runID == "" {
+		return ""
+	}
+	if agentID == "" {
+		return runID + "::"
+	}
+	return runID + "::" + agentID
+}
+
+func cliTraceKeyForEvent(event gateway.RunEvent) string {
+	if key := strings.TrimSpace(event.TraceNodeID); key != "" {
+		return key
+	}
+	return cliTraceKey(event.RunID, event.AgentID)
+}
+
+func (m *cliModel) findTraceKeyByRunID(runID string) string {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return ""
+	}
+	for key, node := range m.traceNodes {
+		if node != nil && strings.TrimSpace(node.runID) == runID {
+			return key
+		}
+	}
+	return ""
 }
 
 func (m *cliModel) runningRunCount() int {
@@ -2311,30 +2755,30 @@ func (m *cliModel) sortedTraceRoots() []*cliTraceNode {
 		if node == nil {
 			continue
 		}
-		if strings.TrimSpace(node.parentRunID) == "" || m.traceNodes[node.parentRunID] == nil {
+		if strings.TrimSpace(node.parentTraceKey) == "" || m.traceNodes[node.parentTraceKey] == nil {
 			roots = append(roots, node)
 		}
 	}
 	sort.Slice(roots, func(i, j int) bool {
 		if roots[i].startedAt.Equal(roots[j].startedAt) {
-			return roots[i].runID < roots[j].runID
+			return roots[i].traceKey < roots[j].traceKey
 		}
 		return roots[i].startedAt.Before(roots[j].startedAt)
 	})
 	return roots
 }
 
-func (m *cliModel) childTraceNodes(parentRunID string) []*cliTraceNode {
+func (m *cliModel) childTraceNodes(parentTraceKey string) []*cliTraceNode {
 	children := make([]*cliTraceNode, 0, len(m.traceNodes))
 	for _, node := range m.traceNodes {
-		if node == nil || node.parentRunID != parentRunID {
+		if node == nil || node.parentTraceKey != parentTraceKey {
 			continue
 		}
 		children = append(children, node)
 	}
 	sort.Slice(children, func(i, j int) bool {
 		if children[i].startedAt.Equal(children[j].startedAt) {
-			return children[i].runID < children[j].runID
+			return children[i].traceKey < children[j].traceKey
 		}
 		return children[i].startedAt.Before(children[j].startedAt)
 	})
@@ -2345,8 +2789,8 @@ func (m *cliModel) appendTraceNodeRows(rows []string, node *cliTraceNode, depth,
 	if node == nil {
 		return rows
 	}
-	rows = append(rows, renderTraceNodeRow(node, m.treeRunIDForNode(node), depth, width, node.runID == m.selectedTraceRunID, m.treeRunIDForNode(node) == m.lastTreeRunID && depth == 0))
-	for _, child := range m.childTraceNodes(node.runID) {
+	rows = append(rows, renderTraceNodeRow(node, m.treeRunIDForNode(node), depth, width, node.traceKey == m.selectedTraceKey, m.treeTraceKeyForNode(node) == m.lastTreeTraceKey && depth == 0))
+	for _, child := range m.childTraceNodes(node.traceKey) {
 		rows = m.appendTraceNodeRows(rows, child, depth+1, width)
 	}
 	return rows
@@ -2469,6 +2913,8 @@ func formatCLIEventTitle(event gateway.RunEvent) string {
 	}
 	prefix := "[" + agent + "] "
 	switch event.Name {
+	case "cli.input.attachments":
+		return cliIdleStyle.Render("[input] attachments")
 	case "run.started":
 		return cliRunningStyle.Render(prefix + "thinking")
 	case "text.delta":
@@ -2536,8 +2982,15 @@ func formatCLIEventTitle(event gateway.RunEvent) string {
 func (m *cliModel) formatCLIEventDetail(event gateway.RunEvent) string {
 	var lines []string
 	header := "run " + shortID(event.RunID)
+	if strings.TrimSpace(event.RunID) == "" {
+		header = "input"
+	}
 	lines = append(lines, header)
 	switch event.Name {
+	case "cli.input.attachments":
+		if summary := payloadString(event.Payload, "summary"); summary != "" {
+			lines = append(lines, summary)
+		}
 	case "text.delta":
 		if text := payloadString(event.Payload, "text"); text != "" {
 			lines = append(lines, trimForDisplay(text, 180))
@@ -2728,6 +3181,11 @@ func renderCLITracePhase(node *cliTraceNode) string {
 
 func summarizeCLITraceEvent(event gateway.RunEvent) string {
 	switch event.Name {
+	case "cli.input.attachments":
+		if summary := payloadString(event.Payload, "summary"); summary != "" {
+			return summary
+		}
+		return "attachments parsed"
 	case "run.started":
 		return "model is thinking"
 	case "text.delta":
@@ -2871,6 +3329,8 @@ func summarizeCLITraceEvent(event gateway.RunEvent) string {
 
 func cliDisplayActivityEvent(name string) bool {
 	switch strings.TrimSpace(name) {
+	case "cli.input.attachments":
+		return true
 	case "run.activity", "run.started", "text.delta", "task.queued", "task.started", "task.running", "tool.call.requested":
 		return false
 	default:
@@ -2942,6 +3402,8 @@ func prefixMultiline(text, prefix string) string {
 
 func toneForEvent(event gateway.RunEvent) string {
 	switch event.Name {
+	case "cli.input.attachments":
+		return "success"
 	case "run.failed", "run.aborted":
 		return "error"
 	case "run.completed", "agent.call.completed", "agent.call.failed":
@@ -2976,25 +3438,25 @@ func toneForEvent(event gateway.RunEvent) string {
 	}
 }
 
-func (m *cliModel) runDepth(runID string) int {
-	runID = strings.TrimSpace(runID)
-	if runID == "" {
+func (m *cliModel) runDepth(traceKey string) int {
+	traceKey = strings.TrimSpace(traceKey)
+	if traceKey == "" {
 		return 0
 	}
 	depth := 0
 	visited := map[string]struct{}{}
-	currentID := runID
+	currentKey := traceKey
 	for {
-		node := m.traceNodes[currentID]
-		if node == nil || strings.TrimSpace(node.parentRunID) == "" {
+		node := m.traceNodes[currentKey]
+		if node == nil || strings.TrimSpace(node.parentTraceKey) == "" {
 			return depth
 		}
-		if _, seen := visited[currentID]; seen {
+		if _, seen := visited[currentKey]; seen {
 			return depth
 		}
-		visited[currentID] = struct{}{}
+		visited[currentKey] = struct{}{}
 		depth++
-		currentID = node.parentRunID
+		currentKey = node.parentTraceKey
 	}
 }
 
@@ -3149,6 +3611,20 @@ func payloadEntries(payload map[string]any, key string) []map[string]any {
 	switch entries := value.(type) {
 	case []map[string]any:
 		return entries
+	case []runtimesession.ImageData:
+		out := make([]map[string]any, 0, len(entries))
+		for _, item := range entries {
+			out = append(out, map[string]any{
+				"type":          "image",
+				"id":            item.ID,
+				"mime_type":     item.MimeType,
+				"path":          item.Path,
+				"name":          item.Name,
+				"size":          item.Size,
+				"attachment_id": item.ID,
+			})
+		}
+		return out
 	case []any:
 		out := make([]map[string]any, 0, len(entries))
 		for _, item := range entries {
@@ -3174,6 +3650,30 @@ func trimForDisplay(value string, limit int) string {
 	return string(runes[:limit]) + "..."
 }
 
+func trimCLITextToWidth(value string, width int) string {
+	value = strings.TrimSpace(value)
+	width = max(1, width)
+	if lipgloss.Width(value) <= width {
+		return value
+	}
+	ellipsis := "..."
+	if width <= lipgloss.Width(ellipsis) {
+		return strings.Repeat(".", width)
+	}
+	limit := width - lipgloss.Width(ellipsis)
+	var out []rune
+	used := 0
+	for _, r := range value {
+		next := lipgloss.Width(string(r))
+		if used+next > limit {
+			break
+		}
+		out = append(out, r)
+		used += next
+	}
+	return strings.TrimSpace(string(out)) + ellipsis
+}
+
 func shortID(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -3183,6 +3683,38 @@ func shortID(value string) string {
 		return value
 	}
 	return value[:12]
+}
+
+func defaultCLISessionID(now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return "cli_" + now.UTC().Format("20060102T150405")
+}
+
+func sanitizeCLISessionID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var out []rune
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			out = append(out, r)
+		case r >= 'A' && r <= 'Z':
+			out = append(out, r+'a'-'A')
+		case r >= '0' && r <= '9':
+			out = append(out, r)
+		case r == '-' || r == '_' || r == '.':
+			out = append(out, r)
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			out = append(out, r)
+		default:
+			out = append(out, '_')
+		}
+	}
+	return strings.Trim(strings.TrimSpace(string(out)), "_-.")
 }
 
 func nonEmptyCLI(values ...string) string {
@@ -3200,7 +3732,7 @@ func (m *cliModel) treeRunID(runID string) string {
 	if runID == "" {
 		return ""
 	}
-	node := m.traceNodes[runID]
+	node := m.traceNodes[m.findTraceKeyByRunID(runID)]
 	return m.treeRunIDForNode(node)
 }
 
@@ -3216,17 +3748,16 @@ func (m *cliModel) treeRunIDForNode(node *cliTraceNode) string {
 		if currentRunID != "" {
 			treeRunID = currentRunID
 		}
-		parentRunID := strings.TrimSpace(current.parentRunID)
-		if parentRunID == "" {
+		parentTraceKey := strings.TrimSpace(current.parentTraceKey)
+		if parentTraceKey == "" {
 			break
 		}
-		if _, seen := visited[parentRunID]; seen {
+		if _, seen := visited[parentTraceKey]; seen {
 			break
 		}
-		visited[parentRunID] = struct{}{}
-		parent := m.traceNodes[parentRunID]
+		visited[parentTraceKey] = struct{}{}
+		parent := m.traceNodes[parentTraceKey]
 		if parent == nil {
-			treeRunID = parentRunID
 			break
 		}
 		current = parent
@@ -3234,12 +3765,42 @@ func (m *cliModel) treeRunIDForNode(node *cliTraceNode) string {
 	return treeRunID
 }
 
-func (m *cliModel) preferCLITraceNode(candidate, current *cliTraceNode, lastTreeRunID string) bool {
+func (m *cliModel) treeTraceKeyForNode(node *cliTraceNode) string {
+	if node == nil {
+		return ""
+	}
+	treeKey := strings.TrimSpace(node.traceKey)
+	current := node
+	visited := map[string]struct{}{}
+	for current != nil {
+		currentKey := strings.TrimSpace(current.traceKey)
+		if currentKey != "" {
+			treeKey = currentKey
+		}
+		parentKey := strings.TrimSpace(current.parentTraceKey)
+		if parentKey == "" {
+			break
+		}
+		if _, seen := visited[parentKey]; seen {
+			break
+		}
+		visited[parentKey] = struct{}{}
+		parent := m.traceNodes[parentKey]
+		if parent == nil {
+			treeKey = parentKey
+			break
+		}
+		current = parent
+	}
+	return treeKey
+}
+
+func (m *cliModel) preferCLITraceNode(candidate, current *cliTraceNode, lastTreeTraceKey string) bool {
 	if current == nil {
 		return true
 	}
-	candidateSameTree := strings.TrimSpace(lastTreeRunID) != "" && m.treeRunIDForNode(candidate) == lastTreeRunID
-	currentSameTree := strings.TrimSpace(lastTreeRunID) != "" && m.treeRunIDForNode(current) == lastTreeRunID
+	candidateSameTree := strings.TrimSpace(lastTreeTraceKey) != "" && m.treeTraceKeyForNode(candidate) == lastTreeTraceKey
+	currentSameTree := strings.TrimSpace(lastTreeTraceKey) != "" && m.treeTraceKeyForNode(current) == lastTreeTraceKey
 	if candidateSameTree != currentSameTree {
 		return candidateSameTree
 	}
@@ -3515,6 +4076,40 @@ func cliTraceBackgroundFootprint(node *cliTraceNode, limit int) string {
 	return cliTraceListNames(names, limit)
 }
 
+func summarizeCLIInputBlocks(blocks []gateway.InputBlock) string {
+	if len(blocks) == 0 {
+		return ""
+	}
+	labels := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		switch strings.TrimSpace(block.Type) {
+		case "file", "image", "pdf", "dir":
+			name := nonEmptyCLI(strings.TrimSpace(block.Name), filepath.Base(strings.TrimSpace(block.Path)), strings.TrimSpace(block.Path))
+			labels = append(labels, strings.TrimSpace(block.Type)+":"+name)
+		case "url":
+			if url := strings.TrimSpace(block.URL); url != "" {
+				labels = append(labels, "url:"+trimForDisplay(url, 44))
+			}
+		}
+	}
+	if len(labels) == 0 {
+		return ""
+	}
+	return "已附加 " + strings.Join(labels, "  •  ")
+}
+
+func cliPendingInputText(text string, blocks []gateway.InputBlock) string {
+	text = strings.TrimSpace(text)
+	summary := summarizeCLIInputBlocks(blocks)
+	if text == "" {
+		return summary
+	}
+	if summary == "" {
+		return text
+	}
+	return text + "\n" + summary
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -3522,96 +4117,389 @@ func max(a, b int) int {
 	return b
 }
 
-// ParseCLIReferences scans text for @file:path / @file path style references
-// (same for @dir and @url) and returns InputBlocks for each.
-func ParseCLIReferences(text string) []input.InputBlock {
-	// Fast path: no @ references at all
-	if !strings.Contains(text, "@file") && !strings.Contains(text, "@dir") && !strings.Contains(text, "@url") {
-		return nil
+// ParseCLIInput scans CLI text for @file:path / @file path style references
+// (same for @dir, @url, @image, and @pdf), plus @/path.png style image
+// references. It returns text with recognized attachment references removed
+// and InputBlocks for each attachment.
+func ParseCLIInput(text string) (string, []gateway.InputBlock) {
+	if !strings.Contains(text, "@file") &&
+		!strings.Contains(text, "@dir") &&
+		!strings.Contains(text, "@url") &&
+		!strings.Contains(text, "@image") &&
+		!strings.Contains(text, "@pdf") &&
+		!strings.Contains(text, "@~") &&
+		!strings.Contains(text, "@/") &&
+		!strings.Contains(text, "@./") &&
+		!strings.Contains(text, "@../") {
+		return text, nil
 	}
 
-	var blocks []input.InputBlock
-	fields := strings.Fields(text)
-	for i := 0; i < len(fields); i++ {
-		block, consumed := parseCLIReferenceField(fields, i)
-		if consumed == 0 {
-			continue
+	matches := parseCLIReferenceMatches(text)
+	if len(matches) == 0 {
+		return text, nil
+	}
+
+	var blocks []gateway.InputBlock
+	seen := map[string]struct{}{}
+	for _, match := range matches {
+		key := cliInputBlockKey(match.block)
+		if key != "" {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
 		}
-		blocks = append(blocks, block)
-		i += consumed - 1
+		blocks = append(blocks, match.block)
 	}
 
 	if len(blocks) == 0 {
-		return nil
+		return text, nil
 	}
+	return stripCLIReferenceMatches(text, matches), blocks
+}
+
+// ParseCLIReferences returns only the structured references from ParseCLIInput.
+func ParseCLIReferences(text string) []gateway.InputBlock {
+	_, blocks := ParseCLIInput(text)
 	return blocks
 }
 
-func parseCLIReferenceField(fields []string, index int) (input.InputBlock, int) {
-	token := fields[index]
-	switch {
-	case strings.HasPrefix(token, "@file:"):
-		return fileReferenceBlock(strings.TrimPrefix(token, "@file:"))
-	case token == "@file" && index+1 < len(fields):
-		block, ok := fileReferenceBlock(fields[index+1])
-		if ok == 0 {
-			return input.InputBlock{}, 0
+type cliReferenceMatch struct {
+	start int
+	end   int
+	block gateway.InputBlock
+}
+
+func parseCLIReferenceMatches(text string) []cliReferenceMatch {
+	var matches []cliReferenceMatch
+	for i := 0; i < len(text); i++ {
+		if text[i] != '@' {
+			continue
 		}
-		return block, 2
-	case strings.HasPrefix(token, "@dir:"):
-		return dirReferenceBlock(strings.TrimPrefix(token, "@dir:"))
-	case token == "@dir" && index+1 < len(fields):
-		block, ok := dirReferenceBlock(fields[index+1])
-		if ok == 0 {
-			return input.InputBlock{}, 0
+		match, ok := parseCLIReferenceAt(text, i)
+		if !ok {
+			continue
 		}
-		return block, 2
-	case strings.HasPrefix(token, "@url:"):
-		return urlReferenceBlock(strings.TrimPrefix(token, "@url:"))
-	case token == "@url" && index+1 < len(fields):
-		block, ok := urlReferenceBlock(fields[index+1])
-		if ok == 0 {
-			return input.InputBlock{}, 0
+		matches = append(matches, match)
+		if match.end > i {
+			i = match.end - 1
 		}
-		return block, 2
+	}
+	return matches
+}
+
+func parseCLIReferenceAt(text string, start int) (cliReferenceMatch, bool) {
+	for _, kind := range []string{"file", "dir", "url", "image", "pdf"} {
+		colonPrefix := "@" + kind + ":"
+		if strings.HasPrefix(text[start:], colonPrefix) {
+			block, end, ok := parseCLIReferenceValue(kind, text, start+len(colonPrefix))
+			if !ok {
+				return cliReferenceMatch{}, false
+			}
+			return cliReferenceMatch{start: start, end: end, block: block}, true
+		}
+
+		naturalPrefix := "@" + kind
+		afterPrefix := start + len(naturalPrefix)
+		if !strings.HasPrefix(text[start:], naturalPrefix) || afterPrefix >= len(text) {
+			continue
+		}
+		r, _ := utf8.DecodeRuneInString(text[afterPrefix:])
+		if !unicode.IsSpace(r) {
+			continue
+		}
+		valueStart := skipCLIReferenceWhitespace(text, afterPrefix)
+		if valueStart >= len(text) {
+			return cliReferenceMatch{}, false
+		}
+		block, end, ok := parseCLIReferenceValue(kind, text, valueStart)
+		if !ok {
+			return cliReferenceMatch{}, false
+		}
+		return cliReferenceMatch{start: start, end: end, block: block}, true
+	}
+
+	if !isCLIAutoImageReferenceStart(text[start:]) {
+		return cliReferenceMatch{}, false
+	}
+	block, end, ok := parseCLIReferenceValue("auto_image", text, start+1)
+	if !ok {
+		return cliReferenceMatch{}, false
+	}
+	return cliReferenceMatch{start: start, end: end, block: block}, true
+}
+
+func parseCLIReferenceValue(kind, text string, valueStart int) (gateway.InputBlock, int, bool) {
+	raw, valueEnd := scanCLIReferenceToken(text, valueStart)
+	if raw == "" {
+		return gateway.InputBlock{}, 0, false
+	}
+	var (
+		block gateway.InputBlock
+		ok    int
+	)
+	switch kind {
+	case "file":
+		block, ok = fileReferenceBlock(raw)
+	case "dir":
+		block, ok = dirReferenceBlock(raw)
+	case "url":
+		block, ok = urlReferenceBlock(raw)
+	case "image":
+		block, ok = pathReferenceBlock("image", raw)
+	case "pdf":
+		block, ok = pathReferenceBlock("pdf", raw)
+	case "auto_image":
+		block, ok = autoImageReferenceBlock(raw)
 	default:
-		return input.InputBlock{}, 0
+		ok = 0
 	}
+	if ok == 0 {
+		return gateway.InputBlock{}, 0, false
+	}
+	return block, valueEnd, true
 }
 
-func fileReferenceBlock(ref string) (input.InputBlock, int) {
-	ref = strings.TrimSpace(ref)
+func fileReferenceBlock(ref string) (gateway.InputBlock, int) {
+	return pathReferenceBlock("file", ref)
+}
+
+func pathReferenceBlock(blockType, ref string) (gateway.InputBlock, int) {
+	ref = trimCLIReferenceToken(ref)
 	if ref == "" {
-		return input.InputBlock{}, 0
+		return gateway.InputBlock{}, 0
 	}
-	absPath, _ := filepath.Abs(ref)
-	return input.InputBlock{
-		Type: "file",
-		Name: filepath.Base(ref),
+	absPath := runtimeinput.NormalizeLocalPath(trimCLIReferenceToken(ref))
+	return gateway.InputBlock{
+		Type: blockType,
+		Name: filepath.Base(absPath),
 		Path: absPath,
 	}, 1
 }
 
-func dirReferenceBlock(ref string) (input.InputBlock, int) {
-	ref = strings.TrimSpace(ref)
+func dirReferenceBlock(ref string) (gateway.InputBlock, int) {
+	ref = trimCLIReferenceToken(ref)
 	if ref == "" {
-		return input.InputBlock{}, 0
+		return gateway.InputBlock{}, 0
 	}
-	absPath, _ := filepath.Abs(ref)
-	return input.InputBlock{
+	absPath := runtimeinput.NormalizeLocalPath(trimCLIReferenceToken(ref))
+	return gateway.InputBlock{
 		Type: "dir",
-		Name: filepath.Base(ref),
+		Name: filepath.Base(absPath),
 		Path: absPath,
 	}, 1
 }
 
-func urlReferenceBlock(ref string) (input.InputBlock, int) {
-	ref = strings.TrimSpace(ref)
+func urlReferenceBlock(ref string) (gateway.InputBlock, int) {
+	ref = trimCLIReferenceToken(ref)
 	if ref == "" {
-		return input.InputBlock{}, 0
+		return gateway.InputBlock{}, 0
 	}
-	return input.InputBlock{
+	return gateway.InputBlock{
 		Type: "url",
 		URL:  ref,
 	}, 1
+}
+
+func autoImageReferenceBlock(ref string) (gateway.InputBlock, int) {
+	ref = trimCLIReferenceToken(ref)
+	if ref == "" || !runtimeinput.IsImagePath(ref) {
+		return gateway.InputBlock{}, 0
+	}
+	absPath := runtimeinput.NormalizeLocalPath(ref)
+	return gateway.InputBlock{
+		Type: "image",
+		Name: filepath.Base(absPath),
+		Path: absPath,
+	}, 1
+}
+
+func trimCLIReferenceToken(ref string) string {
+	ref = strings.TrimSpace(ref)
+	ref = strings.Trim(ref, "\"'`")
+	ref = strings.TrimRight(ref, ".,;:!?，。；：！？、)]}）】》")
+	return strings.TrimSpace(ref)
+}
+
+func isCLIAutoImageReferenceStart(text string) bool {
+	return strings.HasPrefix(text, "@~/") ||
+		strings.HasPrefix(text, "@/") ||
+		strings.HasPrefix(text, "@./") ||
+		strings.HasPrefix(text, "@../")
+}
+
+func skipCLIReferenceWhitespace(text string, start int) int {
+	for start < len(text) {
+		r, size := utf8.DecodeRuneInString(text[start:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		start += size
+	}
+	return start
+}
+
+func scanCLIReferenceToken(text string, start int) (string, int) {
+	if start < 0 || start >= len(text) {
+		return "", start
+	}
+	end := start
+	for end < len(text) {
+		r, size := utf8.DecodeRuneInString(text[end:])
+		if unicode.IsSpace(r) {
+			break
+		}
+		end += size
+	}
+	return text[start:end], end
+}
+
+func stripCLIReferenceMatches(text string, matches []cliReferenceMatch) string {
+	if len(matches) == 0 {
+		return text
+	}
+	var b strings.Builder
+	last := 0
+	for _, match := range matches {
+		if match.start < last || match.end <= match.start || match.end > len(text) {
+			continue
+		}
+		b.WriteString(text[last:match.start])
+		last = match.end
+	}
+	b.WriteString(text[last:])
+	return normalizeCLIInputText(b.String())
+}
+
+func normalizeCLIInputText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastHorizontalSpace := false
+	lastNewline := false
+	for _, r := range text {
+		switch {
+		case r == '\r':
+			continue
+		case r == '\n':
+			for b.Len() > 0 {
+				s := b.String()
+				if !strings.HasSuffix(s, " ") {
+					break
+				}
+				b.Reset()
+				b.WriteString(strings.TrimRight(s, " "))
+			}
+			if !lastNewline {
+				b.WriteRune('\n')
+			}
+			lastHorizontalSpace = false
+			lastNewline = true
+		case unicode.IsSpace(r):
+			if !lastHorizontalSpace && !lastNewline {
+				b.WriteRune(' ')
+			}
+			lastHorizontalSpace = true
+		default:
+			b.WriteRune(r)
+			lastHorizontalSpace = false
+			lastNewline = false
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func cliInputBlockKey(block gateway.InputBlock) string {
+	if value := strings.TrimSpace(block.Path); value != "" {
+		return strings.TrimSpace(block.Type) + "\x00path\x00" + value
+	}
+	if value := strings.TrimSpace(block.URL); value != "" {
+		return strings.TrimSpace(block.Type) + "\x00url\x00" + value
+	}
+	if value := strings.TrimSpace(block.AttachmentID); value != "" {
+		return strings.TrimSpace(block.Type) + "\x00attachment\x00" + value
+	}
+	return strings.TrimSpace(block.Type) + "\x00name\x00" + strings.TrimSpace(block.Name)
+}
+
+func readCLIClipboardImageFromSystem() (gateway.InputBlock, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return readCLIClipboardImageWithCommand("osascript", "-e", `set outFile to POSIX path of ((path to temporary items as text) & "anyai-clipboard.png")
+try
+	set pngData to the clipboard as «class PNGf»
+	set outRef to open for access POSIX file outFile with write permission
+	set eof outRef to 0
+	write pngData to outRef
+	close access outRef
+	return outFile
+on error errMsg
+	try
+		close access POSIX file outFile
+	end try
+	error errMsg
+end try`)
+	case "linux":
+		if block, err := readCLIClipboardImageWithCommand("wl-paste", "--no-newline", "--type", "image/png"); err == nil {
+			return block, nil
+		}
+		if block, err := readCLIClipboardImageWithCommand("xclip", "-selection", "clipboard", "-t", "image/png", "-o"); err == nil {
+			return block, nil
+		}
+		return readCLIClipboardImageWithCommand("xsel", "--clipboard", "--output", "--mime-type", "image/png")
+	case "windows":
+		return readCLIClipboardImageWithCommand("powershell", "-NoProfile", "-Command", `$img = Get-Clipboard -Format Image; if ($null -eq $img) { exit 2 }; $path = Join-Path $env:TEMP ("anyai-clipboard-" + [Guid]::NewGuid().ToString() + ".png"); $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output $path`)
+	default:
+		return gateway.InputBlock{}, fmt.Errorf("unsupported clipboard image platform %s", runtime.GOOS)
+	}
+}
+
+func readCLIClipboardImageWithCommand(name string, args ...string) (gateway.InputBlock, error) {
+	if _, err := exec.LookPath(name); err != nil {
+		return gateway.InputBlock{}, err
+	}
+	cmd := exec.Command(name, args...)
+	data, err := cmd.Output()
+	if err != nil {
+		return gateway.InputBlock{}, err
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed != "" {
+		if info, statErr := os.Stat(trimmed); statErr == nil && !info.IsDir() {
+			path := runtimeinput.NormalizeLocalPath(trimmed)
+			mimeType := runtimeinput.ResolveMIME(runtimeinput.InputBlock{Type: "image", Path: path})
+			return gateway.InputBlock{
+				Type:     "image",
+				Name:     filepath.Base(path),
+				Path:     path,
+				MimeType: mimeType,
+				Meta: map[string]any{
+					"source": "clipboard",
+				},
+			}, nil
+		}
+	}
+	if len(data) == 0 {
+		return gateway.InputBlock{}, fmt.Errorf("clipboard image is empty")
+	}
+	mimeType := http.DetectContentType(data)
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return gateway.InputBlock{}, fmt.Errorf("clipboard content is not an image")
+	}
+	exts, _ := mime.ExtensionsByType(mimeType)
+	ext := ".png"
+	if len(exts) > 0 {
+		ext = exts[0]
+	}
+	return gateway.InputBlock{
+		Type:     "image",
+		Name:     "clipboard" + ext,
+		MimeType: mimeType,
+		Data:     append([]byte(nil), data...),
+		Meta: map[string]any{
+			"source": "clipboard",
+		},
+	}, nil
 }

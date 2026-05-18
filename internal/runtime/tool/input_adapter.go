@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,29 +24,36 @@ func NewRunInputAdapter(env input.InputEnvelope) *RunInputAdapter {
 
 	for _, block := range env.Blocks {
 		info := InputBlockInfo{
-			ID:       strings.TrimSpace(block.ID),
-			Type:     block.Type,
-			Name:     block.Name,
-			Text:     block.Text,
-			Path:     block.Path,
-			URL:      block.URL,
-			MimeType: block.MimeType,
-			Meta:     block.Meta,
+			ID:           strings.TrimSpace(block.ID),
+			Type:         block.Type,
+			Name:         block.Name,
+			Text:         block.Text,
+			Path:         block.Path,
+			AttachmentID: strings.TrimSpace(block.AttachmentID),
+			URL:          block.URL,
+			MimeType:     block.MimeType,
+			Meta:         block.Meta,
 		}
 
 		if info.Name == "" {
 			info.Name = defaultInputName(block)
 		}
 		if isAttachmentBlock(block.Type) {
-			if info.ID == "" {
-				info.ID = NewOpaqueID("att")
+			attachmentID := strings.TrimSpace(firstNonEmpty(info.AttachmentID, info.ID))
+			if attachmentID == "" {
+				attachmentID = NewOpaqueID("att")
 			}
-			adapter.attachments[info.ID] = AttachmentInfo{
-				ID:       info.ID,
+			info.AttachmentID = attachmentID
+			if info.ID == "" {
+				info.ID = attachmentID
+			}
+			adapter.attachments[attachmentID] = AttachmentInfo{
+				ID:       attachmentID,
 				Name:     info.Name,
 				MimeType: resolveBlockMIME(block),
 				Size:     blockSize(block),
 				Path:     block.Path,
+				Source:   stringMeta(block.Meta, "source_path"),
 			}
 		}
 
@@ -108,7 +114,7 @@ func ResolveEnvelopeForRuntime(env input.InputEnvelope) (string, []llm.ImageCont
 
 func isAttachmentBlock(blockType string) bool {
 	switch blockType {
-	case "file", "image", "pdf":
+	case "file", "image", "pdf", "dir":
 		return true
 	default:
 		return false
@@ -131,26 +137,7 @@ func defaultInputName(block input.InputBlock) string {
 }
 
 func resolveBlockMIME(block input.InputBlock) string {
-	if strings.TrimSpace(block.MimeType) != "" {
-		return block.MimeType
-	}
-	if block.Path != "" {
-		if guess := mime.TypeByExtension(strings.ToLower(filepath.Ext(block.Path))); guess != "" {
-			return guess
-		}
-	}
-	if block.Name != "" {
-		if guess := mime.TypeByExtension(strings.ToLower(filepath.Ext(block.Name))); guess != "" {
-			return guess
-		}
-	}
-	if block.Type == "image" {
-		return "image/png"
-	}
-	if block.Type == "pdf" {
-		return "application/pdf"
-	}
-	return "application/octet-stream"
+	return input.ResolveMIME(block)
 }
 
 func blockSize(block input.InputBlock) int64 {
@@ -165,4 +152,14 @@ func blockSize(block input.InputBlock) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+func stringMeta(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	if value, ok := meta[key].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }

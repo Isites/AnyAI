@@ -1,32 +1,32 @@
 package gateway
 
-import (
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	"github.com/Isites/anyai/internal/runtime/task"
-)
-
-func (s *Service) ListTasks() []task.Info {
+func (s *Service) ListTasks() []Task {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	return rt.ListTasks()
+	return gatewayTasks(rt.ListTasks())
 }
 
-func (s *Service) GetTask(taskID string) (task.Info, bool) {
+func (s *Service) GetTask(taskID string) (Task, bool) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
-		return task.Info{}, false
+		return Task{}, false
 	}
-	return rt.GetTask(taskID)
+	tk, ok := rt.GetTask(taskID)
+	if !ok {
+		return Task{}, false
+	}
+	return gatewayTask(tk), true
 }
 
-func (s *Service) SubscribeTask(taskID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *Service) SubscribeTask(taskID string) (<-chan Event, func(), error) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil, nil, err
 	}
-	return rt.SubscribeTask(taskID)
+	ch, cancel, err := rt.SubscribeTask(taskID)
+	return gatewayEventChannel(ch), cancel, err
 }
 
 func (s *Service) CancelTask(taskID string) error {

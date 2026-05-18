@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/Isites/anyai/internal/runtime/llm"
 )
@@ -20,7 +21,7 @@ type Policy struct {
 func (p Policy) IsAllowed(toolName string) bool {
 	// Check deny list first
 	for _, d := range p.Deny {
-		if d == toolName || d == "*" {
+		if matchesToolPolicyPattern(d, toolName) {
 			return false
 		}
 	}
@@ -28,7 +29,7 @@ func (p Policy) IsAllowed(toolName string) bool {
 	// If allow list is non-empty, tool must be in it
 	if len(p.Allow) > 0 {
 		for _, a := range p.Allow {
-			if a == toolName || a == "*" {
+			if matchesToolPolicyPattern(a, toolName) {
 				return true
 			}
 		}
@@ -36,6 +37,21 @@ func (p Policy) IsAllowed(toolName string) bool {
 	}
 
 	return true
+}
+
+func matchesToolPolicyPattern(pattern, toolName string) bool {
+	pattern = strings.TrimSpace(pattern)
+	toolName = strings.TrimSpace(toolName)
+	if pattern == "" {
+		return false
+	}
+	if pattern == "*" || pattern == toolName {
+		return true
+	}
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(toolName, strings.TrimSuffix(pattern, "*"))
+	}
+	return false
 }
 
 // FilteredRegistry wraps a Registry and enforces a tool policy.

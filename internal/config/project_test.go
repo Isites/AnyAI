@@ -113,7 +113,7 @@ func TestProjectDefaults(t *testing.T) {
 	assert.Equal(t, 300000, cfg.Runtime.IdleTimeoutMS)
 	assert.Equal(t, 4, cfg.Runtime.AgentCall.DepthLimit)
 	assert.Equal(t, 4, cfg.Runtime.AgentCall.MaxParallel)
-	assert.Equal(t, 1, cfg.Runtime.Tools.MaxAttempts)
+	assert.Equal(t, 2, cfg.Runtime.Tools.MaxAttempts)
 	require.NotNil(t, cfg.Runtime.Tools.LoopDetection.Enabled)
 	assert.True(t, cfg.Runtime.Tools.LoopDetection.EnabledValue())
 	assert.Equal(t, 750, cfg.Runtime.Tools.RetryBackoffMS)

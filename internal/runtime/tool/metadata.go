@@ -44,7 +44,7 @@ const (
 	longProcessTimeoutMS        = int64((120 * time.Second) / time.Millisecond)
 	callAgentToolTimeoutMS      = int64((90 * time.Second) / time.Millisecond)
 	browserToolTimeoutMS        = int64((60 * time.Second) / time.Millisecond)
-	searchToolTimeoutMS         = int64((15 * time.Second) / time.Millisecond)
+	WebSearchTimeout            = 30 * time.Second
 )
 
 // DefaultToolMetadata returns the generic runtime contract fallback for a

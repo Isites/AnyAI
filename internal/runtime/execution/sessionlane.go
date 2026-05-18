@@ -290,6 +290,7 @@ func startManaged(req runtimeport.IngressRequest, ctx context.Context, deps runt
 		AgentID:       strings.TrimSpace(agentID),
 		Envelope:      req.Envelope,
 		SessionID:     strings.TrimSpace(req.SessionID),
+		MessageID:     strings.TrimSpace(req.MessageID),
 		ParentAgentID: strings.TrimSpace(req.ParentAgentID),
 		Channel:       strings.TrimSpace(req.Channel),
 	})

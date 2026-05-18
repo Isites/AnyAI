@@ -1,32 +1,35 @@
 package gateway
 
-import (
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	"github.com/Isites/anyai/internal/runtime/session"
-)
-
-func (s *Service) ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord {
+func (s *Service) ListSessionEvents(agentID, sessionID string) []Event {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil
 	}
-	return rt.ListSessionEvents(agentID, sessionID)
+	return gatewayEvents(rt.ListSessionEvents(agentID, sessionID))
 }
 
-func (s *Service) ListSessions(agentID string) ([]session.SessionInfo, error) {
+func (s *Service) ListSessions(agentID string) ([]SessionInfo, error) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil, err
 	}
-	return rt.ListSessions(agentID)
-}
-
-func (s *Service) LoadSession(agentID, sessionID string) (*session.Session, error) {
-	rt, err := s.runtimeOrErr()
+	infos, err := rt.ListSessions(agentID)
 	if err != nil {
 		return nil, err
 	}
-	return rt.LoadSession(agentID, sessionID)
+	return gatewaySessionInfos(infos), nil
+}
+
+func (s *Service) LoadSession(agentID, sessionID string) (SessionView, error) {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return SessionView{}, err
+	}
+	snapshot, err := rt.LoadSessionSnapshot(agentID, sessionID)
+	if err != nil {
+		return SessionView{}, err
+	}
+	return gatewaySessionSnapshot(snapshot), nil
 }
 
 func (s *Service) CreateSession(agentID, requestedKey, prefix string) (string, error) {
@@ -45,10 +48,11 @@ func (s *Service) DeleteSession(agentID, sessionID string) error {
 	return rt.DeleteSession(agentID, sessionID)
 }
 
-func (s *Service) SubscribeSession(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *Service) SubscribeSession(agentID, sessionID string) (<-chan Event, func(), error) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {
 		return nil, nil, err
 	}
-	return rt.SubscribeSession(agentID, sessionID)
+	ch, cancel, err := rt.SubscribeSession(agentID, sessionID)
+	return gatewayEventChannel(ch), cancel, err
 }

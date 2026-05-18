@@ -29,7 +29,7 @@ func TestDefaultConfig(t *testing.T) {
 	require.NotNil(t, cfg.Runtime.Tools.LoopDetection.Enabled)
 	assert.True(t, cfg.Runtime.Tools.LoopDetection.EnabledValue())
 	assert.Equal(t, 300000, cfg.Runtime.IdleTimeoutMS)
-	assert.Equal(t, 1, cfg.Runtime.Tools.MaxAttempts)
+	assert.Equal(t, 2, cfg.Runtime.Tools.MaxAttempts)
 	assert.Equal(t, 750, cfg.Runtime.Tools.RetryBackoffMS)
 	assert.Equal(t, 24, cfg.Runtime.Tools.LoopDetection.HistorySize)
 	assert.Equal(t, 4, cfg.Runtime.Tools.LoopDetection.WarningThreshold)

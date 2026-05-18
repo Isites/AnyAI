@@ -99,6 +99,70 @@ func TestServiceRecordsAssistantSessionOutputFromSessionAppend(t *testing.T) {
 	assert.Equal(t, "answer", events[0].Payload["text"])
 }
 
+func TestServiceRecordsRuntimeControlFromSessionAppend(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+
+	store := session.NewStore(t.TempDir())
+	recorder := runtimeevents.NewRecorder()
+	service := NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return recorder },
+	)
+
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_1",
+		AgentID:   "assistant",
+		SessionID: "sess_1",
+		Model:     "test/model",
+		Status:    runtimeevents.RunStatusRunning,
+	})
+	sess, err := service.Load("assistant", "sess_1")
+	require.NoError(t, err)
+	sess.SetActiveRefs(session.EntryRefs{RunID: "run_1"})
+
+	sess.Append(session.RuntimeControlEntry("goal_completion", "[Runtime goal continuation]\nCall `goal_complete` now instead of ending silently."))
+
+	events := recorder.ListRunEvents("run_1")
+	require.Len(t, events, 1)
+	assert.Equal(t, runtimeevents.EventSessionRuntimeControlStored, events[0].Name)
+	assert.Equal(t, "goal_completion", events[0].Payload["kind"])
+	assert.Contains(t, events[0].Payload["text"], "goal_complete")
+}
+
+func TestServiceRecordsSessionMetaFromSessionAppend(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+
+	store := session.NewStore(t.TempDir())
+	recorder := runtimeevents.NewRecorder()
+	service := NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return recorder },
+	)
+
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_1",
+		AgentID:   "assistant",
+		SessionID: "sess_1",
+		Model:     "test/model",
+		Status:    runtimeevents.RunStatusRunning,
+	})
+	sess, err := service.Load("assistant", "sess_1")
+	require.NoError(t, err)
+	sess.SetActiveRefs(session.EntryRefs{RunID: "run_1"})
+
+	sess.Append(session.MetaEntry("Run failed: browser click timed out"))
+
+	events := recorder.ListRunEvents("run_1")
+	require.Len(t, events, 1)
+	assert.Equal(t, runtimeevents.EventSessionMetaStored, events[0].Name)
+	assert.Equal(t, "system", events[0].Payload["role"])
+	assert.Equal(t, "Run failed: browser click timed out", events[0].Payload["text"])
+}
+
 func TestServiceRebuildFromEventsRestoresPlanTodoAndDeletion(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
@@ -126,7 +190,8 @@ func TestServiceRebuildFromEventsRestoresPlanTodoAndDeletion(t *testing.T) {
 		SessionID: "sess_1",
 		Name:      runtimeevents.EventSessionInputStored,
 		Payload: map[string]any{
-			"text": "Need a rollout plan",
+			"entry_id": "e_replayed_user",
+			"text":     "Need a rollout plan",
 			"images": []map[string]any{
 				{
 					"mime_type": "image/png",
@@ -158,6 +223,16 @@ func TestServiceRebuildFromEventsRestoresPlanTodoAndDeletion(t *testing.T) {
 		RunID:     "run_1",
 		AgentID:   "assistant",
 		SessionID: "sess_1",
+		Name:      runtimeevents.EventSessionRuntimeControlStored,
+		Payload: map[string]any{
+			"kind": "goal_completion",
+			"text": "[Runtime goal continuation]\nCall `goal_complete` now instead of ending silently.",
+		},
+	})
+	recorder.AppendEvent(runtimeevents.EventRecord{
+		RunID:     "run_1",
+		AgentID:   "assistant",
+		SessionID: "sess_1",
 		Name:      "text.delta",
 		Payload:   map[string]any{"text": "done"},
 	})
@@ -171,11 +246,13 @@ func TestServiceRebuildFromEventsRestoresPlanTodoAndDeletion(t *testing.T) {
 	rebuilt, err := service.Load("assistant", "sess_1")
 	require.NoError(t, err)
 	entries := rebuilt.History()
-	require.Len(t, entries, 4)
+	require.Len(t, entries, 5)
+	assert.Equal(t, "e_replayed_user", entries[0].ID)
 	assert.Equal(t, session.EntryTypeMessage, entries[0].Type)
 	assert.Equal(t, session.EntryTypePlan, entries[1].Type)
 	assert.Equal(t, session.EntryTypeTodo, entries[2].Type)
-	assert.Equal(t, session.EntryTypeMessage, entries[3].Type)
+	assert.Equal(t, session.EntryTypeRuntimeControl, entries[3].Type)
+	assert.Equal(t, session.EntryTypeMessage, entries[4].Type)
 
 	var userMsg session.MessageData
 	require.NoError(t, json.Unmarshal(entries[0].Data, &userMsg))
@@ -192,10 +269,58 @@ func TestServiceRebuildFromEventsRestoresPlanTodoAndDeletion(t *testing.T) {
 	assert.Equal(t, "todo_1", todo.ID)
 	assert.Equal(t, "completed", todo.Status)
 
+	var control session.RuntimeControlData
+	require.NoError(t, json.Unmarshal(entries[3].Data, &control))
+	assert.Equal(t, "goal_completion", control.Kind)
+	assert.Contains(t, control.Text, "goal_complete")
+
 	items, err := service.List("assistant")
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 	assert.Equal(t, "sess_1", items[0].ID)
+}
+
+func TestServiceRebuildFromEventsAddsRunFailureMeta(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+
+	store := session.NewStore(t.TempDir())
+	recorder := runtimeevents.NewRecorder()
+	service := NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return recorder },
+	)
+
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_failed",
+		AgentID:   "assistant",
+		SessionID: "sess_failed",
+		Model:     "test/model",
+		Input:     "try the browser",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: time.Now().UTC(),
+	})
+	recorder.AppendEvent(runtimeevents.EventRecord{
+		RunID:     "run_failed",
+		AgentID:   "assistant",
+		SessionID: "sess_failed",
+		Name:      runtimeevents.EventRunFailed,
+		Payload:   map[string]any{"message": "browser click timed out"},
+	})
+
+	require.NoError(t, service.RebuildFromEvents())
+
+	rebuilt, err := service.Load("assistant", "sess_failed")
+	require.NoError(t, err)
+	history := rebuilt.History()
+	require.Len(t, history, 2)
+	assert.Equal(t, session.EntryTypeMessage, history[0].Type)
+	assert.Equal(t, session.EntryTypeMeta, history[1].Type)
+
+	var meta session.MessageData
+	require.NoError(t, json.Unmarshal(history[1].Data, &meta))
+	assert.Equal(t, "Run failed: browser click timed out", meta.Text)
 }
 
 func TestServiceRebuildFromEventsReplaysCompactionAsHistoryRewrite(t *testing.T) {

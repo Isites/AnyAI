@@ -21,6 +21,7 @@ type Document struct {
 	MaxTurns    int      `yaml:"max_turns"`
 	Tools       Tools    `yaml:"tools"`
 	Skills      Skills   `yaml:"skills"`
+	MCPs        MCPs     `yaml:"mcps"`
 	Tags        []string `yaml:"tags"`
 
 	Body     string
@@ -40,6 +41,7 @@ type documentAlias struct {
 	MaxTurnsOld int      `yaml:"maxTurns"`
 	Tools       Tools    `yaml:"tools"`
 	Skills      Skills   `yaml:"skills"`
+	MCPs        MCPs     `yaml:"mcps"`
 	Tags        []string `yaml:"tags"`
 }
 
@@ -49,6 +51,10 @@ type Tools struct {
 }
 
 type Skills struct {
+	InheritShared *bool `yaml:"inherit_shared"`
+}
+
+type MCPs struct {
 	InheritShared *bool `yaml:"inherit_shared"`
 }
 
@@ -96,6 +102,7 @@ func (d *Document) UnmarshalYAML(value *yaml.Node) error {
 	}
 	d.Tools = aux.Tools
 	d.Skills = aux.Skills
+	d.MCPs = aux.MCPs
 	d.Tags = aux.Tags
 
 	return nil

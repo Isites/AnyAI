@@ -77,11 +77,19 @@ func (p *AnthropicProvider) Compact(ctx context.Context, req CompactRequest) (Co
 }
 
 func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
+	systemParts := []anthropic.TextBlockParam(nil)
+	if req.SystemPrompt != "" {
+		systemParts = append(systemParts, anthropic.TextBlockParam{Text: req.SystemPrompt})
+	}
 	// Build messages
 	msgs := make([]anthropic.MessageParam, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		switch m.Role {
-		case "user":
+		case MessageRoleRuntime, MessageRoleDeveloper, MessageRoleSystem:
+			if strings.TrimSpace(m.Content) != "" {
+				systemParts = append(systemParts, anthropic.TextBlockParam{Text: m.Content})
+			}
+		case MessageRoleUser:
 			if m.ToolCallID != "" {
 				// This is a tool result message
 				if len(m.Images) > 0 {
@@ -131,7 +139,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 			} else {
 				msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(m.Content)))
 			}
-		case "assistant":
+		case MessageRoleAssistant:
 			var blocks []anthropic.ContentBlockParamUnion
 			if m.Content != "" {
 				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
@@ -197,10 +205,8 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 		params.Tools = tools
 	}
 
-	if req.SystemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{
-			{Text: req.SystemPrompt},
-		}
+	if len(systemParts) > 0 {
+		params.System = systemParts
 	}
 
 	if req.Temperature > 0 {
@@ -308,7 +314,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 }
 
 func (p *AnthropicProvider) compactNative(ctx context.Context, req CompactRequest) (CompactResponse, error) {
-	msgs := buildAnthropicBetaMessages(req.Messages)
+	msgs, systemParts := buildAnthropicBetaMessages(req.Messages)
 	if len(msgs) == 0 {
 		return CompactResponse{}, fmt.Errorf("anthropic native compaction requires non-empty history")
 	}
@@ -340,9 +346,10 @@ func (p *AnthropicProvider) compactNative(ctx context.Context, req CompactReques
 	}
 
 	if req.SystemPrompt != "" {
-		params.System = []anthropic.BetaTextBlockParam{
-			{Text: req.SystemPrompt},
-		}
+		systemParts = append([]anthropic.BetaTextBlockParam{{Text: req.SystemPrompt}}, systemParts...)
+	}
+	if len(systemParts) > 0 {
+		params.System = systemParts
 	}
 	if req.Temperature > 0 {
 		params.Temperature = anthropic.Float(req.Temperature)
@@ -396,11 +403,16 @@ func extractAnthropicCompactionSummary(message *anthropic.BetaMessage) string {
 	return ""
 }
 
-func buildAnthropicBetaMessages(messages []Message) []anthropic.BetaMessageParam {
+func buildAnthropicBetaMessages(messages []Message) ([]anthropic.BetaMessageParam, []anthropic.BetaTextBlockParam) {
 	msgs := make([]anthropic.BetaMessageParam, 0, len(messages))
+	systemParts := []anthropic.BetaTextBlockParam(nil)
 	for _, m := range messages {
 		switch m.Role {
-		case "user":
+		case MessageRoleRuntime, MessageRoleDeveloper, MessageRoleSystem:
+			if strings.TrimSpace(m.Content) != "" {
+				systemParts = append(systemParts, anthropic.BetaTextBlockParam{Text: m.Content})
+			}
+		case MessageRoleUser:
 			if m.ToolCallID != "" {
 				if len(m.Images) > 0 {
 					var content []anthropic.BetaToolResultBlockParamContentUnion
@@ -454,7 +466,7 @@ func buildAnthropicBetaMessages(messages []Message) []anthropic.BetaMessageParam
 
 			msgs = append(msgs, anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(m.Content)))
 
-		case "assistant":
+		case MessageRoleAssistant:
 			var blocks []anthropic.BetaContentBlockParamUnion
 			if m.Content != "" {
 				blocks = append(blocks, anthropic.NewBetaTextBlock(m.Content))
@@ -474,5 +486,5 @@ func buildAnthropicBetaMessages(messages []Message) []anthropic.BetaMessageParam
 			}
 		}
 	}
-	return msgs
+	return msgs, systemParts
 }

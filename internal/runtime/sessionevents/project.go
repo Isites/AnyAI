@@ -37,6 +37,9 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 		AgentID:   strings.TrimSpace(agentID),
 		SessionID: strings.TrimSpace(sessionID),
 		Timestamp: time.Unix(entry.Timestamp, 0).UTC(),
+		Payload: map[string]any{
+			"entry_id": strings.TrimSpace(entry.ID),
+		},
 	}
 
 	switch entry.Type {
@@ -49,7 +52,8 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 		if text == "" && len(msg.Images) == 0 {
 			return nil
 		}
-		payload := map[string]any{"text": text}
+		payload := clonePayload(record.Payload)
+		payload["text"] = text
 		if len(msg.Images) > 0 {
 			payload["images"] = msg.Images
 		}
@@ -76,11 +80,11 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 		}
 		toolCalls[callID] = ToolCallState{name: toolName, input: call.Input}
 		record.Name = runtimeevents.EventToolCallStarted
-		record.Payload = map[string]any{
+		record.Payload = mergePayload(record.Payload, map[string]any{
 			"id":    callID,
 			"tool":  toolName,
 			"input": rawJSONValue(call.Input),
-		}
+		})
 		events := []runtimeevents.EventRecord{record}
 		if strings.EqualFold(toolName, "callagent") {
 			events = append(events, agentCallStartedEvents(record, callID, call.Input)...)
@@ -96,12 +100,12 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 			return nil
 		}
 		call := toolCalls[callID]
-		payload := map[string]any{
+		payload := mergePayload(record.Payload, map[string]any{
 			"id":     callID,
 			"tool":   strings.TrimSpace(call.name),
 			"output": strings.TrimSpace(result.Output),
 			"error":  strings.TrimSpace(result.Error),
-		}
+		})
 		if len(result.Images) > 0 {
 			payload["images"] = result.Images
 		}
@@ -123,9 +127,9 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 		if err := json.Unmarshal(entry.Data, &plan); err != nil {
 			return nil
 		}
-		payload := map[string]any{
+		payload := mergePayload(record.Payload, map[string]any{
 			"plan": renderPlanData(plan),
-		}
+		})
 		if plan.ID != "" {
 			payload["plan_id"] = plan.ID
 		}
@@ -141,14 +145,14 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 			return nil
 		}
 		record.Name = "session.todo.updated"
-		record.Payload = map[string]any{
+		record.Payload = mergePayload(record.Payload, map[string]any{
 			"id":           todo.ID,
 			"content":      todo.Content,
 			"status":       todo.Status,
 			"created_at":   todo.CreatedAt,
 			"completed_at": todo.CompletedAt,
 			"run_id":       strings.TrimSpace(todo.RunID),
-		}
+		})
 		return []runtimeevents.EventRecord{record}
 	case session.EntryTypeCompaction:
 		var compact session.CompactionData
@@ -156,22 +160,37 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 			return nil
 		}
 		record.Name = runtimeevents.EventSessionCompactCompleted
-		record.Payload = map[string]any{
+		record.Payload = mergePayload(record.Payload, map[string]any{
 			"summary":          compact.Text,
 			"trigger":          compact.Trigger,
 			"legacy_heuristic": compact.LegacyHeuristic,
+		})
+		return []runtimeevents.EventRecord{record}
+	case session.EntryTypeRuntimeControl:
+		var control session.RuntimeControlData
+		if err := json.Unmarshal(entry.Data, &control); err != nil {
+			return nil
 		}
+		text := strings.TrimSpace(control.Text)
+		if text == "" {
+			return nil
+		}
+		record.Name = runtimeevents.EventSessionRuntimeControlStored
+		record.Payload = mergePayload(record.Payload, map[string]any{
+			"kind": strings.TrimSpace(control.Kind),
+			"text": text,
+		})
 		return []runtimeevents.EventRecord{record}
 	case session.EntryTypeMeta:
 		var msg session.MessageData
 		if err := json.Unmarshal(entry.Data, &msg); err != nil {
 			return nil
 		}
-		record.Name = "session.meta.stored"
-		record.Payload = map[string]any{
+		record.Name = runtimeevents.EventSessionMetaStored
+		record.Payload = mergePayload(record.Payload, map[string]any{
 			"role": entry.Role,
 			"text": strings.TrimSpace(msg.Text),
-		}
+		})
 		return []runtimeevents.EventRecord{record}
 	default:
 		return nil
@@ -195,6 +214,14 @@ func agentCallStartedEvents(base runtimeevents.EventRecord, callID string, rawIn
 	payload = clonePayload(payload)
 	payload["id"] = callID
 	return []runtimeevents.EventRecord{withEvent(base, runtimeevents.EventAgentCallStarted, payload)}
+}
+
+func mergePayload(base map[string]any, extra map[string]any) map[string]any {
+	out := clonePayload(base)
+	for key, value := range extra {
+		out[key] = value
+	}
+	return out
 }
 
 func agentCallFinishedEvents(base runtimeevents.EventRecord, callID string, rawInput json.RawMessage, result session.ToolResultData) []runtimeevents.EventRecord {
@@ -274,7 +301,7 @@ func withEvent(base runtimeevents.EventRecord, name string, payload map[string]a
 		SessionID:     base.SessionID,
 		Name:          name,
 		Timestamp:     base.Timestamp,
-		Payload:       payload,
+		Payload:       mergePayload(base.Payload, payload),
 		SchemaVersion: base.SchemaVersion,
 		Sequence:      base.Sequence,
 	}

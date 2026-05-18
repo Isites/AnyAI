@@ -8,46 +8,42 @@ import (
 
 	"github.com/Isites/anyai/internal/config"
 	"github.com/Isites/anyai/internal/gateway"
-	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	"github.com/Isites/anyai/internal/runtime/input"
-	"github.com/Isites/anyai/internal/runtime/logging"
-	"github.com/Isites/anyai/internal/runtime/memory"
-	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
-	"github.com/Isites/anyai/internal/runtime/session"
-	"github.com/Isites/anyai/internal/runtime/task"
-	"github.com/Isites/anyai/internal/runtime/tool"
+	runtimeinput "github.com/Isites/anyai/internal/runtime/input"
 	httpapi "github.com/Isites/anyai/internal/startup/http/api"
 	httpui "github.com/Isites/anyai/internal/startup/http/ui"
 )
 
-func (p *ControlPlane) AgentInventoryPayload() any         { return p.agentInventory() }
-func (p *ControlPlane) ChannelViewsPayload() any           { return p.channels() }
-func (p *ControlPlane) CatalogPayload() any                { return p.catalog() }
-func (p *ControlPlane) CatalogEndpointsPayload() any       { return p.catalog().Endpoints }
-func (p *ControlPlane) OverviewPayload() any               { return p.overview() }
-func (p *ControlPlane) RebuildProjections() error          { return p.rebuildProjections() }
-func (p *ControlPlane) RunList() []runtimeevents.RunRecord { return p.listRuns() }
-func (p *ControlPlane) EventStorageDir() string            { return p.eventStorageDir() }
+func (p *ControlPlane) AgentInventoryPayload() any   { return p.agentInventory() }
+func (p *ControlPlane) ChannelViewsPayload() any     { return p.channels() }
+func (p *ControlPlane) CatalogPayload() any          { return p.catalog() }
+func (p *ControlPlane) CatalogEndpointsPayload() any { return p.catalog().Endpoints }
+func (p *ControlPlane) OverviewPayload() any         { return p.overview() }
+func (p *ControlPlane) RebuildProjections() error    { return p.rebuildProjections() }
+func (p *ControlPlane) RunList() []gateway.Run       { return p.listRuns() }
+func (p *ControlPlane) EventStorageDir() string      { return p.eventStorageDir() }
+func (p *ControlPlane) AttachmentBaseDir() string {
+	return runtimeinput.ProjectAssetsDir(p.config())
+}
 
-func (p *ControlPlane) MemoryStats() memory.Stats {
+func (p *ControlPlane) MemoryStats() gateway.MemoryStats {
 	if p != nil && p.memory != nil {
 		return p.memory.MemoryStats()
 	}
-	return memory.Stats{}
+	return gateway.MemoryStats{}
 }
 
-func (p *ControlPlane) MemorySearch(query string, maxItems int, scope memory.SearchScope, layers ...memory.Layer) []memory.SearchMatch {
+func (p *ControlPlane) MemorySearch(query string, maxItems int, scope gateway.MemoryScope, layers ...gateway.MemoryLayer) []gateway.MemorySearchMatch {
 	if p != nil && p.memory != nil {
 		return p.memory.MemorySearch(query, maxItems, scope, layers...)
 	}
 	return nil
 }
 
-func (p *ControlPlane) MemoryGet(id string, scope memory.SearchScope) (memory.Entry, bool) {
+func (p *ControlPlane) MemoryGet(id string, scope gateway.MemoryScope) (gateway.MemoryEntry, bool) {
 	if p != nil && p.memory != nil {
 		return p.memory.MemoryGet(id, scope)
 	}
-	return memory.Entry{}, false
+	return gateway.MemoryEntry{}, false
 }
 
 func (p *ControlPlane) MemoryStaleCleanup(now time.Time) (int, error) {
@@ -74,16 +70,17 @@ func (p *ControlPlane) MemoryPromoteEligible(now time.Time) (int, error) {
 func (p *ControlPlane) StartAcceptedRun(
 	ctx context.Context,
 	agentID, text string,
-	inputs []input.InputBlock,
-	sessionID, channel, senderID, accountID string,
+	inputs []gateway.InputBlock,
+	sessionID, messageID, channel, senderID, accountID string,
 	chatType gateway.ChatType,
 	sessionPrefix string,
-) (*runtimeport.ManagedRun, runtimeevents.RunRecord, error) {
+) (*gateway.ManagedRun, gateway.Run, error) {
 	accepted, err := p.startRun(ctx, runStartRequest{
 		AgentID:       agentID,
 		Text:          text,
 		Inputs:        inputs,
 		SessionID:     sessionID,
+		MessageID:     messageID,
 		Channel:       channel,
 		SenderID:      senderID,
 		AccountID:     accountID,
@@ -91,7 +88,7 @@ func (p *ControlPlane) StartAcceptedRun(
 		SessionPrefix: sessionPrefix,
 	})
 	if err != nil {
-		return nil, runtimeevents.RunRecord{}, err
+		return nil, gateway.Run{}, err
 	}
 	return accepted.Run, accepted.Record, nil
 }
@@ -99,22 +96,22 @@ func (p *ControlPlane) StartAcceptedRun(
 func (p *ControlPlane) StartManagedRun(
 	ctx context.Context,
 	agentID, text string,
-	inputs []input.InputBlock,
-	sessionID, channel, senderID, accountID string,
+	inputs []gateway.InputBlock,
+	sessionID, messageID, channel, senderID, accountID string,
 	chatType gateway.ChatType,
 	sessionPrefix string,
-) (*runtimeport.ManagedRun, error) {
-	run, _, err := p.StartAcceptedRun(ctx, agentID, text, inputs, sessionID, channel, senderID, accountID, chatType, sessionPrefix)
+) (*gateway.ManagedRun, error) {
+	run, _, err := p.StartAcceptedRun(ctx, agentID, text, inputs, sessionID, messageID, channel, senderID, accountID, chatType, sessionPrefix)
 	return run, err
 }
 
-func (p *ControlPlane) RunRecord(runID string) (runtimeevents.RunRecord, bool) {
+func (p *ControlPlane) RunRecord(runID string) (gateway.Run, bool) {
 	return p.getRun(runID)
 }
-func (p *ControlPlane) RunEvents(runID string) []runtimeevents.EventRecord {
+func (p *ControlPlane) RunEvents(runID string) []gateway.Event {
 	return p.listRunEvents(runID)
 }
-func (p *ControlPlane) SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+func (p *ControlPlane) SubscribeRunReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error) {
 	if p == nil || p.run == nil {
 		return nil, nil, nil, fmt.Errorf("runtime not available")
 	}
@@ -127,7 +124,7 @@ func (p *ControlPlane) CancelRun(runID string) error {
 	return p.run.CancelRun(runID)
 }
 
-func (p *ControlPlane) SessionList(agentID string) ([]session.SessionInfo, error) {
+func (p *ControlPlane) SessionList(agentID string) ([]gateway.SessionInfo, error) {
 	return p.listSessions(agentID)
 }
 func (p *ControlPlane) CreateSession(agentID, requestedKey, prefix string) (string, error) {
@@ -136,16 +133,16 @@ func (p *ControlPlane) CreateSession(agentID, requestedKey, prefix string) (stri
 func (p *ControlPlane) SessionCreate(agentID, requestedKey, prefix string) (string, error) {
 	return p.createSession(agentID, requestedKey, prefix)
 }
-func (p *ControlPlane) LoadSession(agentID, sessionID string) (*session.Session, error) {
+func (p *ControlPlane) LoadSession(agentID, sessionID string) (gateway.SessionView, error) {
 	return p.loadSession(agentID, sessionID)
 }
-func (p *ControlPlane) SessionLoad(agentID, sessionID string) (*session.Session, error) {
+func (p *ControlPlane) SessionLoad(agentID, sessionID string) (gateway.SessionView, error) {
 	return p.loadSession(agentID, sessionID)
 }
-func (p *ControlPlane) SessionEvents(agentID, sessionID string) []runtimeevents.EventRecord {
+func (p *ControlPlane) SessionEvents(agentID, sessionID string) []gateway.Event {
 	return p.listSessionEvents(agentID, sessionID)
 }
-func (p *ControlPlane) SubscribeSession(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (p *ControlPlane) SubscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error) {
 	return p.subscribeSession(agentID, sessionID)
 }
 func (p *ControlPlane) SessionDelete(agentID, sessionID string) error {
@@ -155,28 +152,53 @@ func (p *ControlPlane) DeleteSession(agentID, sessionID string) error {
 	return p.deleteSession(agentID, sessionID)
 }
 
-func (p *ControlPlane) RunTreeRecord(runID string) (runtimeevents.RunTreeRecord, bool) {
+func (p *ControlPlane) RunTreeRecord(runID string) (gateway.RunTree, bool) {
 	return p.getRunTree(runID)
 }
-func (p *ControlPlane) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
+func (p *ControlPlane) RunTree(runID string) ([]gateway.RunNode, bool) {
 	return p.runTree(runID)
 }
-func (p *ControlPlane) SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+func (p *ControlPlane) SubscribeRunTreeReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error) {
 	if p == nil || p.run == nil {
 		return nil, nil, nil, fmt.Errorf("runtime not available")
 	}
 	return p.run.SubscribeRunTreeReplay(runID)
 }
 
-func (p *ControlPlane) JobScheduler() tools.JobScheduler {
+func (p *ControlPlane) ListJobs() []gateway.Job {
 	if p == nil || p.inventory == nil {
 		return nil
 	}
-	return p.inventory.JobScheduler()
+	return p.inventory.ListJobs()
+}
+
+func (p *ControlPlane) PauseJob(name string) error {
+	if p == nil || p.inventory == nil {
+		return fmt.Errorf("runtime not available")
+	}
+	return p.inventory.PauseJob(name)
+}
+func (p *ControlPlane) ResumeJob(name string) error {
+	if p == nil || p.inventory == nil {
+		return fmt.Errorf("runtime not available")
+	}
+	return p.inventory.ResumeJob(name)
+}
+func (p *ControlPlane) RemoveJob(name string) error {
+	if p == nil || p.inventory == nil {
+		return fmt.Errorf("runtime not available")
+	}
+	return p.inventory.RemoveJob(name)
+}
+func (p *ControlPlane) UpdateJobSchedule(name, schedule string) error {
+	if p == nil || p.inventory == nil {
+		return fmt.Errorf("runtime not available")
+	}
+	return p.inventory.UpdateJobSchedule(name, schedule)
 }
 
 func (p *ControlPlane) LogEntriesPayload(limit int) []map[string]any { return p.logEntries(limit) }
-func (p *ControlPlane) SubscribeLogs() (<-chan logging.LogEntry, func()) {
+func (p *ControlPlane) SubscribeLogs() (<-chan gateway.LogEntry, func()) {
 	if p == nil || p.logs == nil {
 		return nil, nil
 	}
@@ -195,15 +217,15 @@ func (p *ControlPlane) ResolveIngressAgent(channelName, requestedAgentID, sender
 	return p.resolveIngressAgent(channelName, requestedAgentID, senderID, accountID, chatType)
 }
 
-func (p *ControlPlane) TaskList() []task.Info {
+func (p *ControlPlane) TaskList() []gateway.Task {
 	return p.listTasks()
 }
 
-func (p *ControlPlane) TaskRecord(taskID string) (task.Info, bool) {
+func (p *ControlPlane) TaskRecord(taskID string) (gateway.Task, bool) {
 	return p.getTask(taskID)
 }
 
-func (p *ControlPlane) TaskEvents(taskID string) []runtimeevents.EventRecord {
+func (p *ControlPlane) TaskEvents(taskID string) []gateway.Event {
 	if p == nil || p.task == nil || p.run == nil {
 		return nil
 	}
@@ -215,12 +237,12 @@ func (p *ControlPlane) TaskEvents(taskID string) []runtimeevents.EventRecord {
 	if len(runEvents) == 0 {
 		return synthesizeTaskEvents(tk)
 	}
-	filtered := make([]runtimeevents.EventRecord, 0, len(runEvents))
+	filtered := make([]gateway.Event, 0, len(runEvents))
 	for _, event := range runEvents {
 		if !strings.HasPrefix(event.Name, "task.") {
 			continue
 		}
-		if runtimeevents.StringPayload(event.Payload, "task_id") != taskID {
+		if payloadString(event.Payload, "task_id") != taskID {
 			continue
 		}
 		filtered = append(filtered, event)
@@ -231,7 +253,7 @@ func (p *ControlPlane) TaskEvents(taskID string) []runtimeevents.EventRecord {
 	return filtered
 }
 
-func (p *ControlPlane) SubscribeTask(taskID string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (p *ControlPlane) SubscribeTask(taskID string) (<-chan gateway.Event, func(), error) {
 	return p.subscribeTask(taskID)
 }
 
@@ -239,13 +261,13 @@ func (p *ControlPlane) CancelTask(taskID string) error {
 	return p.cancelTask(taskID)
 }
 
-func synthesizeTaskEvents(tk task.Info) []runtimeevents.EventRecord {
+func synthesizeTaskEvents(tk gateway.Task) []gateway.Event {
 	payload := taskEventPayload(tk)
 	queuedAt := firstTaskEventTime(tk.CreatedAt, tk.UpdatedAt, tk.StartedAt, tk.CompletedAt)
 	startedAt := firstTaskEventTime(tk.StartedAt, queuedAt)
 	completedAt := firstTaskEventTime(tk.CompletedAt, tk.UpdatedAt, startedAt)
 
-	events := []runtimeevents.EventRecord{
+	events := []gateway.Event{
 		{
 			RunID:     tk.RunID,
 			AgentID:   tk.AgentID,
@@ -265,8 +287,8 @@ func synthesizeTaskEvents(tk task.Info) []runtimeevents.EventRecord {
 	}
 
 	switch tk.Status {
-	case task.StatusCompleted:
-		events = append(events, runtimeevents.EventRecord{
+	case "completed":
+		events = append(events, gateway.Event{
 			RunID:     tk.RunID,
 			AgentID:   tk.AgentID,
 			SessionID: tk.SessionID,
@@ -274,8 +296,8 @@ func synthesizeTaskEvents(tk task.Info) []runtimeevents.EventRecord {
 			Timestamp: completedAt,
 			Payload:   payload,
 		})
-	case task.StatusFailed:
-		events = append(events, runtimeevents.EventRecord{
+	case "failed":
+		events = append(events, gateway.Event{
 			RunID:     tk.RunID,
 			AgentID:   tk.AgentID,
 			SessionID: tk.SessionID,
@@ -283,8 +305,8 @@ func synthesizeTaskEvents(tk task.Info) []runtimeevents.EventRecord {
 			Timestamp: completedAt,
 			Payload:   payload,
 		})
-	case task.StatusCancelled:
-		events = append(events, runtimeevents.EventRecord{
+	case "cancelled":
+		events = append(events, gateway.Event{
 			RunID:     tk.RunID,
 			AgentID:   tk.AgentID,
 			SessionID: tk.SessionID,
@@ -297,11 +319,11 @@ func synthesizeTaskEvents(tk task.Info) []runtimeevents.EventRecord {
 	return events
 }
 
-func taskEventPayload(tk task.Info) map[string]any {
+func taskEventPayload(tk gateway.Task) map[string]any {
 	payload := map[string]any{
 		"task_id":   tk.ID,
-		"task_kind": string(tk.Kind),
-		"status":    string(tk.Status),
+		"task_kind": tk.Kind,
+		"status":    tk.Status,
 	}
 	if strings.TrimSpace(tk.ParentTaskID) != "" {
 		payload["parent_task_id"] = tk.ParentTaskID
@@ -348,6 +370,22 @@ func firstTaskEventTime(values ...time.Time) time.Time {
 		}
 	}
 	return time.Now().UTC()
+}
+
+func payloadString(payload map[string]any, key string) string {
+	if payload == nil {
+		return ""
+	}
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
 
 var _ httpapi.Plane = (*ControlPlane)(nil)

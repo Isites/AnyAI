@@ -70,6 +70,31 @@ func TestExecutorForAgentWithExtrasAutoAllowsSkillGet(t *testing.T) {
 	assert.Contains(t, executor.Names(), "skill_get")
 }
 
+func TestExecutorForAgentWithExtrasDenyOnlyDoesNotBecomeSkillAllowList(t *testing.T) {
+	cfg := config.DefaultConfig()
+	agentCfg := &config.AgentConfig{
+		Workspace: t.TempDir(),
+		Tools: config.ToolPolicy{
+			Deny: []string{"browser"},
+		},
+	}
+
+	executor := ExecutorForAgentWithExtras(cfg, agentCfg, nil, &mockAgentCallRunner{}, nil, ExtraToolDeps{
+		SkillProvider: mockSkillProvider{
+			docs: map[string]SkillDocument{
+				"rollout-playbook": {Name: "rollout-playbook", Content: "Verify staging before rollout."},
+			},
+		},
+	})
+
+	names := executor.Names()
+	assert.Contains(t, names, "skill_get")
+	assert.Contains(t, names, "read_file")
+	assert.Contains(t, names, "bash")
+	assert.Contains(t, names, "callagent")
+	assert.NotContains(t, names, "browser")
+}
+
 func TestExecutorForAgentWithExtrasDoesNotAutoAllowSkillGetWhenAllowListIsExplicit(t *testing.T) {
 	cfg := config.DefaultConfig()
 	agentCfg := &config.AgentConfig{

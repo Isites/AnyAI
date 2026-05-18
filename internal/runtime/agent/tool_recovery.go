@@ -11,12 +11,11 @@ import (
 	"time"
 
 	"github.com/Isites/anyai/internal/runtime/llm"
-	"github.com/Isites/anyai/internal/runtime/tool"
+	tools "github.com/Isites/anyai/internal/runtime/tool"
+	"github.com/Isites/anyai/internal/runtime/tooldefaults"
 )
 
 const (
-	defaultToolMaxAttempts          = 1
-	defaultToolRetryBackoffMS       = 750
 	defaultToolLoopHistorySize      = 24
 	defaultToolLoopWarningThreshold = 4
 	defaultToolLoopBlockThreshold   = 6
@@ -66,10 +65,10 @@ type toolRecoveryMetadata struct {
 func (r *Runtime) toolRecoveryConfig() ToolRecoveryConfig {
 	cfg := r.ToolRecovery
 	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = defaultToolMaxAttempts
+		cfg.MaxAttempts = tooldefaults.MaxAttempts
 	}
 	if cfg.RetryBackoffMS <= 0 {
-		cfg.RetryBackoffMS = defaultToolRetryBackoffMS
+		cfg.RetryBackoffMS = tooldefaults.RetryBackoffMS
 	}
 	if cfg.LoopDetection.HistorySize <= 0 {
 		cfg.LoopDetection.HistorySize = defaultToolLoopHistorySize
@@ -196,6 +195,7 @@ func (r *Runtime) executeToolWithRecovery(
 		}
 		result = shapeState.Result
 		result = tools.SanitizeToolResult(result)
+		result = persistToolResultImages(ctx, call.ID, result)
 		last = result
 
 		if !shouldRetryToolFailure(result) || attempt >= maxAttempts {
@@ -257,6 +257,7 @@ func (r *Runtime) executeToolAttempt(ctx context.Context, call llm.ToolCall) (to
 		SessionID:      r.Session.ID,
 		TaskID:         meta.TaskID,
 		ToolCallID:     call.ID,
+		AssetsBaseDir:  meta.AssetsBaseDir,
 		CurrentRequest: meta.CurrentRequest,
 		CallChain:      meta.CallChain,
 		Depth:          meta.Depth,
@@ -309,7 +310,7 @@ func buildToolRecoveryMetadata(
 		ErrorClass:         errorClass,
 		AutoRetryable:      autoRetryable,
 		ModelRecoverable:   modelRecoverable,
-		SuggestedNextMoves: suggestedNextMoves(call.Name, errorClass),
+		SuggestedNextMoves: tools.RecoveryHints(call.Name, errorClass, errorMessage),
 		Attempt:            attempt,
 		MaxAttempts:        maxAttempts,
 		RetryCount:         retryCount,
@@ -392,7 +393,7 @@ func blockedToolResult(call llm.ToolCall, cfg ToolRecoveryConfig, warning *ToolW
 		ErrorClass:         "loop_detected",
 		AutoRetryable:      false,
 		ModelRecoverable:   true,
-		SuggestedNextMoves: suggestedNextMoves(call.Name, "loop_detected"),
+		SuggestedNextMoves: tools.RecoveryHints(call.Name, "loop_detected", warning.Message),
 		Attempt:            1,
 		MaxAttempts:        cfg.MaxAttempts,
 		Decision:           "blocked",
@@ -434,9 +435,11 @@ func classifyToolFailure(toolName, errMsg string) (string, bool, bool) {
 		return "path_not_found", false, true
 	case strings.Contains(errLower, "dial tcp"),
 		strings.Contains(errLower, "connection refused"),
+		strings.Contains(errLower, "err_connection_refused"),
 		strings.Contains(errLower, "connection reset"),
 		strings.Contains(errLower, "tls handshake timeout"),
 		strings.Contains(errLower, "temporary network"),
+		toolName == "browser" && strings.Contains(errLower, "access to internal address") && strings.Contains(errLower, "localhost"),
 		errLower == "eof":
 		return "network_error", true, true
 	case strings.Contains(errLower, "rate limit"),
@@ -471,7 +474,7 @@ func isPathNotFound(toolName, errLower string) bool {
 	if strings.Contains(errLower, "no such file") || strings.Contains(errLower, "cannot find the file") {
 		return true
 	}
-	if toolName == "read_file" || toolName == "write_file" || toolName == "edit_file" || toolName == "save_output" {
+	if toolName == "read_file" || toolName == "write_file" || toolName == "edit_file" {
 		return strings.Contains(errLower, "failed to read file") ||
 			strings.Contains(errLower, "failed to write file") ||
 			strings.Contains(errLower, "file does not exist")
@@ -479,58 +482,9 @@ func isPathNotFound(toolName, errLower string) bool {
 	return false
 }
 
-func suggestedNextMoves(toolName, errorClass string) []string {
-	switch errorClass {
-	case "path_is_directory":
-		return []string{
-			"Use `bash` to inspect the directory contents instead of trying to read it as a file.",
-			"Choose a concrete file path, preferably an absolute path rooted at the injected workspace or project root.",
-		}
-	case "path_not_found":
-		return []string{
-			"Check whether the path is relative to the agent workspace and switch to an absolute path if needed.",
-			"Use `bash` to verify the file exists before calling the file tool again.",
-		}
-	case "permission_denied":
-		return []string{
-			"Choose a tool or path that is allowed in the current runtime policy.",
-			"Explain the permission boundary clearly and continue with other verifiable work when possible.",
-		}
-	case "validation_error":
-		return []string{
-			"Read the exact parameter error and fix the arguments before retrying.",
-			"Switch tools if another tool matches the task more directly.",
-		}
-	case "timeout":
-		return []string{
-			"Reduce the scope, split the work into smaller calls, or retry with a shorter-running command.",
-			"Use `bash` plus a short script when the task is repetitive or easier to control programmatically.",
-		}
-	case "network_error", "transient_provider_error":
-		return []string{
-			"Retry after a short wait because the failure looks transient.",
-			"If transient retries keep failing, switch methods or continue with the parts that can still be verified locally.",
-		}
-	case "loop_detected":
-		return []string{
-			"Stop repeating the same tool call unchanged; change arguments, switch tools, or report the blockage explicitly.",
-			"Use the most recent tool error or result to decide on a different next step.",
-		}
-	default:
-		moves := []string{
-			"Inspect the exact error and adjust the next step instead of repeating the same call unchanged.",
-			"Switch tools or use `bash` when it gives you more control over the task.",
-		}
-		if toolName == "read_file" {
-			moves = append(moves, "If the path might be a directory, use `bash` first to inspect it.")
-		}
-		return moves
-	}
-}
-
 func toolRetryDelay(base time.Duration, attempt int) time.Duration {
 	if base <= 0 {
-		base = time.Duration(defaultToolRetryBackoffMS) * time.Millisecond
+		base = time.Duration(tooldefaults.RetryBackoffMS) * time.Millisecond
 	}
 	delay := base
 	for i := 1; i < attempt; i++ {

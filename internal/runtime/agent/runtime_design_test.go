@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Isites/anyai/internal/runtime/llm"
@@ -65,6 +66,58 @@ func TestClassifyToolFailureTreatsContextDeadlineExceededAsRetryableTimeout(t *t
 	assert.Equal(t, "timeout", errorClass)
 	assert.True(t, autoRetryable)
 	assert.True(t, modelRecoverable)
+}
+
+func TestClassifyToolFailureTreatsChromeConnectionRefusedAsNetworkError(t *testing.T) {
+	errorClass, autoRetryable, modelRecoverable := classifyToolFailure("browser", "navigate failed: page load error net::ERR_CONNECTION_REFUSED")
+	assert.Equal(t, "network_error", errorClass)
+	assert.True(t, autoRetryable)
+	assert.True(t, modelRecoverable)
+}
+
+func TestClassifyToolFailureTreatsBrowserLocalhostSSRFAsRetryable(t *testing.T) {
+	errorClass, autoRetryable, modelRecoverable := classifyToolFailure("browser", "navigate failed: access to internal address localhost (::1) is blocked")
+	assert.Equal(t, "network_error", errorClass)
+	assert.True(t, autoRetryable)
+	assert.True(t, modelRecoverable)
+}
+
+func TestWriteFileMalformedJSONRecoverySuggestsChunkedWriteOrPatch(t *testing.T) {
+	errorMessage := "invalid input: unexpected end of JSON input"
+	errorClass, autoRetryable, modelRecoverable := classifyToolFailure("write_file", errorMessage)
+	assert.Equal(t, "validation_error", errorClass)
+	assert.False(t, autoRetryable)
+	assert.True(t, modelRecoverable)
+
+	moves := tools.RecoveryHints("write_file", errorClass, errorMessage)
+	require.NotEmpty(t, moves)
+	joined := strings.Join(moves, "\n")
+	assert.Contains(t, joined, "not valid JSON")
+	assert.Contains(t, joined, "mode=overwrite")
+	assert.Contains(t, joined, "mode=append")
+	assert.Contains(t, joined, "expected_offset")
+	assert.Contains(t, joined, "mode=patch")
+}
+
+func TestToolRecoveryBlockIncludesWriteFileChunkAndPatchGuidance(t *testing.T) {
+	content := formatToolResultContent(session.ToolResultData{
+		Error: "invalid input: unexpected end of JSON input",
+		Metadata: map[string]any{
+			"tool_name":            "write_file",
+			"error_class":          "validation_error",
+			"error_message":        "invalid input: unexpected end of JSON input",
+			"model_recoverable":    true,
+			"auto_retryable":       false,
+			"suggested_next_moves": tools.RecoveryHints("write_file", "validation_error", "invalid input: unexpected end of JSON input"),
+		},
+	})
+
+	assert.Contains(t, content, "status: failed")
+	assert.Contains(t, content, "error type: validation_error")
+	assert.Contains(t, content, "suggested next steps:")
+	assert.Contains(t, content, "mode=append")
+	assert.Contains(t, content, "expected_offset")
+	assert.Contains(t, content, "mode=patch")
 }
 
 func TestParseCanonicalCallAgentInputFallsBackToCurrentRequest(t *testing.T) {

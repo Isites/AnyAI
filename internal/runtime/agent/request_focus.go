@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/session"
 )
 
@@ -19,6 +20,7 @@ type RequestFocus struct {
 }
 
 func deriveRequestFocus(history []session.SessionEntry, fallback string) RequestFocus {
+	history = session.ModelVisibleEntries(history)
 	focus := RequestFocus{
 		CurrentRequest: strings.TrimSpace(fallback),
 	}
@@ -39,7 +41,7 @@ func deriveRequestFocus(history []session.SessionEntry, fallback string) Request
 			}
 			focus.SessionSummary = compactFocusText(md.Text, 320)
 		case session.EntryTypeMessage:
-			if entry.Role != "user" {
+			if entry.Role != llm.MessageRoleUser {
 				continue
 			}
 			var md session.MessageData
@@ -87,6 +89,7 @@ func parseStructuredFollowup(text string) (current string, pending string, ok bo
 }
 
 func summarizeTailUserTurns(history []session.SessionEntry, limit int) string {
+	history = session.ModelVisibleEntries(history)
 	if len(history) == 0 || limit <= 0 {
 		return ""
 	}
@@ -100,7 +103,7 @@ func summarizeTailUserTurns(history []session.SessionEntry, limit int) string {
 			}
 			continue
 		}
-		if entry.Role != "user" {
+		if entry.Role != llm.MessageRoleUser {
 			if len(items) > 0 {
 				break
 			}

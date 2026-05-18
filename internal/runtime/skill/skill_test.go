@@ -318,17 +318,14 @@ func TestLoaderGetSkillByNormalizedName(t *testing.T) {
 }
 
 func TestLoaderForAgentScopesAndOverrides(t *testing.T) {
-	systemDir := t.TempDir()
 	sharedDir := t.TempDir()
 	privateDir := t.TempDir()
 
-	require.NoError(t, os.WriteFile(filepath.Join(systemDir, "shared.md"), []byte("---\nname: common\n---\nsystem"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "shared.md"), []byte("---\nname: common\n---\nshared"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(privateDir, "private.md"), []byte("---\nname: common\n---\nprivate"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(privateDir, "unique.md"), []byte("---\nname: unique\n---\nonly private"), 0o644))
 
 	cfg := &config.Config{
-		SystemSkillsDir: systemDir,
 		SharedSkillsDir: sharedDir,
 	}
 	agentCfg := &config.AgentConfig{

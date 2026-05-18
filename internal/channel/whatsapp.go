@@ -3,14 +3,12 @@ package channel
 import (
 	"context"
 	"fmt"
-	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/Isites/anyai/internal/gateway"
-	"github.com/Isites/anyai/internal/runtime/logging"
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -72,7 +70,7 @@ func (w *WhatsAppChannel) Connect(ctx context.Context) error {
 	// - foreign_keys: required by whatsmeow schema
 	// - journal_mode=WAL: allows concurrent reads/writes (avoids SQLITE_BUSY during history sync)
 	// - busy_timeout=5000: wait up to 5s for locks instead of failing immediately
-	logger := logging.NewWhatsMeowLogger("whatsmeow")
+	logger := gateway.NewWhatsMeowLogger("whatsmeow")
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", w.dbPath)
 	container, err := sqlstore.New(ctx, "sqlite", dsn, logger)
 	if err != nil {
@@ -123,7 +121,7 @@ func (w *WhatsAppChannel) Connect(ctx context.Context) error {
 			case "code":
 				printQRCode(evt.Code)
 			case "login":
-				runtimelogging.Info("whatsapp login successful")
+				gateway.Info("whatsapp login successful")
 			case "timeout":
 				cancel()
 				w.mu.Lock()
@@ -149,7 +147,7 @@ func (w *WhatsAppChannel) Connect(ctx context.Context) error {
 	w.status = gateway.StatusConnected
 	w.mu.Unlock()
 
-	runtimelogging.Info("whatsapp channel connected")
+	gateway.Info("whatsapp channel connected")
 
 	// Keep alive until context is cancelled
 	go func() {
@@ -215,14 +213,14 @@ func (w *WhatsAppChannel) eventHandler(evt interface{}) {
 	case *events.Message:
 		w.handleMessage(v)
 	case *events.Connected:
-		runtimelogging.Info("whatsapp connected event received")
+		gateway.Info("whatsapp connected event received")
 	case *events.Disconnected:
-		runtimelogging.Warn("whatsapp disconnected event received")
+		gateway.Warn("whatsapp disconnected event received")
 		w.mu.Lock()
 		w.status = gateway.StatusDisconnected
 		w.mu.Unlock()
 	case *events.LoggedOut:
-		runtimelogging.Warn("whatsapp logged out — re-run 'anyai start' to scan QR code again")
+		gateway.Warn("whatsapp logged out - re-run 'anyai start' to scan QR code again")
 		w.mu.Lock()
 		w.status = gateway.StatusError
 		w.mu.Unlock()
@@ -240,7 +238,7 @@ func (w *WhatsAppChannel) handleMessage(evt *events.Message) {
 	if len(w.allowedSenders) > 0 {
 		senderJID := evt.Info.Sender.ToNonAD().String()
 		if !w.isSenderAllowed(senderJID) {
-			runtimelogging.Debug("whatsapp message from non-allowed sender, ignoring", "sender", senderJID)
+			gateway.Debug("whatsapp message from non-allowed sender, ignoring", "sender", senderJID)
 			return
 		}
 	}
@@ -277,7 +275,7 @@ func (w *WhatsAppChannel) handleMessage(evt *events.Message) {
 		if client != nil {
 			data, err := client.Download(context.Background(), img)
 			if err != nil {
-				runtimelogging.Warn("whatsapp image download failed", "error", err)
+				gateway.Warn("whatsapp image download failed", "error", err)
 			} else {
 				att.Data = data
 			}

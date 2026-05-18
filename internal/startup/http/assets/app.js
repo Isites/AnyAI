@@ -11,7 +11,6 @@ const appState = {
   inventory: {
     agents: [],
     sharedSkills: [],
-    systemSkills: [],
     notes: [],
   },
   chat: {
@@ -23,6 +22,8 @@ const appState = {
     pendingEntries: [],
     pendingHistoryBaseline: 0,
     pendingUserText: '',
+    pendingUserAttachments: [],
+    attachments: [],
     runEvents: [],
     runRecord: null,
     runStatus: 'idle',
@@ -361,6 +362,18 @@ function generateSessionName() {
   return `session-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
+function generateMessageID() {
+  const bytes = new Uint8Array(8);
+  if (window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return `e_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
 function safeStorageGet(key) {
   try {
     return window.localStorage.getItem(key) || '';
@@ -430,6 +443,7 @@ function resetChatPendingState() {
   appState.chat.pendingEntries = [];
   appState.chat.pendingHistoryBaseline = appState.chat.history.length;
   appState.chat.pendingUserText = '';
+  appState.chat.pendingUserAttachments = [];
 }
 
 function resetChatRuntimeState(nextStatus = 'idle') {
@@ -450,6 +464,47 @@ function summarizeInputBlocks(inputs) {
     if (block.type === 'text') return truncate(block.text || '空文本', 56);
     return `${block.type}${block.name ? `:${block.name}` : ''}`;
   }).join(' · ');
+}
+
+function normalizeAttachmentBlocks(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((block) => block && typeof block === 'object' && block.type)
+    .map((block) => ({
+      ...block,
+      name: block.name || block.path || block.url || block.type,
+    }));
+}
+
+function attachmentKey(block) {
+  return String(
+    block?.attachment_id
+      || block?.id
+      || block?.path
+      || block?.url
+      || `${block?.type || ''}:${block?.name || ''}`,
+  ).trim();
+}
+
+function attachmentLabel(block) {
+  const type = String(block?.type || 'file').trim();
+  const name = String(block?.name || block?.path || block?.url || 'attachment').trim();
+  return `${type}:${name}`;
+}
+
+function renderAttachmentList(blocks, removable = false) {
+  const items = normalizeAttachmentBlocks(blocks);
+  if (!items.length) return '';
+  return `
+    <div class="attachment-list">
+      ${items.map((block, index) => `
+        <span class="attachment-chip ${escapeHTML(block.type || 'file')}" title="${escapeHTML(block.path || block.name || '')}">
+          <span>${escapeHTML(attachmentLabel(block))}</span>
+          ${removable ? `<button type="button" class="attachment-remove" data-attachment-index="${escapeHTML(index)}" aria-label="移除 ${escapeHTML(block.name || '附件')}">移除</button>` : ''}
+        </span>
+      `).join('')}
+    </div>
+  `;
 }
 
 function summarizeToolPayload(payload) {
@@ -594,12 +649,15 @@ function decorateChatHistoryEntries(events) {
     switch (name) {
       case 'session.input.stored': {
         const text = String(payload.text || '').trim();
-        if (!text) break;
+        const attachments = normalizeAttachmentBlocks(payload.attachments || payload.images || []);
+        if (!text && !attachments.length) break;
         items.push({
-          _key: liveWindowKey('user', event.run_id, event.session_id, timestamp, text),
+          _key: liveWindowKey('user', payload.entry_id || '', event.run_id, event.session_id, timestamp, text, attachments.map(attachmentKey).join(',')),
           type: 'message',
           role: 'user',
           text,
+          attachments,
+          message_id: payload.entry_id || '',
           timestamp,
           session_id: event.session_id || appState.chat.sessionID,
           run_id: event.run_id || '',
@@ -618,6 +676,24 @@ function decorateChatHistoryEntries(events) {
           agent_id: event.agent_id || appState.chat.agentID,
           session_id: event.session_id || appState.chat.sessionID,
           run_id: event.run_id || '',
+        });
+        break;
+      }
+      case 'session.meta.stored': {
+        const text = String(payload.text || '').trim();
+        if (!text) break;
+        const item = {
+          type: 'meta',
+          role: payload.role || 'system',
+          text,
+          timestamp,
+          agent_id: event.agent_id || appState.chat.agentID,
+          session_id: event.session_id || appState.chat.sessionID,
+          run_id: event.run_id || '',
+        };
+        item._key = runtimeMetaEntryKey(item);
+        items.push({
+          ...item,
         });
         break;
       }
@@ -756,7 +832,6 @@ function rememberAgentInventory(payload) {
   appState.inventory = {
     agents: Array.isArray(payload?.agents) ? payload.agents : [],
     sharedSkills: Array.isArray(payload?.shared_skills) ? payload.shared_skills : [],
-    systemSkills: Array.isArray(payload?.system_skills) ? payload.system_skills : [],
     notes: Array.isArray(payload?.notes) ? payload.notes : [],
   };
   return appState.inventory;
@@ -970,7 +1045,6 @@ async function renderOverview() {
   const skillDeck = `
     <div class="list">
       ${renderSharedSkillDeck('Shared Skills', '面向所有继承共享技能的 agent。', inventory.sharedSkills)}
-      ${renderSharedSkillDeck('System Skills', '系统级技能，会在被启用后进入 agent 能力面。', inventory.systemSkills)}
       ${inventory.notes?.length ? inventory.notes.map((note) => `<div class="meta-note compact">${escapeHTML(note)}</div>`).join('') : ''}
     </div>
   `;
@@ -1070,9 +1144,14 @@ async function renderChat() {
           <label class="stack-field composer-input-field">
             <textarea id="chat-input" rows="3" aria-label="发送给当前 Session" placeholder="直接输入任务、需求或提问。发送后会继续保留在当前 session。"></textarea>
           </label>
+          <input id="chat-attachments" class="visually-hidden" type="file" multiple>
+          <div id="chat-attachment-list" class="composer-attachment-row"></div>
           <div class="composer-actions">
             <div class="muted" id="chat-composer-note">准备就绪</div>
-            <button type="submit" id="chat-send">发送消息</button>
+            <div class="toolbar composer-send-tools">
+              <button type="button" class="ghost" id="chat-attach">添加附件</button>
+              <button type="submit" id="chat-send">发送消息</button>
+            </div>
           </div>
         </form>
       </section>
@@ -1081,9 +1160,11 @@ async function renderChat() {
 
   const agentSelect = document.getElementById('chat-agent');
   const promptInput = document.getElementById('chat-input');
+  const attachmentInput = document.getElementById('chat-attachments');
   agentSelect.value = preferredAgent;
   promptInput.value = safeStorageGet('anyai.chat.draft');
   updateChatRuntimeNote();
+  renderChatAttachments();
 
   agentSelect.addEventListener('change', async () => {
     clearFlash();
@@ -1102,6 +1183,13 @@ async function renderChat() {
     updateChatSnippet();
   });
 
+  promptInput.addEventListener('paste', async (event) => {
+    const files = clipboardImageFiles(event.clipboardData);
+    if (!files.length) return;
+    event.preventDefault();
+    await uploadChatAttachments(files, { source: 'clipboard' });
+  });
+
   document.getElementById('chat-refresh-sessions').addEventListener('click', async () => {
     clearFlash();
     await loadChatSessions(appState.chat.agentID, appState.chat.sessionID);
@@ -1110,6 +1198,27 @@ async function renderChat() {
   document.getElementById('chat-new-session').addEventListener('click', async () => {
     clearFlash();
     await createChatSession();
+  });
+
+  document.getElementById('chat-attach')?.addEventListener('click', () => {
+    attachmentInput?.click();
+  });
+
+  attachmentInput?.addEventListener('change', async (event) => {
+    const files = Array.from(event.target?.files || []);
+    event.target.value = '';
+    if (!files.length) return;
+    await uploadChatAttachments(files);
+  });
+
+  document.getElementById('chat-attachment-list')?.addEventListener('click', (event) => {
+    const button = event.target?.closest?.('[data-attachment-index]');
+    if (!button) return;
+    const index = Number(button.dataset.attachmentIndex);
+    if (!Number.isInteger(index) || index < 0) return;
+    appState.chat.attachments.splice(index, 1);
+    renderChatAttachments();
+    updateChatSnippet();
   });
 
   document.getElementById('chat-form').addEventListener('submit', async (event) => {
@@ -1175,27 +1284,130 @@ async function loadChatHistory(agentID, sessionID) {
   applyChatHistory(payload.session.events || [], true);
 }
 
+function renderChatAttachments() {
+  const host = document.getElementById('chat-attachment-list');
+  if (!host) return;
+  host.innerHTML = renderAttachmentList(appState.chat.attachments, true);
+}
+
+function clipboardImageFiles(clipboardData) {
+  if (!clipboardData) return [];
+  const files = [];
+  const seen = new Set();
+  for (const item of Array.from(clipboardData.items || [])) {
+    if (item?.kind !== 'file') continue;
+    const type = String(item.type || '').toLowerCase();
+    if (!type.startsWith('image/')) continue;
+    const file = item.getAsFile?.();
+    if (!file) continue;
+    const key = `${file.name || ''}:${file.type || ''}:${file.size || ''}:${file.lastModified || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ext = mimeExtension(file.type) || 'png';
+    const name = file.name || `clipboard-${Date.now()}-${files.length + 1}.${ext}`;
+    files.push(file.name ? file : new File([file], name, { type: file.type || 'image/png' }));
+  }
+  for (const file of Array.from(clipboardData.files || [])) {
+    if (!String(file?.type || '').toLowerCase().startsWith('image/')) continue;
+    const key = `${file.name || ''}:${file.type || ''}:${file.size || ''}:${file.lastModified || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ext = mimeExtension(file.type) || 'png';
+    const name = file.name || `clipboard-${Date.now()}-${files.length + 1}.${ext}`;
+    files.push(file.name ? file : new File([file], name, { type: file.type || 'image/png' }));
+  }
+  return files;
+}
+
+function mimeExtension(mimeType = '') {
+  const type = String(mimeType || '').toLowerCase();
+  if (type === 'image/jpeg') return 'jpg';
+  if (type === 'image/png') return 'png';
+  if (type === 'image/gif') return 'gif';
+  if (type === 'image/webp') return 'webp';
+  if (type === 'image/svg+xml') return 'svg';
+  if (type === 'image/bmp') return 'bmp';
+  return '';
+}
+
+async function uploadChatAttachments(files, options = {}) {
+  if (!files.length) return;
+  const note = document.getElementById('chat-composer-note');
+  const attachButton = document.getElementById('chat-attach');
+  const form = new FormData();
+  files.forEach((file) => form.append('files', file));
+  clearFlash();
+  if (attachButton) attachButton.disabled = true;
+  const sourceLabel = options.source === 'clipboard' ? '剪贴板图片' : '附件';
+  if (note) note.textContent = `正在上传 ${files.length} 个${sourceLabel}…`;
+  try {
+    const response = await fetch(withAuthQuery('/api/attachments'), {
+      method: 'POST',
+      body: form,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || `Upload failed: ${response.status}`);
+    }
+    const incoming = normalizeAttachmentBlocks(payload.inputs || payload.attachments || []);
+    const seen = new Set(appState.chat.attachments.map(attachmentKey).filter(Boolean));
+    incoming.forEach((block) => {
+      const key = attachmentKey(block);
+      if (key && seen.has(key)) return;
+      if (key) seen.add(key);
+      appState.chat.attachments.push(block);
+    });
+    renderChatAttachments();
+    if (note) note.textContent = `已添加 ${incoming.length} 个${sourceLabel}`;
+    updateChatSnippet();
+  } catch (error) {
+    showFlash(error.message || '附件上传失败', true);
+    if (note) note.textContent = '附件上传失败';
+  } finally {
+    if (attachButton) attachButton.disabled = false;
+  }
+}
+
 function reconcileChatPendingEntriesWithHistory() {
   if (!appState.chat.pendingEntries.length) return;
 
   const baseline = Math.max(0, appState.chat.pendingHistoryBaseline || 0);
   const historySincePending = appState.chat.history.slice(baseline);
   const pendingUserText = String(appState.chat.pendingUserText || '').trim();
+  const pendingAttachmentKeys = normalizeAttachmentBlocks(appState.chat.pendingUserAttachments).map(attachmentKey).filter(Boolean);
+  const pendingMessageIDs = new Set(appState.chat.pendingEntries
+    .filter((entry) => entry?.type === 'message' && entry?.role === 'user')
+    .map((entry) => String(entry.message_id || '').trim())
+    .filter(Boolean));
+  const hasPendingMessageIDEcho = pendingMessageIDs.size > 0 && historySincePending.some((entry) =>
+    entry?.type === 'message'
+      && entry?.role === 'user'
+      && pendingMessageIDs.has(String(entry.message_id || '').trim())
+  );
   const hasPendingUserEcho = pendingUserText && historySincePending.some((entry) =>
     entry?.type === 'message'
       && entry?.role === 'user'
       && String(entry?.text || '').trim() === pendingUserText
   );
+  const hasPendingAttachmentEcho = pendingAttachmentKeys.length > 0 && historySincePending.some((entry) => {
+    if (entry?.type !== 'message' || entry?.role !== 'user') return false;
+    const keys = normalizeAttachmentBlocks(entry.attachments || entry.images).map(attachmentKey).filter(Boolean);
+    return pendingAttachmentKeys.every((key) => keys.includes(key));
+  });
   const hasAssistantHistory = historySincePending.some((entry) =>
     entry?.type === 'message' && entry?.role === 'assistant'
   );
 
-  if (!hasPendingUserEcho && !hasAssistantHistory) return;
+  if (!hasPendingMessageIDEcho && !hasPendingUserEcho && !hasPendingAttachmentEcho && !hasAssistantHistory) return;
 
   let removedEmptyAssistant = false;
   appState.chat.pendingEntries = appState.chat.pendingEntries.filter((entry) => {
     if (entry?.type !== 'message') return true;
-    if (entry.role === 'user' && hasPendingUserEcho) {
+    if (entry.role === 'user' && (
+      (entry.message_id && hasPendingMessageIDEcho)
+      || hasPendingUserEcho
+      || hasPendingAttachmentEcho
+    )) {
       return false;
     }
     if (entry.role === 'assistant' && hasAssistantHistory && !String(entry.text || '').trim()) {
@@ -1207,6 +1419,7 @@ function reconcileChatPendingEntriesWithHistory() {
 
   if (!appState.chat.pendingEntries.some((entry) => entry?.type === 'message' && entry?.role === 'user')) {
     appState.chat.pendingUserText = '';
+    appState.chat.pendingUserAttachments = [];
   }
   if (removedEmptyAssistant || !appState.chat.pendingEntries.length) {
     appState.chat.pendingHistoryBaseline = appState.chat.history.length;
@@ -1320,6 +1533,7 @@ function renderChatSessionHead() {
 
 function renderTranscriptEntry(entry) {
   const agentLabel = displayChatAgentLabel(entry);
+  const attachments = normalizeAttachmentBlocks(entry.attachments || entry.images || []);
   switch (entry.type) {
     case 'message':
       return `
@@ -1330,7 +1544,7 @@ function renderTranscriptEntry(entry) {
             ${entry.pending ? '<span class="pill">streaming</span>' : ''}
           </div>
           <div class="message-text message-markdown markdown-body">${renderMarkdown(entry.text || (entry.pending ? '正在生成回复…' : ''))}</div>
-          ${entry.images && entry.images.length ? `<div class="muted tiny">附带 ${escapeHTML(entry.images.length)} 张图片</div>` : ''}
+          ${attachments.length ? `<div class="message-attachments">${renderAttachmentList(attachments)}</div>` : ''}
         </article>
       `;
     case 'tool_call':
@@ -1350,6 +1564,17 @@ function renderTranscriptEntry(entry) {
         </article>
       `;
     case 'meta':
+      return `
+        <article class="transcript-card runtime-meta-card">
+          <div class="toolbar">
+            <div>
+              <span class="eyebrow subtle">${escapeHTML(agentLabel)}</span>
+              <strong>Runtime</strong>
+            </div>
+          </div>
+          <div class="tool-runtime-summary">${escapeHTML(entry.text || '')}</div>
+        </article>
+      `;
     default:
       return '';
   }
@@ -1423,6 +1648,11 @@ function liveWindowKey(...parts) {
   return parts.map((part) => String(part || '').trim()).filter(Boolean).join(':');
 }
 
+function runtimeMetaEntryKey(entry) {
+  if (!entry || typeof entry !== 'object') return '';
+  return liveWindowKey('meta', entry.run_id, entry.agent_id, entry.session_id, entry.text);
+}
+
 function chatWindowEntryKey(entry) {
   if (!entry || typeof entry !== 'object') return '';
   if (entry._key) return String(entry._key).trim();
@@ -1431,6 +1661,9 @@ function chatWindowEntryKey(entry) {
   }
   if (entry.type === 'message' && entry.role !== 'user' && entry.agent_id) {
     return liveWindowKey('message', entry.run_id, entry.agent_id, entry.session_id);
+  }
+  if (entry.type === 'meta') {
+    return runtimeMetaEntryKey(entry);
   }
   return '';
 }
@@ -1538,6 +1771,19 @@ function buildChatLiveWindowEntries() {
             item.pending = false;
           }
         });
+        if (name !== 'run.completed') {
+          const message = String(payload.message || payload.error || (name === 'run.aborted' ? 'run aborted' : 'run failed')).trim();
+          const item = {
+            type: 'meta',
+            role: 'system',
+            agent_id: event.agent_id || appState.chat.agentID,
+            session_id: event.session_id || appState.chat.sessionID,
+            run_id: event.run_id || '',
+            text: `${name === 'run.aborted' ? 'Run aborted' : 'Run failed'}: ${message}`,
+            timestamp: event.timestamp || new Date().toISOString(),
+          };
+          upsert(runtimeMetaEntryKey(item), () => item);
+        }
         break;
       }
       default:
@@ -1726,8 +1972,9 @@ async function sendChatPrompt() {
   const sendButton = document.getElementById('chat-send');
   const note = document.getElementById('chat-composer-note');
   const text = promptInput.value.trim();
-  if (!text) {
-    showFlash('请输入消息内容后再发送。', true);
+  const attachments = normalizeAttachmentBlocks(appState.chat.attachments);
+  if (!text && !attachments.length) {
+    showFlash('请输入消息内容或添加附件后再发送。', true);
     return;
   }
 
@@ -1735,11 +1982,18 @@ async function sendChatPrompt() {
   closeChatSource();
 
   const sessionID = await ensureChatSession();
+  const messageID = generateMessageID();
+  const inputs = [];
+  if (text) {
+    inputs.push({ type: 'text', text });
+  }
+  inputs.push(...attachments);
   resetChatRuntimeState('queued');
   appState.chat.pendingHistoryBaseline = appState.chat.history.length;
   appState.chat.pendingUserText = text;
+  appState.chat.pendingUserAttachments = attachments;
   appState.chat.pendingEntries = [
-    { type: 'message', role: 'user', text },
+    { type: 'message', role: 'user', text, attachments, message_id: messageID },
   ];
   appState.chat.sending = true;
 
@@ -1755,10 +2009,16 @@ async function sendChatPrompt() {
   const requestBody = {
     agent_id: appState.chat.agentID,
     session_id: sessionID,
-    text,
+    message_id: messageID,
+    inputs,
   };
+  if (text) {
+    requestBody.text = text;
+  }
 
   promptInput.value = '';
+  appState.chat.attachments = [];
+  renderChatAttachments();
   safeStorageRemove('anyai.chat.draft');
   note.textContent = `已发送到 ${sessionID}，等待 run.accepted…`;
   sendButton.disabled = false;
@@ -4094,9 +4354,11 @@ function updateChatSnippet() {
   updateChatRuntimeNote();
   const note = document.getElementById('chat-composer-note');
   if (note) {
+    const attachmentCount = normalizeAttachmentBlocks(appState.chat.attachments).length;
+    const suffix = attachmentCount ? ` · ${attachmentCount} 个附件` : '';
     note.textContent = appState.chat.sessionID
-      ? `写入 ${appState.chat.sessionID}`
-      : '发送首条消息时会自动创建 session。';
+      ? `写入 ${appState.chat.sessionID}${suffix}`
+      : `发送首条消息时会自动创建 session。${suffix}`;
   }
 }
 
@@ -4553,6 +4815,24 @@ async function renderAPI() {
             ${transport.entrypoints?.length ? `<pre>${escapeHTML(transport.entrypoints.join('\n'))}</pre>` : ''}
           </article>
         `).join('')}
+      </div>
+    </section>
+
+    <section class="panel" id="attachment-docs">
+      ${sectionHeader('附件上传', 'WebUI 和外部 HTTP 客户端先上传附件，再把返回的 InputBlock 引用放进 /api/chat 或 /api/runs。')}
+      <div class="endpoint-list">
+        <article class="endpoint-card">
+          <div class="toolbar">
+            <strong>POST /api/attachments</strong>
+            <span class="pill">multipart/form-data</span>
+          </div>
+          <p>字段名可用 <code>files</code> 或 <code>file</code>。响应中的 <code>inputs</code> 已经是可直接提交的引用块，图片会自动标记为 <code>type=image</code>。</p>
+          <pre>${escapeHTML(`curl -F 'files=@diagram.png' http://127.0.0.1:18789/api/attachments
+
+curl -N -X POST 'http://127.0.0.1:18789/api/chat?stream=1' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"agent_id":"assistant","session_id":"demo","inputs":[{"type":"text","text":"看图说明"},{"type":"image","attachment_id":"att_x","path":"/.../anyai/assets/uploads/att_x/diagram.png","name":"diagram.png","mime_type":"image/png"}]}'`)}</pre>
+        </article>
       </div>
     </section>
 

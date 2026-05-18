@@ -30,12 +30,12 @@ func prepareTranscript(raw []llm.Message, policy transcriptPolicy) preparedTrans
 	for _, msg := range out.Messages {
 		switch {
 		case policy.treatMetaAsSummaryContext &&
-			msg.Role == "user" &&
+			llm.IsUserRole(msg.Role) &&
 			msg.ToolCallID == "" &&
 			strings.HasPrefix(msg.Content, sessionSummaryPrefix):
 			summaries = append(summaries, compactFocusText(strings.TrimPrefix(msg.Content, sessionSummaryPrefix), 400))
 		case policy.dropOrphanToolResults &&
-			msg.Role == "user" &&
+			llm.IsUserRole(msg.Role) &&
 			msg.ToolCallID == "" &&
 			strings.HasPrefix(msg.Content, recoveredOrphanResultPrefix):
 			out.DroppedOrphans = append(out.DroppedOrphans, compactFocusText(strings.TrimPrefix(msg.Content, recoveredOrphanResultPrefix), 200))
@@ -129,7 +129,7 @@ func mergeConsecutiveAssistantTurns(msgs []llm.Message) []llm.Message {
 }
 
 func isPlainUserMessage(msg llm.Message) bool {
-	return msg.Role == "user" &&
+	return llm.IsUserRole(msg.Role) &&
 		msg.ToolCallID == "" &&
 		len(msg.ToolCalls) == 0 &&
 		!msg.IsError &&
@@ -137,7 +137,7 @@ func isPlainUserMessage(msg llm.Message) bool {
 }
 
 func isMergeableAssistant(msg llm.Message) bool {
-	return msg.Role == "assistant" && msg.ToolCallID == "" && len(msg.ToolCalls) == 0
+	return llm.IsAssistantRole(msg.Role) && msg.ToolCallID == "" && len(msg.ToolCalls) == 0
 }
 
 func joinCompactLines(items []string, limit int) string {

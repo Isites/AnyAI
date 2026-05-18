@@ -20,32 +20,43 @@ func TestRunInputAdapterBuildsManifestAndAttachments(t *testing.T) {
 		Blocks: []input.InputBlock{
 			{Type: "text", Text: "please inspect"},
 			{Type: "file", Path: filePath, Name: "spec.txt"},
+			{Type: "dir", Path: dir, Name: "fixtures"},
 			{Type: "url", URL: "https://example.com"},
 		},
 	})
 
 	manifest := adapter.InputManifest()
-	require.Len(t, manifest, 3)
+	require.Len(t, manifest, 4)
 	assert.Equal(t, "text", manifest[0].Type)
 	assert.Equal(t, "please inspect", manifest[0].Text)
 	assert.Equal(t, "file", manifest[1].Type)
 	assert.Equal(t, "spec.txt", manifest[1].Name)
 	assert.NotEmpty(t, manifest[1].ID)
-	assert.Equal(t, "url", manifest[2].Type)
+	assert.Equal(t, "dir", manifest[2].Type)
+	assert.NotEmpty(t, manifest[2].ID)
+	assert.Equal(t, "url", manifest[3].Type)
 
 	attachment, ok := adapter.GetAttachment(manifest[1].ID)
 	require.True(t, ok)
 	assert.Equal(t, "spec.txt", attachment.Name)
 	assert.Equal(t, filePath, attachment.Path)
 	assert.Equal(t, int64(len("hello spec")), attachment.Size)
+
+	dirAttachment, ok := adapter.GetAttachment(manifest[2].ID)
+	require.True(t, ok)
+	assert.Equal(t, "fixtures", dirAttachment.Name)
+	assert.Equal(t, dir, dirAttachment.Path)
 }
 
 func TestResolveEnvelopeForRuntimeBuildsTextAndImages(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "diagram.png")
+	require.NoError(t, os.WriteFile(imagePath, []byte{1, 2, 3}, 0o644))
 	env := input.InputEnvelope{
 		Blocks: []input.InputBlock{
 			{Type: "text", Text: "analyze this"},
 			{Type: "file", Name: "notes.md", MimeType: "text/markdown"},
-			{Type: "image", Name: "diagram.png", MimeType: "image/png", Data: []byte{1, 2, 3}},
+			{Type: "image", Name: "diagram.png", MimeType: "image/png", Path: imagePath},
 		},
 	}
 
@@ -55,5 +66,23 @@ func TestResolveEnvelopeForRuntimeBuildsTextAndImages(t *testing.T) {
 	assert.Contains(t, text, "[Image: diagram.png]")
 	require.Len(t, images, 1)
 	assert.Equal(t, "image/png", images[0].MimeType)
+	assert.Equal(t, []byte{1, 2, 3}, images[0].Data)
+}
+
+func TestResolveEnvelopeForRuntimeDoesNotExposeOriginalImagePath(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "diagram.png")
+	require.NoError(t, os.WriteFile(imagePath, []byte{1, 2, 3}, 0o644))
+	env := input.InputEnvelope{
+		Blocks: []input.InputBlock{
+			{Type: "text", Text: "analyze this"},
+			{Type: "image", Name: "diagram.png", MimeType: "image/png", Path: imagePath},
+		},
+	}
+
+	text, images := ResolveEnvelopeForRuntime(env)
+	assert.Equal(t, "analyze this\n[Image: diagram.png]", text)
+	assert.NotContains(t, text, imagePath)
+	require.Len(t, images, 1)
 	assert.Equal(t, []byte{1, 2, 3}, images[0].Data)
 }

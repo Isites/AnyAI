@@ -6,15 +6,14 @@ import (
 	"time"
 
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
-	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type stubChannelPort struct {
-	snapshot     []runtimeevents.EventRecord
-	live         <-chan runtimeevents.EventRecord
-	runs         map[string]runtimeevents.RunRecord
+	snapshot     []Event
+	live         <-chan Event
+	runs         map[string]Run
 	cancelCalled bool
 }
 
@@ -24,22 +23,22 @@ func (*stubChannelPort) EvaluateMessagePolicy(string, string, InboundMessage) Me
 	return MessagePolicyDecision{Accepted: true}
 }
 
-func (*stubChannelPort) ResolveIngressAgent(req runtimeport.IngressRequest) string {
+func (*stubChannelPort) ResolveIngressAgent(req IngressRequest) string {
 	return req.RequestedID
 }
 
-func (*stubChannelPort) StartIngressRun(context.Context, runtimeport.IngressRequest) (*runtimeport.ManagedRun, error) {
+func (*stubChannelPort) StartIngressRun(context.Context, IngressRequest) (*ManagedRun, error) {
 	return nil, nil
 }
 
-func (s *stubChannelPort) SubscribeRunTreeReplay(string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
-	snapshot := append([]runtimeevents.EventRecord(nil), s.snapshot...)
+func (s *stubChannelPort) SubscribeRunTreeReplay(string) ([]Event, <-chan Event, func(), error) {
+	snapshot := append([]Event(nil), s.snapshot...)
 	return snapshot, s.live, func() { s.cancelCalled = true }, nil
 }
 
-func (s *stubChannelPort) GetRun(runID string) (runtimeevents.RunRecord, bool) {
+func (s *stubChannelPort) GetRun(runID string) (Run, bool) {
 	if s == nil || s.runs == nil {
-		return runtimeevents.RunRecord{}, false
+		return Run{}, false
 	}
 	run, ok := s.runs[runID]
 	return run, ok
@@ -47,8 +46,8 @@ func (s *stubChannelPort) GetRun(runID string) (runtimeevents.RunRecord, bool) {
 
 func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 	now := time.Now().UTC()
-	live := make(chan runtimeevents.EventRecord, 1)
-	live <- runtimeevents.EventRecord{
+	live := make(chan Event, 1)
+	live <- Event{
 		Name:      runtimeevents.EventRunCompleted,
 		RunID:     "run_root",
 		AgentID:   "worker",
@@ -59,7 +58,7 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 	close(live)
 
 	port := &stubChannelPort{
-		snapshot: []runtimeevents.EventRecord{
+		snapshot: []Event{
 			{
 				Name:      runtimeevents.EventRunStarted,
 				RunID:     "run_root",
@@ -78,7 +77,7 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 			},
 		},
 		live: live,
-		runs: map[string]runtimeevents.RunRecord{
+		runs: map[string]Run{
 			"run_root": {
 				ID:      "run_root",
 				AgentID: "lead",
@@ -91,7 +90,7 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := dispatch.forwardRunTree(ctx, mock, &runtimeport.ManagedRun{
+	done := dispatch.forwardRunTree(ctx, mock, &ManagedRun{
 		RunID:   "run_root",
 		AgentID: "lead",
 	})
@@ -120,20 +119,20 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 func TestChannelResponseBufferUsesOnlyPostToolAssistantText(t *testing.T) {
 	tests := []struct {
 		name   string
-		events []runtimeevents.EventRecord
+		events []Event
 		want   string
 	}{
 		{
 			name: "direct response",
-			events: []runtimeevents.EventRecord{
+			events: []Event{
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "hello "}},
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "world"}},
 			},
-			want: "helloworld",
+			want: "hello world",
 		},
 		{
 			name: "tool clears progress",
-			events: []runtimeevents.EventRecord{
+			events: []Event{
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "I will inspect."}},
 				{Name: runtimeevents.EventToolCallStarted, Payload: map[string]any{"tool": "read_file"}},
 				{Name: runtimeevents.EventToolCompleted, Payload: map[string]any{"tool": "read_file"}},
@@ -142,7 +141,7 @@ func TestChannelResponseBufferUsesOnlyPostToolAssistantText(t *testing.T) {
 		},
 		{
 			name: "post tool final response",
-			events: []runtimeevents.EventRecord{
+			events: []Event{
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "I will inspect."}},
 				{Name: runtimeevents.EventToolCompleted, Payload: map[string]any{"tool": "read_file"}},
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "Done."}},
@@ -151,22 +150,12 @@ func TestChannelResponseBufferUsesOnlyPostToolAssistantText(t *testing.T) {
 		},
 		{
 			name: "completion tool preserves final response",
-			events: []runtimeevents.EventRecord{
+			events: []Event{
 				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "Done."}},
 				{Name: runtimeevents.EventToolCallStarted, Payload: map[string]any{"tool": "goal_complete"}},
 				{Name: runtimeevents.EventToolCompleted, Payload: map[string]any{"tool": "goal_complete"}},
 			},
 			want: "Done.",
-		},
-		{
-			name: "save output preserves report response",
-			events: []runtimeevents.EventRecord{
-				{Name: runtimeevents.EventTextDelta, Payload: map[string]any{"text": "# Report"}},
-				{Name: runtimeevents.EventToolCallStarted, Payload: map[string]any{"tool": "save_output"}},
-				{Name: runtimeevents.EventToolCompleted, Payload: map[string]any{"tool": "save_output"}},
-				{Name: runtimeevents.EventToolFanoutComplete},
-			},
-			want: "# Report",
 		},
 	}
 

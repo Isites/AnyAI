@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	runtimesessionstate "github.com/Isites/anyai/internal/runtime/session/state"
 	"github.com/Isites/anyai/internal/runtime/skill"
 	"github.com/Isites/anyai/internal/runtime/task"
+	runtimetaskbuiltin "github.com/Isites/anyai/internal/runtime/task/builtin"
 	tools "github.com/Isites/anyai/internal/runtime/tool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,16 +35,19 @@ type mockLLMProvider struct {
 
 	autoGoalFinalize bool
 	autoGoalSeq      int
+	autoGoalComplete bool
 }
 
 func (m *mockLLMProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
-	if events, ok := autoGoalCompletionResponse(req, m.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		ch := make(chan llm.ChatEvent, len(events))
-		for _, e := range events {
-			ch <- e
+	if m.autoGoalComplete {
+		if events, ok := autoGoalCompletionResponse(req, m.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			ch := make(chan llm.ChatEvent, len(events))
+			for _, e := range events {
+				ch <- e
+			}
+			close(ch)
+			return ch, nil
 		}
-		close(ch)
-		return ch, nil
 	}
 	ch := make(chan llm.ChatEvent, len(m.events))
 	for _, e := range m.events {
@@ -71,16 +77,19 @@ type capturingLLMProvider struct {
 	compactRequests  []llm.CompactRequest
 	autoGoalFinalize bool
 	autoGoalSeq      int
+	autoGoalComplete bool
 }
 
 func (m *capturingLLMProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
-	if events, ok := autoGoalCompletionResponse(req, m.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		ch := make(chan llm.ChatEvent, len(events))
-		for _, e := range events {
-			ch <- e
+	if m.autoGoalComplete {
+		if events, ok := autoGoalCompletionResponse(req, m.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			ch := make(chan llm.ChatEvent, len(events))
+			for _, e := range events {
+				ch <- e
+			}
+			close(ch)
+			return ch, nil
 		}
-		close(ch)
-		return ch, nil
 	}
 
 	m.mu.Lock()
@@ -154,16 +163,19 @@ type scriptedLLMProvider struct {
 	requests         []llm.ChatRequest
 	autoGoalFinalize bool
 	autoGoalSeq      int
+	autoGoalComplete bool
 }
 
 func (m *scriptedLLMProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
-	if events, ok := autoGoalCompletionResponse(req, nil, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		ch := make(chan llm.ChatEvent, len(events))
-		for _, e := range events {
-			ch <- e
+	if m.autoGoalComplete {
+		if events, ok := autoGoalCompletionResponse(req, nil, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			ch := make(chan llm.ChatEvent, len(events))
+			for _, e := range events {
+				ch <- e
+			}
+			close(ch)
+			return ch, nil
 		}
-		close(ch)
-		return ch, nil
 	}
 
 	m.mu.Lock()
@@ -172,9 +184,11 @@ func (m *scriptedLLMProvider) ChatStream(ctx context.Context, req llm.ChatReques
 		idx = len(m.outcomes) - 1
 	}
 	outcome := m.outcomes[idx]
-	if events, ok := autoGoalCompletionResponse(req, outcome.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		m.mu.Unlock()
-		return staticEventStream(events), nil
+	if m.autoGoalComplete {
+		if events, ok := autoGoalCompletionResponse(req, outcome.events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			m.mu.Unlock()
+			return staticEventStream(events), nil
+		}
 	}
 	m.requests = append(m.requests, req)
 	m.idx++
@@ -204,6 +218,57 @@ func (m *scriptedLLMProvider) Requests() []llm.ChatRequest {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]llm.ChatRequest(nil), m.requests...)
+}
+
+func sessionEntryRuntimeControlText(t *testing.T, entry session.SessionEntry) (string, bool) {
+	t.Helper()
+	switch entry.Type {
+	case session.EntryTypeRuntimeControl:
+		var data session.RuntimeControlData
+		require.NoError(t, json.Unmarshal(entry.Data, &data))
+		return data.Text, strings.TrimSpace(data.Text) != ""
+	case session.EntryTypeMessage:
+		if entry.Role != "user" {
+			return "", false
+		}
+		var data session.MessageData
+		require.NoError(t, json.Unmarshal(entry.Data, &data))
+		if !session.IsRuntimeControlText(data.Text) {
+			return "", false
+		}
+		return data.Text, true
+	default:
+		return "", false
+	}
+}
+
+func sessionHasRuntimeControlText(t *testing.T, history []session.SessionEntry, substrings ...string) bool {
+	t.Helper()
+	for _, entry := range history {
+		text, ok := sessionEntryRuntimeControlText(t, entry)
+		if !ok {
+			continue
+		}
+		matched := true
+		for _, expected := range substrings {
+			if !strings.Contains(text, expected) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func requestMessagesText(messages []llm.Message) string {
+	parts := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		parts = append(parts, msg.Role+": "+msg.Content)
+	}
+	return strings.Join(parts, "\n")
 }
 
 // --- assembleSystemPrompt tests ---
@@ -332,20 +397,22 @@ func TestBuildDefaultIdentityCallAgentHintsNaturalLanguageWorkflow(t *testing.T)
 	assert.Contains(t, result, "write the final integrated user-facing answer")
 }
 
-func TestBuildDefaultIdentitySaveOutputHint(t *testing.T) {
-	result := buildCapabilitySection([]string{"save_output"})
-	assert.Contains(t, result, "most recent assistant message")
-	assert.Contains(t, result, "long reports")
+func TestBuildDefaultIdentityWriteFileHint(t *testing.T) {
+	result := buildCapabilitySection([]string{"write_file"})
+	assert.Contains(t, result, "Codex-style")
+	assert.Contains(t, result, "expected_offset")
 }
 
 func TestBuildCapabilitySectionGuidesFailureRecoveryAndPathHandling(t *testing.T) {
 	contract := buildContractSection()
-	result := buildCapabilitySection([]string{"read_file", "bash", "save_output"})
+	result := buildCapabilitySection([]string{"read_file", "bash", "write_file"})
 	assert.Contains(t, contract, "When a tool call fails")
 	assert.Contains(t, contract, "relative paths resolve from your agent workspace")
 	assert.Contains(t, contract, "Python script")
-	assert.Contains(t, contract, "call save_output immediately")
 	assert.Contains(t, result, "not directory listings")
+	assert.Contains(t, result, "If an image is already attached")
+	assert.Contains(t, result, "inspect that image directly")
+	assert.Contains(t, result, "manageable chunks")
 }
 
 func TestBuildToolCallStyleSectionGuidesDirectExecutionAndRecovery(t *testing.T) {
@@ -395,7 +462,7 @@ func TestAssembleSystemPromptEnvironmentIncludesProjectWorkspaceAndRuntimeDirs(t
 			Name: "Context Analyst",
 		},
 		Tools: ToolSurface{
-			Names: []string{"read_file", "bash", "save_output"},
+			Names: []string{"read_file", "bash", "write_file"},
 		},
 		Environment: EnvironmentSurface{
 			ConfigPath:  "/repo/anyai.yaml",
@@ -407,7 +474,7 @@ func TestAssembleSystemPromptEnvironmentIncludesProjectWorkspaceAndRuntimeDirs(t
 	})
 	assert.Contains(t, result, "- Project root: /repo")
 	assert.Contains(t, result, "- Agent workspace: /repo/agents/context-analyst")
-	assert.Contains(t, result, "- Relative path base for file/bash/python/save_output tools: /repo/agents/context-analyst")
+	assert.Contains(t, result, "- Relative path base for file/bash/python tools: /repo/agents/context-analyst")
 	assert.Contains(t, result, "- Runtime data directory: /repo/anyai")
 	assert.Contains(t, result, "- Sessions directory: /repo/anyai/sessions")
 	assert.Contains(t, result, "- Memory directory: /repo/anyai/memory")
@@ -420,7 +487,7 @@ func TestAssembleSystemPromptIncludesAgentCallContractDetails(t *testing.T) {
 			Name: "Coder",
 		},
 		Tools: ToolSurface{
-			Names: []string{"read_file", "save_output", "callagent"},
+			Names: []string{"read_file", "write_file", "callagent"},
 		},
 		Collaboration: CollaborationSurface{
 			RunMode:         "agent_call",
@@ -510,6 +577,20 @@ func TestAssembleMessagesUserAndAssistant(t *testing.T) {
 	assert.Equal(t, "hello", msgs[0].Content)
 	assert.Equal(t, "assistant", msgs[1].Role)
 	assert.Equal(t, "hi there", msgs[1].Content)
+}
+
+func TestAssembleMessagesSkipsRuntimeControlEntries(t *testing.T) {
+	history := []session.SessionEntry{
+		session.UserMessageEntry("first user request"),
+		session.RuntimeControlEntry(runtimeControlKindGoalCompletion, "[Runtime goal continuation]\nCall `goal_complete` now instead of ending silently."),
+		session.UserMessageEntry("[Runtime goal continuation]\nlegacy control prompt"),
+		session.UserMessageEntry("second user request"),
+	}
+
+	msgs := assembleMessages(history)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "first user request", msgs[0].Content)
+	assert.Equal(t, "second user request", msgs[1].Content)
 }
 
 func TestAssembleMessagesToolCallAndResult(t *testing.T) {
@@ -767,7 +848,7 @@ func TestRuntimeRunSettlesQuietlyForEmptyCompletion(t *testing.T) {
 	assert.Equal(t, "user", history[0].Role)
 }
 
-func TestRuntimeRunAutoCompletesSettledGoalAfterEmptyTurn(t *testing.T) {
+func TestRuntimeRunFailsAfterRepeatedEmptyGoalCompletionTurns(t *testing.T) {
 	callCount := 0
 	sess := session.NewSession("test-agent", "test-key")
 	stateStore := runtimesessionstate.NewStateStore(sess, nil, runtimeevents.RunRecord{
@@ -792,6 +873,94 @@ func TestRuntimeRunAutoCompletesSettledGoalAfterEmptyTurn(t *testing.T) {
 			{
 				{Type: llm.EventDone},
 			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	reg := tools.NewRegistry()
+	reg.Register(&tools.TodoTool{Store: stateStore})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	text, err := rt.RunSync(context.Background(), "finish the task", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty responses after runtime requested explicit goal_complete")
+	assert.Empty(t, text)
+	assert.Equal(t, 4, callCount)
+
+	todos := stateStore.ListTodos(context.Background())
+	require.Len(t, todos, 1)
+	assert.Equal(t, "completed", todos[0].Status)
+
+	var acceptedCompletion bool
+	for _, entry := range sess.History() {
+		switch entry.Type {
+		case session.EntryTypeToolResult:
+			var data session.ToolResultData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			if strings.Contains(data.Output, "marked as completed") {
+				acceptedCompletion = true
+			}
+		}
+	}
+	assert.True(t, sessionHasRuntimeControlText(t, sess.History(),
+		"[Runtime goal continuation]",
+		"Call `goal_complete` now instead of ending silently.",
+	))
+	assert.False(t, acceptedCompletion)
+}
+
+func TestRuntimeRunCompletesWithExplicitGoalCompleteAfterPrompt(t *testing.T) {
+	callCount := 0
+	sess := session.NewSession("test-agent", "test-key")
+	stateStore := runtimesessionstate.NewStateStore(sess, nil, runtimeevents.RunRecord{
+		ID:        "run_explicit_finalize",
+		AgentID:   "test-agent",
+		SessionID: "test-key",
+	})
+	todoID := stateStore.AddTodo(context.Background(), "Close the runtime todo")
+	require.NotEmpty(t, todoID)
+
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_todo", Name: "todo"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_todo",
+					Name:  "todo",
+					Input: json.RawMessage(`{"action":"complete","item":"` + todoID + `"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_goal_done", Name: "goal_complete"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_goal_done",
+					Name:  "goal_complete",
+					Input: json.RawMessage(`{}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "Goal is complete."},
+				{Type: llm.EventDone},
+			},
 		},
 		callCount: &callCount,
 	}
@@ -810,38 +979,261 @@ func TestRuntimeRunAutoCompletesSettledGoalAfterEmptyTurn(t *testing.T) {
 
 	text, err := rt.RunSync(context.Background(), "finish the task", nil)
 	require.NoError(t, err)
-	assert.Empty(t, text)
-	assert.Equal(t, 2, callCount)
+	assert.Equal(t, "Goal is complete.", text)
+	assert.Equal(t, 4, callCount)
 
-	todos := stateStore.ListTodos(context.Background())
-	require.Len(t, todos, 1)
-	assert.Equal(t, "completed", todos[0].Status)
-
-	var sawCompletionPrompt bool
 	var acceptedCompletion bool
 	for _, entry := range sess.History() {
 		switch entry.Type {
-		case session.EntryTypeMessage:
-			if entry.Role != "user" {
-				continue
-			}
-			var data session.MessageData
-			require.NoError(t, json.Unmarshal(entry.Data, &data))
-			if strings.Contains(data.Text, "[Runtime goal continuation]") &&
-				strings.Contains(data.Text, "Call `goal_complete` now instead of ending silently.") {
-				sawCompletionPrompt = true
-			}
 		case session.EntryTypeToolResult:
 			var data session.ToolResultData
 			require.NoError(t, json.Unmarshal(entry.Data, &data))
-			if data.ToolCallID == "tc_auto_goal_complete_1" &&
+			if data.ToolCallID == "tc_goal_done" &&
 				strings.Contains(data.Output, "marked as completed") {
 				acceptedCompletion = true
 			}
 		}
 	}
-	assert.True(t, sawCompletionPrompt)
+	assert.True(t, sessionHasRuntimeControlText(t, sess.History(),
+		"[Runtime goal continuation]",
+		"Call `goal_complete` now instead of ending silently.",
+	))
+	assert.True(t, sessionHasRuntimeControlText(t, sess.History(), "[Runtime visible reply required]"))
 	assert.True(t, acceptedCompletion)
+}
+
+func TestRuntimeRunInjectsCurrentRuntimeControlOnlyOnce(t *testing.T) {
+	callCount := 0
+	sess := session.NewSession("test-agent", "test-key")
+	stateStore := runtimesessionstate.NewStateStore(sess, nil, runtimeevents.RunRecord{
+		ID:        "run_inject_control",
+		AgentID:   "test-agent",
+		SessionID: "test-key",
+	})
+	todoID := stateStore.AddTodo(context.Background(), "Close the runtime todo")
+	require.NotEmpty(t, todoID)
+
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_todo", Name: "todo"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_todo",
+					Name:  "todo",
+					Input: json.RawMessage(`{"action":"complete","item":"` + todoID + `"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "finished"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	reg := tools.NewRegistry()
+	reg.Register(&tools.TodoTool{Store: stateStore})
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	text, err := rt.RunSync(context.Background(), "finish the task", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires explicit goal_complete")
+	assert.Equal(t, "finished", text)
+
+	requests := provider.Requests()
+	require.Len(t, requests, 3)
+	assert.NotContains(t, requestMessagesText(requests[1].Messages), "[Runtime goal continuation]")
+	require.NotEmpty(t, requests[2].Messages)
+	assert.Equal(t, llm.MessageRoleRuntime, requests[2].Messages[len(requests[2].Messages)-1].Role)
+	assert.Contains(t, requests[2].Messages[len(requests[2].Messages)-1].Content, "[Runtime goal continuation]")
+}
+
+func TestRuntimeRunDoesNotReplayLegacyRuntimeControlFromPreviousRun(t *testing.T) {
+	sess := session.NewSession("test-agent", "shared-session")
+	sess.Append(session.ApplyEntryRefs(
+		session.UserMessageEntry("previous request"),
+		session.EntryRefs{RunID: "run_previous"},
+	))
+	sess.Append(session.ApplyEntryRefs(
+		session.UserMessageEntry("[Runtime goal continuation]\nCall `goal_complete` now instead of ending silently."),
+		session.EntryRefs{RunID: "run_previous"},
+	))
+
+	provider := &capturingLLMProvider{
+		events: []llm.ChatEvent{
+			{Type: llm.EventDone},
+		},
+	}
+	reg := tools.NewRegistry()
+	reg.Register(&capturingTool{name: "goal_complete", result: tools.ToolResult{Output: "should not be called"}})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  3,
+	}
+	ctx := tools.WithRuntimeContext(context.Background(), tools.RuntimeContext{
+		RunID:     "run_current",
+		SessionID: "shared-session",
+	})
+	text, err := rt.RunSync(ctx, "new request", nil)
+	require.NoError(t, err)
+	assert.Empty(t, text)
+
+	requests := provider.Requests()
+	require.Len(t, requests, 1)
+	joined := requestMessagesText(requests[0].Messages)
+	assert.NotContains(t, joined, "Call `goal_complete` now instead of ending silently.")
+	assert.Contains(t, joined, "new request")
+
+	focus := deriveRequestFocus(sess.History(), "fallback")
+	assert.Equal(t, "new request", focus.CurrentRequest)
+}
+
+func TestRuntimeRunFailsWhenModelRepliesWithoutCompletionToolAfterGoalPrompt(t *testing.T) {
+	callCount := 0
+	sess := session.NewSession("test-agent", "test-key")
+	stateStore := runtimesessionstate.NewStateStore(sess, nil, runtimeevents.RunRecord{
+		ID:        "run_text_finalize",
+		AgentID:   "test-agent",
+		SessionID: "test-key",
+	})
+	todoID := stateStore.AddTodo(context.Background(), "Close the runtime todo")
+	require.NotEmpty(t, todoID)
+
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_todo", Name: "todo"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_todo",
+					Name:  "todo",
+					Input: json.RawMessage(`{"action":"complete","item":"` + todoID + `"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "finished"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	reg := tools.NewRegistry()
+	reg.Register(&tools.TodoTool{Store: stateStore})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	text, err := rt.RunSync(context.Background(), "finish the task", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires explicit goal_complete or await_user_input")
+	assert.Equal(t, "finished", text)
+	assert.Equal(t, 3, callCount)
+}
+
+func TestRuntimeRunStopsWithAwaitUserInputAfterGoalPrompt(t *testing.T) {
+	callCount := 0
+	sess := session.NewSession("test-agent", "test-key")
+	stateStore := runtimesessionstate.NewStateStore(sess, nil, runtimeevents.RunRecord{
+		ID:        "run_await_prompt",
+		AgentID:   "test-agent",
+		SessionID: "test-key",
+	})
+	todoID := stateStore.AddTodo(context.Background(), "Close the runtime todo")
+	require.NotEmpty(t, todoID)
+
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_todo", Name: "todo"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_todo",
+					Name:  "todo",
+					Input: json.RawMessage(`{"action":"complete","item":"` + todoID + `"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_await", Name: "await_user_input"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_await",
+					Name:  "await_user_input",
+					Input: json.RawMessage(`{"message":"Please choose option A or B."}`),
+				}},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	reg := tools.NewRegistry()
+	reg.Register(&tools.TodoTool{Store: stateStore})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+	ctx := tools.WithRuntimeContext(context.Background(), tools.RuntimeContext{RunID: "run_await_prompt"})
+	text, err := rt.RunSync(ctx, "finish the task", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "Please choose option A or B.", text)
+	assert.Equal(t, 3, callCount)
+
+	goal, ok := rt.GoalRuntime.GetGoal(task.GoalID("run_await_prompt"))
+	require.True(t, ok)
+	require.NotNil(t, goal)
+	assert.Equal(t, task.GoalStateAwaitingInput, goal.State)
+	assert.Equal(t, "Please choose option A or B.", goal.AwaitingInputMessage)
+
+	var sawAwaitResult bool
+	for _, entry := range sess.History() {
+		switch entry.Type {
+		case session.EntryTypeToolResult:
+			var data session.ToolResultData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			if data.ToolCallID == "tc_await" &&
+				strings.Contains(data.Output, "awaiting user input") {
+				sawAwaitResult = true
+			}
+		}
+	}
+	assert.True(t, sessionHasRuntimeControlText(t, sess.History(),
+		"[Runtime goal continuation]",
+		"Call `goal_complete` now instead of ending silently.",
+	))
+	assert.True(t, sawAwaitResult)
 }
 
 func TestRuntimeRunRetriesLLMRequestFailure(t *testing.T) {
@@ -1002,6 +1394,266 @@ func TestRuntimeRunWithToolCalls(t *testing.T) {
 
 	assert.True(t, gotToolResult, "should have received tool result")
 	assert.True(t, gotDone, "should have received done event")
+}
+
+func TestRuntimeRunUsesBrowserToolToAnalyzeLocalhost3000(t *testing.T) {
+	resp, err := http.Get("http://localhost:3000/")
+	if err != nil {
+		t.Skipf("localhost:3000 is not running for browser integration test: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		t.Skipf("localhost:3000 returned %s", resp.Status)
+	}
+
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_browser", Name: "browser"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_browser",
+					Name:  "browser",
+					Input: json.RawMessage(`{"action":"get_text","url":"http://localhost:3000/","selector":"body","timeout":30}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "已通过 browser 打开 localhost:3000，并根据页面 HTML 分析出页面包含 game-container、canvas 或脚本入口等内容。"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "browser-localhost")
+	reg := tools.NewRegistry()
+	reg.Register(&tools.BrowserTool{})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	events, err := rt.Run(context.Background(), "打开 http://localhost:3000/ 并分析页面内容", nil)
+	require.NoError(t, err)
+	var final strings.Builder
+	var browserOutput string
+	for event := range events {
+		switch event.Type {
+		case EventToolResult:
+			if event.ToolCall != nil && event.ToolCall.Name == "browser" && event.Result != nil {
+				browserOutput = event.Result.Output
+			}
+		case EventTextDelta:
+			final.WriteString(event.Text)
+		case EventError:
+			t.Fatalf("unexpected browser run error: %v", event.Error)
+		}
+	}
+
+	require.NotEmpty(t, strings.TrimSpace(browserOutput))
+	assert.True(t,
+		strings.Contains(browserOutput, "<") ||
+			strings.Contains(browserOutput, "canvas") ||
+			strings.Contains(browserOutput, "script") ||
+			strings.Contains(browserOutput, "body"),
+		"expected browser output to include page markup/content, got %q", browserOutput,
+	)
+	assert.Contains(t, final.String(), "browser")
+	assert.Contains(t, final.String(), "localhost:3000")
+
+	requests := provider.Requests()
+	require.Len(t, requests, 2)
+	assert.Equal(t, browserOutput, toolResultContentForTest(requests[1].Messages, "tc_browser"))
+}
+
+func TestRuntimeRunKeepsBrowserPageAcrossModelTurns(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <head><title>Runtime Browser State</title></head>
+  <body>
+    <h1 id="headline">Persistent Browser Page</h1>
+    <script>
+      window.anyaiState = {value: "kept-across-turns"};
+    </script>
+  </body>
+</html>`))
+	}))
+	defer server.Close()
+
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_nav", Name: "browser"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_nav",
+					Name:  "browser",
+					Input: json.RawMessage(fmt.Sprintf(`{"action":"navigate","url":%q}`, server.URL)),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_eval", Name: "browser"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_eval",
+					Name:  "browser",
+					Input: json.RawMessage(`{"action":"evaluate","script":"({title: document.title, headline: document.querySelector('#headline').textContent, state: window.anyaiState.value})"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "browser page stayed available across turns"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "browser-continuous")
+	reg := tools.NewRegistry()
+	reg.Register(&tools.BrowserTool{})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	events, err := rt.Run(context.Background(), "open the page and inspect it twice", nil)
+	require.NoError(t, err)
+	var navOutput string
+	var evalOutput string
+	var final strings.Builder
+	for event := range events {
+		switch event.Type {
+		case EventToolResult:
+			if event.ToolCall == nil || event.Result == nil {
+				continue
+			}
+			switch event.ToolCall.ID {
+			case "tc_nav":
+				navOutput = event.Result.Output
+			case "tc_eval":
+				evalOutput = event.Result.Output
+			}
+		case EventTextDelta:
+			final.WriteString(event.Text)
+		case EventError:
+			t.Fatalf("unexpected browser run error: %v", event.Error)
+		}
+	}
+
+	assert.Contains(t, navOutput, "Runtime Browser State")
+	assert.Contains(t, evalOutput, "Runtime Browser State")
+	assert.Contains(t, evalOutput, "Persistent Browser Page")
+	assert.Contains(t, evalOutput, "kept-across-turns")
+	assert.Contains(t, final.String(), "browser page stayed available")
+
+	requests := provider.Requests()
+	require.Len(t, requests, 3)
+	assert.Contains(t, toolResultContentForTest(requests[2].Messages, "tc_eval"), "kept-across-turns")
+}
+
+func TestRuntimeRunKeepsBrowserPageAcrossToolCallsInSameTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <head><title>Browser Batch State</title></head>
+  <body>
+    <h1 id="headline">Sequential Browser Batch</h1>
+    <script>
+      window.anyaiBatchState = "same-turn-state";
+    </script>
+  </body>
+</html>`))
+	}))
+	defer server.Close()
+
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_nav", Name: "browser"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_nav",
+					Name:  "browser",
+					Input: json.RawMessage(fmt.Sprintf(`{"action":"navigate","url":%q}`, server.URL)),
+				}},
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_eval", Name: "browser"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_eval",
+					Name:  "browser",
+					Input: json.RawMessage(`{"action":"evaluate","script":"({title: document.title, headline: document.querySelector('#headline').textContent, state: window.anyaiBatchState})"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "browser batch stayed ordered"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "browser-same-turn")
+	reg := tools.NewRegistry()
+	reg.Register(&tools.BrowserTool{})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  4,
+	}
+
+	events, err := rt.Run(context.Background(), "open and inspect in one turn", nil)
+	require.NoError(t, err)
+	var evalOutput string
+	var final strings.Builder
+	var fanout *ToolFanoutInfo
+	for event := range events {
+		switch event.Type {
+		case EventToolResult:
+			if event.ToolCall != nil && event.ToolCall.ID == "tc_eval" && event.Result != nil {
+				evalOutput = event.Result.Output
+			}
+		case EventToolFanoutCompleted:
+			fanout = event.ToolFanout
+		case EventTextDelta:
+			final.WriteString(event.Text)
+		case EventError:
+			t.Fatalf("unexpected browser run error: %v", event.Error)
+		}
+	}
+
+	assert.Contains(t, evalOutput, "Browser Batch State")
+	assert.Contains(t, evalOutput, "Sequential Browser Batch")
+	assert.Contains(t, evalOutput, "same-turn-state")
+	assert.Contains(t, final.String(), "browser batch stayed ordered")
+	require.NotNil(t, fanout)
+	require.Len(t, fanout.Calls, 2)
+	assert.Equal(t, "tc_nav", fanout.Calls[0].ID)
+	assert.Equal(t, "tc_eval", fanout.Calls[1].ID)
+	assert.Less(t, fanout.Calls[0].StartedOrder, fanout.Calls[1].StartedOrder)
+	assert.Less(t, fanout.Calls[0].CompletedOrder, fanout.Calls[1].CompletedOrder)
+
+	requests := provider.Requests()
+	require.Len(t, requests, 2)
+	assert.Contains(t, toolResultContentForTest(requests[1].Messages, "tc_eval"), "same-turn-state")
 }
 
 func TestRuntimeRunExecutesParallelSafeToolsWithFanoutAndStableSessionOrder(t *testing.T) {
@@ -1188,6 +1840,91 @@ func TestRuntimeRunRoutesToolCallsThroughTaskRuntime(t *testing.T) {
 	assert.Equal(t, "hello", tasks[0].Summary)
 }
 
+func TestRuntimeRunExecutesOriginalWriteFileInputWhilePersistingSummary(t *testing.T) {
+	dir := t.TempDir()
+	longContent := strings.Repeat("0123456789", 80)
+	input, err := json.Marshal(map[string]any{
+		"path":    "large.txt",
+		"content": longContent,
+	})
+	require.NoError(t, err)
+
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_write", Name: "write_file"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_write",
+					Name:  "write_file",
+					Input: input,
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "done"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "test-key")
+	reg := tools.NewRegistry()
+	reg.Register(&tools.WriteFileTool{WorkDir: dir})
+
+	recorder := runtimeevents.NewRecorder()
+	taskStore := task.NewStore(task.WithEventAppender(recorder.AppendEvent))
+	registry := task.NewExecutorRegistry()
+	require.NoError(t, registry.Register(task.KindTool, runtimetaskbuiltin.NewToolExecutor(reg)))
+
+	taskRuntime := task.NewRuntime(taskStore, registry)
+	taskRuntime.SetEventAppender(recorder.AppendEvent)
+
+	rt := &Runtime{
+		LLM:         provider,
+		Tools:       reg,
+		Session:     sess,
+		Model:       "mock-model",
+		Workspace:   dir,
+		MaxTurns:    4,
+		TaskRuntime: taskRuntime,
+	}
+
+	events, err := rt.Run(context.Background(), "write file", nil)
+	require.NoError(t, err)
+	for event := range events {
+		if event.Type == EventError {
+			t.Fatalf("unexpected error: %v", event.Error)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "large.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, longContent, string(data))
+
+	var storedInput string
+	for _, entry := range sess.History() {
+		if entry.Type != session.EntryTypeToolCall {
+			continue
+		}
+		var data session.ToolCallData
+		require.NoError(t, json.Unmarshal(entry.Data, &data))
+		if data.ID == "tc_write" {
+			storedInput = string(data.Input)
+		}
+	}
+	require.NotEmpty(t, storedInput)
+	assert.Contains(t, storedInput, "content_bytes")
+	assert.Contains(t, storedInput, "content omitted")
+	assert.NotContains(t, storedInput, longContent)
+
+	tasks := taskStore.ListAll()
+	require.Len(t, tasks, 1)
+	assert.Contains(t, tasks[0].Input, "content_bytes")
+	assert.NotContains(t, tasks[0].Input, longContent)
+}
+
 func TestRuntimeRunRoutesBashThroughProcessTask(t *testing.T) {
 	callCount := 0
 	provider := &statefulMockLLMProvider{
@@ -1197,7 +1934,7 @@ func TestRuntimeRunRoutesBashThroughProcessTask(t *testing.T) {
 				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
 					ID:    "tc_1",
 					Name:  "bash",
-					Input: json.RawMessage(`{"command":"printf hello","timeout":1}`),
+					Input: json.RawMessage(`{"command":"if [ ! -f marker ]; then touch marker; echo 'dial tcp 127.0.0.1:9: connection refused' >&2; exit 1; fi; printf hello","timeout":5}`),
 				}},
 				{Type: llm.EventDone},
 			},
@@ -1220,7 +1957,7 @@ func TestRuntimeRunRoutesBashThroughProcessTask(t *testing.T) {
 	recorder := runtimeevents.NewRecorder()
 	taskStore := task.NewStore(task.WithEventAppender(recorder.AppendEvent))
 	registry := task.NewExecutorRegistry()
-	require.NoError(t, registry.Register(task.KindProcess, testProcessTaskExecutor{}))
+	require.NoError(t, registry.Register(task.KindProcess, runtimetaskbuiltin.NewProcessExecutor()))
 
 	taskRuntime := task.NewRuntime(taskStore, registry)
 	taskRuntime.SetEventAppender(recorder.AppendEvent)
@@ -1233,15 +1970,24 @@ func TestRuntimeRunRoutesBashThroughProcessTask(t *testing.T) {
 		Workspace:   workDir,
 		MaxTurns:    4,
 		TaskRuntime: taskRuntime,
+		ToolRecovery: ToolRecoveryConfig{
+			MaxAttempts:    2,
+			RetryBackoffMS: 1,
+		},
 	}
 
 	events, err := rt.Run(context.Background(), "run bash", nil)
 	require.NoError(t, err)
+	var sawRetry bool
 	for event := range events {
-		if event.Type == EventError {
+		switch event.Type {
+		case EventError:
 			t.Fatalf("unexpected error: %v", event.Error)
+		case EventToolRetry:
+			sawRetry = true
 		}
 	}
+	assert.True(t, sawRetry)
 
 	tasks := taskStore.ListAll()
 	require.Len(t, tasks, 1)
@@ -1249,6 +1995,12 @@ func TestRuntimeRunRoutesBashThroughProcessTask(t *testing.T) {
 	assert.Equal(t, task.StatusCompleted, tasks[0].Status)
 	assert.Equal(t, "bash", tasks[0].ProcessName)
 	assert.Equal(t, "hello", tasks[0].Summary)
+
+	result := mustToolResultDataForCall(t, sess.History(), "tc_1")
+	assert.Equal(t, "completed_after_retry", result.Metadata["decision"])
+	assert.Equal(t, float64(2), result.Metadata["attempt"])
+	assert.Equal(t, float64(2), result.Metadata["max_attempts"])
+	assert.Equal(t, float64(1), result.Metadata["retry_count"])
 }
 
 func TestRuntimeRunRoutesUpdatePlanThroughToolTaskRuntime(t *testing.T) {
@@ -1498,6 +2250,23 @@ func (e testProcessTaskExecutor) Kind() task.Kind {
 func (e testProcessTaskExecutor) Execute(ctx context.Context, record task.Record) (task.Result, error) {
 	switch strings.TrimSpace(record.ProcessName) {
 	case "bash":
+		call := llm.ToolCall{
+			ID:    metadataStringValue(record.Metadata, "tool_call_id"),
+			Name:  "bash",
+			Input: json.RawMessage(record.Input),
+		}
+		if call.ID == "" {
+			call.ID = record.ID
+		}
+		if exec := tools.TaskToolExecutionFromContext(ctx); exec != nil {
+			result, err := exec(ctx, call)
+			return task.Result{
+				Status:   task.StatusCompleted,
+				Summary:  result.Output,
+				Error:    result.Error,
+				Metadata: cloneTestMap(result.Metadata),
+			}, err
+		}
 		in, err := tools.ParseBashProcessInput(json.RawMessage(record.Input))
 		if err != nil {
 			return task.Result{Status: task.StatusFailed, Error: err.Error()}, nil
@@ -1634,6 +2403,73 @@ func TestRuntimeRunRetriesTransientToolFailure(t *testing.T) {
 	require.GreaterOrEqual(t, len(history), 3)
 	tr := mustLastToolResultData(t, history)
 	assert.Equal(t, "ok", tr.Output)
+	assert.Equal(t, float64(1), tr.Metadata["retry_count"])
+	assert.Equal(t, "completed_after_retry", tr.Metadata["decision"])
+}
+
+func TestRuntimeRunRetriesTransientToolFailureWithDefaultRecovery(t *testing.T) {
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_1", Name: "web_search"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_1",
+					Name:  "web_search",
+					Input: json.RawMessage(`{"query":"anyai"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "searched"},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "test-key")
+	search := &sequenceTool{
+		name: "web_search",
+		results: []tools.ToolResult{
+			{Error: "search failed: context deadline exceeded"},
+			{Output: "ok"},
+		},
+	}
+	reg := tools.NewRegistry()
+	reg.Register(search)
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	events, err := rt.Run(context.Background(), "search once", nil)
+	require.NoError(t, err)
+
+	var gotToolRetry bool
+	for e := range events {
+		switch e.Type {
+		case EventToolRetry:
+			gotToolRetry = true
+			require.NotNil(t, e.ToolRetry)
+			assert.Equal(t, "web_search", e.ToolRetry.ToolName)
+			assert.Equal(t, 2, e.ToolRetry.Attempt)
+			assert.Equal(t, "timeout", e.ToolRetry.ErrorClass)
+		case EventError:
+			t.Fatalf("unexpected error: %v", e.Error)
+		}
+	}
+
+	assert.True(t, gotToolRetry)
+	assert.Equal(t, 2, search.Calls())
+	tr := mustLastToolResultData(t, sess.History())
+	assert.Equal(t, "ok", tr.Output)
+	assert.Equal(t, float64(2), tr.Metadata["max_attempts"])
 	assert.Equal(t, float64(1), tr.Metadata["retry_count"])
 	assert.Equal(t, "completed_after_retry", tr.Metadata["decision"])
 }
@@ -2257,23 +3093,8 @@ func TestRuntimeRunContinuesWhenGoalStillHasOpenTodos(t *testing.T) {
 	assert.Equal(t, "completed", todos[0].Status)
 
 	history := sess.History()
-	var sawContinuation bool
-	var sawTodoContinuation bool
-	for _, entry := range history {
-		if entry.Type != session.EntryTypeMessage || entry.Role != "user" {
-			continue
-		}
-		var data session.MessageData
-		require.NoError(t, json.Unmarshal(entry.Data, &data))
-		if strings.Contains(data.Text, "[Runtime goal continuation]") {
-			sawContinuation = true
-			if strings.Contains(data.Text, todoID) {
-				sawTodoContinuation = true
-			}
-		}
-	}
-	assert.True(t, sawContinuation)
-	assert.True(t, sawTodoContinuation)
+	assert.True(t, sessionHasRuntimeControlText(t, history, "[Runtime goal continuation]"))
+	assert.True(t, sessionHasRuntimeControlText(t, history, "[Runtime goal continuation]", todoID))
 }
 
 func TestRuntimeRunAutoCompletesAfterVisibleReplyFollowingToolWork(t *testing.T) {
@@ -2298,8 +3119,7 @@ func TestRuntimeRunAutoCompletesAfterVisibleReplyFollowingToolWork(t *testing.T)
 	}
 
 	sess := session.NewSession("test-agent", "test-key")
-	reg := tools.NewRegistry()
-	reg.Register(&capturingTool{
+	reg := newStaticExecutor(&capturingTool{
 		name:   "read_file",
 		result: tools.ToolResult{Output: "README contents"},
 	})
@@ -2330,20 +3150,9 @@ func TestRuntimeRunAutoCompletesAfterVisibleReplyFollowingToolWork(t *testing.T)
 	assert.Equal(t, 2, callCount)
 
 	history := sess.History()
-	var sawCompletionPrompt bool
 	var acceptedCompletion bool
 	for _, entry := range history {
 		switch entry.Type {
-		case session.EntryTypeMessage:
-			if entry.Role != "user" {
-				continue
-			}
-			var data session.MessageData
-			require.NoError(t, json.Unmarshal(entry.Data, &data))
-			if strings.Contains(data.Text, "[Runtime goal continuation]") &&
-				strings.Contains(data.Text, "Call `goal_complete` now instead of ending silently.") {
-				sawCompletionPrompt = true
-			}
 		case session.EntryTypeToolResult:
 			var data session.ToolResultData
 			require.NoError(t, json.Unmarshal(entry.Data, &data))
@@ -2353,8 +3162,108 @@ func TestRuntimeRunAutoCompletesAfterVisibleReplyFollowingToolWork(t *testing.T)
 			}
 		}
 	}
-	assert.False(t, sawCompletionPrompt)
+	assert.False(t, sessionHasRuntimeControlText(t, history,
+		"[Runtime goal continuation]",
+		"Call `goal_complete` now instead of ending silently.",
+	))
 	assert.False(t, acceptedCompletion)
+}
+
+func TestRuntimeRunRequestsVisibleReplyAfterToolOnlyWork(t *testing.T) {
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_read", Name: "read_file"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_read",
+					Name:  "read_file",
+					Input: json.RawMessage(`{"path":"README.md"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventTextDelta, Text: "I read README.md and found the project summary."},
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "test-key")
+	reg := newStaticExecutor(&capturingTool{
+		name:   "read_file",
+		result: tools.ToolResult{Output: "README contents"},
+	})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	text, err := rt.RunSync(context.Background(), "inspect and summarize", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "I read README.md and found the project summary.", text)
+	assert.Equal(t, 3, callCount)
+
+	requests := provider.Requests()
+	require.Len(t, requests, 3)
+	require.NotEmpty(t, requests[2].Messages)
+	last := requests[2].Messages[len(requests[2].Messages)-1]
+	assert.Equal(t, llm.MessageRoleRuntime, last.Role)
+	assert.Contains(t, last.Content, "[Runtime visible reply required]")
+}
+
+func TestRuntimeRunFailsAfterRepeatedEmptyVisibleReplyRequest(t *testing.T) {
+	callCount := 0
+	provider := &statefulMockLLMProvider{
+		responses: [][]llm.ChatEvent{
+			{
+				{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_read", Name: "read_file"}},
+				{Type: llm.EventToolCallDone, ToolCall: &llm.ToolCall{
+					ID:    "tc_read",
+					Name:  "read_file",
+					Input: json.RawMessage(`{"path":"README.md"}`),
+				}},
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+			{
+				{Type: llm.EventDone},
+			},
+		},
+		callCount: &callCount,
+	}
+
+	sess := session.NewSession("test-agent", "test-key")
+	reg := newStaticExecutor(&capturingTool{
+		name:   "read_file",
+		result: tools.ToolResult{Output: "README contents"},
+	})
+
+	rt := &Runtime{
+		LLM:       provider,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	text, err := rt.RunSync(context.Background(), "inspect and summarize", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "visible reply")
+	assert.Empty(t, text)
+	assert.Equal(t, 3, callCount)
 }
 
 func TestRuntimeGoalCompleteToolRejectsUntilObjectiveWorkIsCleared(t *testing.T) {
@@ -2419,8 +3328,8 @@ func TestRuntimeGoalCompleteToolRejectsUntilObjectiveWorkIsCleared(t *testing.T)
 
 	text, err := rt.RunSync(context.Background(), "finish the task", nil)
 	require.NoError(t, err)
-	assert.Empty(t, text)
-	assert.Equal(t, 3, callCount)
+	assert.Equal(t, "finished", text)
+	assert.Equal(t, 4, callCount)
 
 	requests := provider.Requests()
 	require.NotEmpty(t, requests)
@@ -2454,6 +3363,7 @@ func TestRuntimeGoalCompleteToolRejectsUntilObjectiveWorkIsCleared(t *testing.T)
 	}
 	assert.True(t, rejectedCompletion)
 	assert.True(t, acceptedCompletion)
+	assert.True(t, sessionHasRuntimeControlText(t, sess.History(), "[Runtime visible reply required]"))
 }
 
 func TestRuntimeRunHardStopSummarizesBeforeFailing(t *testing.T) {
@@ -2520,19 +3430,7 @@ func TestRuntimeRunHardStopSummarizesBeforeFailing(t *testing.T) {
 	assert.Contains(t, requests[1].Messages[len(requests[1].Messages)-1].Content, "[Runtime hard stop]")
 
 	history := sess.History()
-	var sawHardStopPrompt bool
-	for _, entry := range history {
-		if entry.Type != session.EntryTypeMessage || entry.Role != "user" {
-			continue
-		}
-		var data session.MessageData
-		require.NoError(t, json.Unmarshal(entry.Data, &data))
-		if strings.Contains(data.Text, "[Runtime hard stop]") {
-			sawHardStopPrompt = true
-			break
-		}
-	}
-	assert.True(t, sawHardStopPrompt)
+	assert.True(t, sessionHasRuntimeControlText(t, history, "[Runtime hard stop]"))
 }
 
 func TestRuntimeRunAutoExecutesStructuredPlanReadyStep(t *testing.T) {
@@ -3046,11 +3944,14 @@ type statefulMockLLMProvider struct {
 	requests         []llm.ChatRequest
 	autoGoalFinalize bool
 	autoGoalSeq      int
+	autoGoalComplete bool
 }
 
 func (m *statefulMockLLMProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (<-chan llm.ChatEvent, error) {
-	if events, ok := autoGoalCompletionResponse(req, nil, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		return staticEventStream(events), nil
+	if m.autoGoalComplete {
+		if events, ok := autoGoalCompletionResponse(req, nil, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			return staticEventStream(events), nil
+		}
 	}
 
 	m.mu.Lock()
@@ -3059,9 +3960,11 @@ func (m *statefulMockLLMProvider) ChatStream(ctx context.Context, req llm.ChatRe
 		idx = len(m.responses) - 1
 	}
 	events := m.responses[idx]
-	if synthetic, ok := autoGoalCompletionResponse(req, events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
-		m.mu.Unlock()
-		return staticEventStream(synthetic), nil
+	if m.autoGoalComplete {
+		if synthetic, ok := autoGoalCompletionResponse(req, events, &m.autoGoalFinalize, &m.autoGoalSeq); ok {
+			m.mu.Unlock()
+			return staticEventStream(synthetic), nil
+		}
 	}
 	m.requests = append(m.requests, req)
 	*m.callCount++
@@ -3168,6 +4071,15 @@ func staticEventStream(events []llm.ChatEvent) <-chan llm.ChatEvent {
 	}
 	close(ch)
 	return ch
+}
+
+func toolResultContentForTest(messages []llm.Message, toolCallID string) string {
+	for _, msg := range messages {
+		if msg.Role == llm.MessageRoleUser && msg.ToolCallID == toolCallID {
+			return strings.TrimSpace(msg.Content)
+		}
+	}
+	return ""
 }
 
 // mockTool is a simple tool that returns a canned output.
@@ -3277,6 +4189,63 @@ func (t *capturingTool) LastInput() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.lastInput
+}
+
+type staticExecutor struct {
+	tools map[string]tools.Tool
+}
+
+func newStaticExecutor(items ...tools.Tool) *staticExecutor {
+	exec := &staticExecutor{tools: make(map[string]tools.Tool, len(items))}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		exec.tools[item.Name()] = item
+	}
+	return exec
+}
+
+func (e *staticExecutor) Execute(ctx context.Context, name string, input json.RawMessage) (tools.ToolResult, error) {
+	tool, ok := e.Get(name)
+	if !ok {
+		return tools.ToolResult{}, fmt.Errorf("unknown tool: %q", name)
+	}
+	return tool.Execute(ctx, input)
+}
+
+func (e *staticExecutor) ToolDefs() []llm.ToolDef {
+	if e == nil {
+		return nil
+	}
+	defs := make([]llm.ToolDef, 0, len(e.tools))
+	for _, tool := range e.tools {
+		defs = append(defs, llm.ToolDef{
+			Name:        tool.Name(),
+			Description: tool.Description(),
+			Parameters:  tool.Parameters(),
+		})
+	}
+	return defs
+}
+
+func (e *staticExecutor) Names() []string {
+	if e == nil {
+		return nil
+	}
+	names := make([]string, 0, len(e.tools))
+	for name := range e.tools {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (e *staticExecutor) Get(name string) (tools.Tool, bool) {
+	if e == nil {
+		return nil, false
+	}
+	tool, ok := e.tools[name]
+	return tool, ok
 }
 
 type timedTool struct {

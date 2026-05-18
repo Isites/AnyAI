@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -181,20 +180,24 @@ func appendRuntimePlanToolResult(sess *session.Session, toolCallID string, resul
 	if sess == nil {
 		return
 	}
-	imgData := make([]session.ImageData, 0, len(result.Images))
-	for _, img := range result.Images {
-		imgData = append(imgData, session.ImageData{
-			MimeType: img.MimeType,
-			Data:     base64.StdEncoding.EncodeToString(img.Data),
-		})
-	}
-	sess.Append(session.ToolResultEntryWithMetadata(
+	entry := session.ToolResultEntryWithMetadata(
 		toolCallID,
 		result.Output,
 		result.Error,
 		result.Metadata,
-		imgData,
-	))
+		session.ImagePayloads(result.Images),
+	)
+	if len(result.Images) > 0 {
+		sess.AppendWithPersistedEntry(entry, session.ToolResultEntryWithMetadata(
+			toolCallID,
+			result.Output,
+			result.Error,
+			result.Metadata,
+			session.ImageRefs(result.Images),
+		))
+	} else {
+		sess.Append(entry)
+	}
 }
 
 func planActionAutoExecutable(step *runtimeplan.Step) bool {

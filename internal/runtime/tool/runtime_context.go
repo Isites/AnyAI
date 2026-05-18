@@ -2,13 +2,18 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 
+	"github.com/Isites/anyai/internal/runtime/input"
 	"github.com/Isites/anyai/internal/runtime/llm"
 )
 
 type runtimeContextKey struct{}
+type runtimeInputBlocksKey struct{}
 type runtimeExecutorKey struct{}
 type runtimeToolExecutionKey struct{}
+type runtimeBackgroundProcessManagerKey struct{}
+type runtimeRawToolInputsKey struct{}
 
 // RuntimeContext carries the current runtime call metadata through tool execution.
 type RuntimeContext struct {
@@ -16,7 +21,9 @@ type RuntimeContext struct {
 	AgentID        string
 	SessionID      string
 	TaskID         string
+	InputMessageID string
 	ToolCallID     string
+	AssetsBaseDir  string
 	CurrentRequest string
 	CallChain      []string
 	Depth          int
@@ -34,6 +41,21 @@ func RuntimeContextFrom(ctx context.Context) RuntimeContext {
 	}
 	meta, _ := ctx.Value(runtimeContextKey{}).(RuntimeContext)
 	return meta
+}
+
+// WithRuntimeInputBlocks attaches prepared runtime input blocks to the run
+// context so session persistence can store lightweight attachment refs.
+func WithRuntimeInputBlocks(ctx context.Context, blocks []input.InputBlock) context.Context {
+	return context.WithValue(ctx, runtimeInputBlocksKey{}, append([]input.InputBlock(nil), blocks...))
+}
+
+// RuntimeInputBlocksFrom extracts prepared runtime input blocks from context.
+func RuntimeInputBlocksFrom(ctx context.Context) []input.InputBlock {
+	if ctx == nil {
+		return nil
+	}
+	blocks, _ := ctx.Value(runtimeInputBlocksKey{}).([]input.InputBlock)
+	return append([]input.InputBlock(nil), blocks...)
 }
 
 // WithExecutorContext attaches the current tool surface to the context so task
@@ -69,4 +91,49 @@ func TaskToolExecutionFromContext(ctx context.Context) TaskToolExecution {
 	}
 	execute, _ := ctx.Value(runtimeToolExecutionKey{}).(TaskToolExecution)
 	return execute
+}
+
+// WithRawToolInput keeps execution-only tool arguments out of persisted task
+// records while still allowing the async task executor to run the original
+// model call. Stored task input should remain transcript-safe.
+func WithRawToolInput(ctx context.Context, toolCallID string, raw json.RawMessage) context.Context {
+	if ctx == nil || toolCallID == "" {
+		return ctx
+	}
+	next := map[string]json.RawMessage{}
+	if current, ok := ctx.Value(runtimeRawToolInputsKey{}).(map[string]json.RawMessage); ok {
+		for key, value := range current {
+			next[key] = append(json.RawMessage(nil), value...)
+		}
+	}
+	next[toolCallID] = append(json.RawMessage(nil), raw...)
+	return context.WithValue(ctx, runtimeRawToolInputsKey{}, next)
+}
+
+func RawToolInputFromContext(ctx context.Context, toolCallID string) (json.RawMessage, bool) {
+	if ctx == nil || toolCallID == "" {
+		return nil, false
+	}
+	inputs, _ := ctx.Value(runtimeRawToolInputsKey{}).(map[string]json.RawMessage)
+	raw, ok := inputs[toolCallID]
+	if !ok {
+		return nil, false
+	}
+	return append(json.RawMessage(nil), raw...), true
+}
+
+// WithBackgroundProcessManager attaches the current run-controller-owned
+// process manager to a context.
+func WithBackgroundProcessManager(ctx context.Context, manager *BackgroundProcessManager) context.Context {
+	return context.WithValue(ctx, runtimeBackgroundProcessManagerKey{}, manager)
+}
+
+// BackgroundProcessManagerFromContext returns the manager that owns detached
+// process groups for the current run controller invocation.
+func BackgroundProcessManagerFromContext(ctx context.Context) *BackgroundProcessManager {
+	if ctx == nil {
+		return nil
+	}
+	manager, _ := ctx.Value(runtimeBackgroundProcessManagerKey{}).(*BackgroundProcessManager)
+	return manager
 }

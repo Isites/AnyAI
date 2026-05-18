@@ -1,9 +1,9 @@
 package runtimeevents
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,30 +30,36 @@ const (
 )
 
 type RunRecord struct {
-	ID            string    `json:"id"`
-	ParentAgentID string    `json:"parent_agent_id,omitempty"`
-	AgentID       string    `json:"agent_id"`
-	SessionID     string    `json:"session_id"`
-	Model         string    `json:"model"`
-	Channel       string    `json:"channel,omitempty"`
-	Input         string    `json:"input,omitempty"`
-	Output        string    `json:"output,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	Status        RunStatus `json:"status"`
-	CreatedAt     time.Time `json:"created_at"`
-	StartedAt     time.Time `json:"started_at"`
-	CompletedAt   time.Time `json:"completed_at,omitempty"`
+	ID                string    `json:"id"`
+	TraceID           string    `json:"trace_id,omitempty"`
+	TraceNodeID       string    `json:"trace_node_id,omitempty"`
+	ParentTraceNodeID string    `json:"parent_trace_node_id,omitempty"`
+	ParentAgentID     string    `json:"parent_agent_id,omitempty"`
+	AgentID           string    `json:"agent_id"`
+	SessionID         string    `json:"session_id"`
+	Model             string    `json:"model"`
+	Channel           string    `json:"channel,omitempty"`
+	Input             string    `json:"input,omitempty"`
+	Output            string    `json:"output,omitempty"`
+	Error             string    `json:"error,omitempty"`
+	Status            RunStatus `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	StartedAt         time.Time `json:"started_at"`
+	CompletedAt       time.Time `json:"completed_at,omitempty"`
 }
 
 type EventRecord struct {
-	SchemaVersion int            `json:"schema_version,omitempty"`
-	Sequence      int            `json:"sequence"`
-	RunID         string         `json:"run_id"`
-	AgentID       string         `json:"agent_id"`
-	SessionID     string         `json:"session_id"`
-	Name          string         `json:"name"`
-	Timestamp     time.Time      `json:"timestamp"`
-	Payload       map[string]any `json:"payload,omitempty"`
+	SchemaVersion     int            `json:"schema_version,omitempty"`
+	Sequence          int            `json:"sequence"`
+	RunID             string         `json:"run_id"`
+	TraceID           string         `json:"trace_id,omitempty"`
+	TraceNodeID       string         `json:"trace_node_id,omitempty"`
+	ParentTraceNodeID string         `json:"parent_trace_node_id,omitempty"`
+	AgentID           string         `json:"agent_id"`
+	SessionID         string         `json:"session_id"`
+	Name              string         `json:"name"`
+	Timestamp         time.Time      `json:"timestamp"`
+	Payload           map[string]any `json:"payload,omitempty"`
 }
 
 type RunTreeRecord struct {
@@ -165,6 +171,7 @@ func (r *Recorder) StartRun(run RunRecord) {
 	defer r.mu.Unlock()
 
 	now := time.Now().UTC()
+	normalizeRunTraceFields(&run)
 	if run.CreatedAt.IsZero() {
 		run.CreatedAt = now
 	}
@@ -187,6 +194,7 @@ func (r *Recorder) StartRun(run RunRecord) {
 func (r *Recorder) BeginRun(run RunRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	normalizeRunTraceFields(&run)
 
 	now := time.Now().UTC()
 	if run.CreatedAt.IsZero() {
@@ -209,6 +217,15 @@ func (r *Recorder) BeginRun(run RunRecord) {
 		}
 		if run.Channel == "" {
 			run.Channel = existing.Channel
+		}
+		if run.TraceID == "" {
+			run.TraceID = existing.TraceID
+		}
+		if run.TraceNodeID == "" {
+			run.TraceNodeID = existing.TraceNodeID
+		}
+		if run.ParentTraceNodeID == "" {
+			run.ParentTraceNodeID = existing.ParentTraceNodeID
 		}
 	}
 
@@ -279,6 +296,7 @@ func (r *Recorder) publishEvent(event EventRecord, persist bool, notifyListeners
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
+	r.applyEventTraceFieldsLocked(&event)
 	treeRunID = r.ensureRunTreeLocked(event.RunID)
 	r.attachSessionRunLocked(event.SessionID, event.RunID)
 	if persist {
@@ -341,8 +359,21 @@ func (r *Recorder) applyRunLifecycleEventLocked(event EventRecord) {
 	if strings.TrimSpace(run.SessionID) == "" {
 		run.SessionID = event.SessionID
 	}
+	if strings.TrimSpace(run.TraceID) == "" {
+		run.TraceID = event.TraceID
+	}
+	if strings.TrimSpace(run.TraceNodeID) == "" {
+		run.TraceNodeID = event.TraceNodeID
+	}
+	if strings.TrimSpace(run.ParentTraceNodeID) == "" {
+		run.ParentTraceNodeID = event.ParentTraceNodeID
+	}
 	if run.CreatedAt.IsZero() {
 		run.CreatedAt = event.Timestamp
+	}
+	if eventTrace := strings.TrimSpace(event.TraceNodeID); eventTrace != "" && strings.TrimSpace(run.TraceNodeID) != "" && eventTrace != strings.TrimSpace(run.TraceNodeID) {
+		r.persistRunLocked(*run)
+		return
 	}
 
 	switch event.Name {
@@ -604,21 +635,28 @@ func (r *Recorder) RunTree(runID string) ([]RunNode, bool) {
 }
 
 func EventRecordsForAgentEvent(run RunRecord, event AgentEvent) []EventRecord {
+	normalizeRunTraceFields(&run)
 	base := EventRecord{
-		RunID:     run.ID,
-		AgentID:   run.AgentID,
-		SessionID: run.SessionID,
-		Timestamp: time.Now().UTC(),
+		RunID:             run.ID,
+		TraceID:           run.TraceID,
+		TraceNodeID:       run.TraceNodeID,
+		ParentTraceNodeID: run.ParentTraceNodeID,
+		AgentID:           run.AgentID,
+		SessionID:         run.SessionID,
+		Timestamp:         time.Now().UTC(),
 	}
 
 	build := func(name string, payload map[string]any) EventRecord {
 		return EventRecord{
-			RunID:     base.RunID,
-			AgentID:   base.AgentID,
-			SessionID: base.SessionID,
-			Name:      name,
-			Timestamp: base.Timestamp,
-			Payload:   payload,
+			RunID:             base.RunID,
+			TraceID:           base.TraceID,
+			TraceNodeID:       base.TraceNodeID,
+			ParentTraceNodeID: base.ParentTraceNodeID,
+			AgentID:           base.AgentID,
+			SessionID:         base.SessionID,
+			Name:              name,
+			Timestamp:         base.Timestamp,
+			Payload:           payload,
 		}
 	}
 
@@ -659,7 +697,7 @@ func EventRecordsForAgentEvent(run RunRecord, event AgentEvent) []EventRecord {
 		}
 		if event.ToolCall != nil {
 			payload["id"] = event.ToolCall.ID
-			payload["input"] = tools.SanitizeRawJSON(event.ToolCall.Input)
+			payload["input"] = tools.SanitizeToolInputForTranscript(event.ToolCall.Name, event.ToolCall.Input)
 		}
 		return []EventRecord{build(EventToolRetrying, payload)}
 	case AgentEventTextDelta:
@@ -708,7 +746,7 @@ func EventRecordsForAgentEvent(run RunRecord, event AgentEvent) []EventRecord {
 		}
 		if event.ToolCall != nil {
 			payload["id"] = event.ToolCall.ID
-			payload["input"] = tools.SanitizeRawJSON(event.ToolCall.Input)
+			payload["input"] = tools.SanitizeToolInputForTranscript(event.ToolCall.Name, event.ToolCall.Input)
 		}
 		return []EventRecord{build(EventToolWarning, payload)}
 	case AgentEventToolResult:
@@ -718,17 +756,34 @@ func EventRecordsForAgentEvent(run RunRecord, event AgentEvent) []EventRecord {
 		payload := map[string]any{
 			"id":     event.ToolCall.ID,
 			"tool":   event.ToolCall.Name,
-			"input":  tools.SanitizeRawJSON(event.ToolCall.Input),
+			"input":  tools.SanitizeToolInputForTranscript(event.ToolCall.Name, event.ToolCall.Input),
 			"output": event.Result.Output,
 			"error":  event.Result.Error,
 		}
 		if len(event.Result.Images) > 0 {
-			var images []map[string]string
-			for _, img := range event.Result.Images {
-				images = append(images, map[string]string{
-					"mimeType": img.MimeType,
-					"data":     base64.StdEncoding.EncodeToString(img.Data),
-				})
+			var images []map[string]any
+			for i, img := range event.Result.Images {
+				size := img.Size
+				if size <= 0 {
+					size = len(img.Data)
+				}
+				item := map[string]any{
+					"id":   fmt.Sprintf("tool_image_%d", i+1),
+					"size": size,
+				}
+				if strings.TrimSpace(img.ID) != "" {
+					item["id"] = strings.TrimSpace(img.ID)
+				}
+				if strings.TrimSpace(img.Name) != "" {
+					item["name"] = strings.TrimSpace(img.Name)
+				}
+				if strings.TrimSpace(img.Path) != "" {
+					item["path"] = strings.TrimSpace(img.Path)
+				}
+				if strings.TrimSpace(img.MimeType) != "" {
+					item["mime_type"] = img.MimeType
+				}
+				images = append(images, item)
 			}
 			payload["images"] = images
 		}
@@ -831,7 +886,7 @@ func normalizedToolInput(toolCall *llm.ToolCall) any {
 	if payload, err := tools.NormalizeCallAgentPayload(tools.SanitizeRawJSON(toolCall.Input)); err == nil && strings.TrimSpace(toolCall.Name) == "callagent" {
 		return payload
 	}
-	return tools.SanitizeRawJSON(toolCall.Input)
+	return tools.SanitizeToolInputForTranscript(toolCall.Name, toolCall.Input)
 }
 
 func shouldRecordRuntimeEvent(event EventRecord) bool {
@@ -1006,6 +1061,69 @@ func copyEventListeners(src map[int]Listener) []Listener {
 	return out
 }
 
+func normalizeRunTraceFields(run *RunRecord) {
+	if run == nil {
+		return
+	}
+	run.ID = strings.TrimSpace(run.ID)
+	run.AgentID = strings.TrimSpace(run.AgentID)
+	run.SessionID = strings.TrimSpace(run.SessionID)
+	run.TraceID = strings.TrimSpace(run.TraceID)
+	run.TraceNodeID = strings.TrimSpace(run.TraceNodeID)
+	run.ParentTraceNodeID = strings.TrimSpace(run.ParentTraceNodeID)
+	if run.TraceNodeID == "" {
+		run.TraceNodeID = TraceNodeID(run.ID, run.AgentID)
+	}
+	if run.TraceID == "" {
+		run.TraceID = firstNonEmptyTraceID(run.ID, run.TraceNodeID)
+	}
+}
+
+func (r *Recorder) applyEventTraceFieldsLocked(event *EventRecord) {
+	if event == nil {
+		return
+	}
+	event.TraceID = strings.TrimSpace(event.TraceID)
+	event.TraceNodeID = strings.TrimSpace(event.TraceNodeID)
+	event.ParentTraceNodeID = strings.TrimSpace(event.ParentTraceNodeID)
+	if run := r.runs[event.RunID]; run != nil {
+		normalizeRunTraceFields(run)
+		if event.TraceID == "" {
+			event.TraceID = run.TraceID
+		}
+		if event.TraceNodeID == "" {
+			event.TraceNodeID = run.TraceNodeID
+		}
+		if event.ParentTraceNodeID == "" {
+			event.ParentTraceNodeID = run.ParentTraceNodeID
+		}
+	}
+	if event.TraceNodeID == "" {
+		event.TraceNodeID = TraceNodeID(event.RunID, event.AgentID)
+	}
+	if event.TraceID == "" {
+		event.TraceID = firstNonEmptyTraceID(event.RunID, event.TraceNodeID)
+	}
+}
+
+func TraceNodeID(runID, agentID string) string {
+	runID = strings.TrimSpace(runID)
+	agentID = strings.TrimSpace(agentID)
+	if runID == "" {
+		return ""
+	}
+	return runID + "::" + agentID
+}
+
+func firstNonEmptyTraceID(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 type recorderState struct {
 	runs        map[string]*RunRecord
 	runEvents   map[string][]EventRecord
@@ -1029,6 +1147,7 @@ func (s *recorderState) apply(record persistedRecord) {
 			return
 		}
 		runCopy := *record.Run
+		normalizeRunTraceFields(&runCopy)
 		s.runs[runCopy.ID] = &runCopy
 		s.attachRun(runCopy.ID)
 		s.attachSessionRun(runCopy.SessionID, runCopy.ID)
@@ -1037,6 +1156,19 @@ func (s *recorderState) apply(record persistedRecord) {
 			return
 		}
 		eventCopy := *record.Event
+		if eventCopy.TraceNodeID == "" {
+			if run := s.runs[eventCopy.RunID]; run != nil {
+				eventCopy.TraceID = run.TraceID
+				eventCopy.TraceNodeID = run.TraceNodeID
+				eventCopy.ParentTraceNodeID = run.ParentTraceNodeID
+			}
+		}
+		if eventCopy.TraceNodeID == "" {
+			eventCopy.TraceNodeID = TraceNodeID(eventCopy.RunID, eventCopy.AgentID)
+		}
+		if eventCopy.TraceID == "" {
+			eventCopy.TraceID = firstNonEmptyTraceID(eventCopy.RunID, eventCopy.TraceNodeID)
+		}
 		if eventCopy.Sequence <= 0 {
 			eventCopy.Sequence = len(s.runEvents[eventCopy.RunID]) + 1
 		}

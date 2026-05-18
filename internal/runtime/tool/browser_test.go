@@ -53,6 +53,24 @@ func TestBrowserNavigateInvalidURL(t *testing.T) {
 	assert.Contains(t, result.Error, "url must start with http")
 }
 
+func TestBrowserURLValidationAllowsLocalhost(t *testing.T) {
+	require.NoError(t, validateBrowserURL("http://localhost:3000/"))
+	require.NoError(t, validateBrowserURL("http://127.0.0.1:3000/"))
+	require.NoError(t, validateBrowserURL("http://[::1]:3000/"))
+}
+
+func TestBrowserURLValidationBlocksPrivateNetwork(t *testing.T) {
+	err := validateBrowserURL("http://192.168.1.10/")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "access to internal address")
+}
+
+func TestWebURLValidationStillBlocksLocalhost(t *testing.T) {
+	err := validateURLNotInternal("http://localhost:3000/")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "access to internal address")
+}
+
 func TestBrowserClickMissingSelector(t *testing.T) {
 	tool := &BrowserTool{}
 	result, err := tool.click(context.Background(), browserInput{Action: "click"})

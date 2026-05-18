@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -29,6 +30,46 @@ type stubRuntimeSurface struct {
 	getTraceGate    chan struct{}
 }
 
+func TestSessionIDForInboundMessageHonorsExplicitSessionID(t *testing.T) {
+	msg := InboundMessage{
+		SenderID:  "local",
+		SessionID: "cli_custom",
+		ChatType:  ChatTypeDirect,
+	}
+
+	assert.Equal(t, "cli_custom", sessionIDForInboundMessage("cli", msg))
+	req := ingressRequestForInboundMessage("cli", msg)
+	assert.Equal(t, "cli_custom", req.SessionID)
+}
+
+func TestChannelRunEventCarriesTraceIdentity(t *testing.T) {
+	dispatch := &dispatcher{runtime: &stubChannelPort{
+		runs: map[string]Run{
+			"run_child": gatewayRun(runtimeevents.RunRecord{
+				ID:                "run_child",
+				TraceID:           "trace_root",
+				TraceNodeID:       "node_child",
+				ParentTraceNodeID: "node_parent",
+				AgentID:           "coder",
+				SessionID:         "sess",
+				ParentAgentID:     "lead",
+			}),
+		},
+	}}
+
+	event := dispatch.channelRunEventFromRecord(Event{
+		RunID:     "run_child",
+		AgentID:   "coder",
+		SessionID: "sess",
+		Name:      runtimeevents.EventRunStarted,
+	})
+
+	assert.Equal(t, "trace_root", event.TraceID)
+	assert.Equal(t, "node_child", event.TraceNodeID)
+	assert.Equal(t, "node_parent", event.ParentTraceNodeID)
+	assert.Equal(t, "lead", event.ParentAgentID)
+}
+
 func (s *stubRuntimeSurface) Config() *config.Config               { return nil }
 func (s *stubRuntimeSurface) Agents() []config.AgentConfig         { return nil }
 func (s *stubRuntimeSurface) Resources() *runtimeresources.Catalog { return nil }
@@ -54,9 +95,21 @@ func (s *stubRuntimeSurface) GetRun(runID string) (runtimeevents.RunRecord, bool
 	}
 	return runtimeevents.RunRecord{}, false
 }
-func (s *stubRuntimeSurface) ListRuns() []runtimeevents.RunRecord              { return nil }
-func (s *stubRuntimeSurface) ListRunEvents(string) []runtimeevents.EventRecord { return nil }
-func (s *stubRuntimeSurface) SubscribeRun(string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *stubRuntimeSurface) ListRuns() []runtimeevents.RunRecord                 { return nil }
+func (s *stubRuntimeSurface) ListRawRunEvents(string) []runtimeevents.EventRecord { return nil }
+func (s *stubRuntimeSurface) GetRawRunTree(string) (runtimeevents.RunTreeRecord, bool) {
+	return runtimeevents.RunTreeRecord{}, false
+}
+func (s *stubRuntimeSurface) RawRunTree(string) ([]runtimeevents.RunNode, bool) { return nil, false }
+func (s *stubRuntimeSurface) ListRunEvents(runID string) []runtimeevents.EventRecord {
+	run, ok := s.GetRun(runID)
+	events := s.ListRawRunEvents(runID)
+	if !ok {
+		return events
+	}
+	return runtimeevents.ReplayRunEvents(run, events)
+}
+func (s *stubRuntimeSurface) SubscribeRawRun(string) (<-chan runtimeevents.EventRecord, func(), error) {
 	if s.runSubscribed != nil {
 		close(s.runSubscribed)
 		s.runSubscribed = nil
@@ -75,13 +128,13 @@ func (s *stubRuntimeSurface) GetRunTree(runID string) (runtimeevents.RunTreeReco
 	}
 	for _, run := range s.trace.Runs {
 		if run.ID == runID {
-			return s.trace, true
+			return runtimeevents.ReplayRunTreeRecord(s.trace), true
 		}
 	}
 	if len(s.trace.Runs) == 0 && len(s.trace.Events) > 0 {
 		for _, event := range s.trace.Events {
 			if event.RunID == runID {
-				return s.trace, true
+				return runtimeevents.ReplayRunTreeRecord(s.trace), true
 			}
 		}
 	}
@@ -90,19 +143,19 @@ func (s *stubRuntimeSurface) GetRunTree(runID string) (runtimeevents.RunTreeReco
 func (s *stubRuntimeSurface) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	for _, node := range s.tree {
 		if node.Run.ID == runID {
-			return s.tree, true
+			return runtimeevents.ReplayRunTree(s.tree), true
 		}
 	}
 	if len(s.tree) == 0 && len(s.trace.Events) > 0 {
 		for _, event := range s.trace.Events {
 			if event.RunID == runID {
-				return s.tree, true
+				return runtimeevents.ReplayRunTree(s.tree), true
 			}
 		}
 	}
 	return nil, false
 }
-func (s *stubRuntimeSurface) SubscribeRunTree(string) (<-chan runtimeevents.EventRecord, func(), error) {
+func (s *stubRuntimeSurface) SubscribeRawRunTree(string) (<-chan runtimeevents.EventRecord, func(), error) {
 	if s.traceSubscribed != nil {
 		close(s.traceSubscribed)
 		s.traceSubscribed = nil
@@ -114,11 +167,43 @@ func (s *stubRuntimeSurface) SubscribeRunTree(string) (<-chan runtimeevents.Even
 	}
 	return s.traceSub, func() {}, nil
 }
+func (s *stubRuntimeSurface) SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+	return stubSubscribeReplayStream(
+		func() (<-chan runtimeevents.EventRecord, func(), error) {
+			return s.SubscribeRawRun(runID)
+		},
+		func() ([]runtimeevents.EventRecord, error) {
+			run, ok := s.GetRun(runID)
+			if !ok {
+				return nil, assert.AnError
+			}
+			return runtimeevents.ReplayRunEvents(run, s.ListRawRunEvents(runID)), nil
+		},
+	)
+}
+func (s *stubRuntimeSurface) SubscribeRunTreeReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+	return stubSubscribeReplayStream(
+		func() (<-chan runtimeevents.EventRecord, func(), error) {
+			return s.SubscribeRawRunTree(runID)
+		},
+		func() ([]runtimeevents.EventRecord, error) {
+			tree, ok := s.GetRunTree(runID)
+			if !ok {
+				return nil, assert.AnError
+			}
+			replayed := runtimeevents.ReplayRunTreeRecord(tree)
+			return append([]runtimeevents.EventRecord(nil), replayed.Events...), nil
+		},
+	)
+}
 func (s *stubRuntimeSurface) ListSessionEvents(string, string) []runtimeevents.EventRecord {
 	return nil
 }
 func (s *stubRuntimeSurface) ListSessions(string) ([]session.SessionInfo, error)   { return nil, nil }
 func (s *stubRuntimeSurface) LoadSession(string, string) (*session.Session, error) { return nil, nil }
+func (s *stubRuntimeSurface) LoadSessionSnapshot(string, string) (runtimeport.SessionSnapshot, error) {
+	return runtimeport.SessionSnapshot{}, nil
+}
 func (s *stubRuntimeSurface) CreateSession(string, string, string) (string, error) { return "", nil }
 func (s *stubRuntimeSurface) DeleteSession(string, string) error                   { return nil }
 func (s *stubRuntimeSurface) SubscribeSession(string, string) (<-chan runtimeevents.EventRecord, func(), error) {
@@ -141,6 +226,100 @@ func (s *stubRuntimeSurface) MemoryStaleCleanup(time.Time) (int, error)    { ret
 func (s *stubRuntimeSurface) MemoryReindex() (int, error)                  { return 0, nil }
 func (s *stubRuntimeSurface) MemoryPromoteEligible(time.Time) (int, error) { return 0, nil }
 func (s *stubRuntimeSurface) CompactSession(string, string, int) error     { return nil }
+
+func stubReplaySeenSet(events []runtimeevents.EventRecord) map[string]struct{} {
+	seen := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		seen[stubReplayEventKey(event)] = struct{}{}
+	}
+	return seen
+}
+
+func stubReplayEventKey(event runtimeevents.EventRecord) string {
+	return fmt.Sprintf("%s/%d/%s", event.RunID, event.Sequence, event.Name)
+}
+
+func stubSubscribeReplayStream(
+	subscribe func() (<-chan runtimeevents.EventRecord, func(), error),
+	loadSnapshot func() ([]runtimeevents.EventRecord, error),
+) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
+	raw, rawCancel, err := subscribe()
+	if err != nil || rawCancel == nil {
+		return nil, nil, nil, err
+	}
+
+	out := make(chan runtimeevents.EventRecord, 128)
+	done := make(chan struct{})
+	release := make(chan map[string]struct{}, 1)
+
+	go func() {
+		defer close(out)
+		backlog := make([]runtimeevents.EventRecord, 0, 16)
+		seen := map[string]struct{}{}
+		ready := false
+		emit := func(event runtimeevents.EventRecord) bool {
+			key := stubReplayEventKey(event)
+			if _, ok := seen[key]; ok {
+				return true
+			}
+			seen[key] = struct{}{}
+			select {
+			case <-done:
+				return false
+			case out <- event:
+				return true
+			}
+		}
+		for {
+			if !ready {
+				select {
+				case <-done:
+					return
+				case snapshotSeen := <-release:
+					seen = snapshotSeen
+					for _, event := range backlog {
+						if !emit(event) {
+							return
+						}
+					}
+					backlog = nil
+					ready = true
+				case event, ok := <-raw:
+					if !ok {
+						return
+					}
+					backlog = append(backlog, event)
+				}
+				continue
+			}
+			select {
+			case <-done:
+				return
+			case event, ok := <-raw:
+				if !ok {
+					return
+				}
+				if !emit(event) {
+					return
+				}
+			}
+		}
+	}()
+
+	snapshot, err := loadSnapshot()
+	if err != nil {
+		close(done)
+		rawCancel()
+		return nil, nil, nil, err
+	}
+	release <- stubReplaySeenSet(snapshot)
+
+	cancel := func() {
+		close(done)
+		rawCancel()
+	}
+	return snapshot, out, cancel, nil
+}
 
 func TestServiceGetRunTreeReplaysTransientRunOutput(t *testing.T) {
 	now := time.Now().UTC()
@@ -249,8 +428,8 @@ func TestServiceSubscribeRunTreeReplayDedupesBufferedReplayEvents(t *testing.T) 
 
 	service := &Service{runtime: rt}
 	type result struct {
-		snapshot []runtimeevents.EventRecord
-		events   <-chan runtimeevents.EventRecord
+		snapshot []Event
+		events   <-chan Event
 		cancel   func()
 		err      error
 	}
@@ -316,8 +495,8 @@ func TestServiceSubscribeRunTreeReplayFlushesBufferedLiveEvents(t *testing.T) {
 
 	service := &Service{runtime: rt}
 	type result struct {
-		snapshot []runtimeevents.EventRecord
-		events   <-chan runtimeevents.EventRecord
+		snapshot []Event
+		events   <-chan Event
 		cancel   func()
 		err      error
 	}
@@ -376,8 +555,8 @@ func TestServiceSubscribeRunReplayDedupesBufferedReplayEvents(t *testing.T) {
 
 	service := &Service{runtime: rt}
 	type result struct {
-		snapshot []runtimeevents.EventRecord
-		events   <-chan runtimeevents.EventRecord
+		snapshot []Event
+		events   <-chan Event
 		cancel   func()
 		err      error
 	}
@@ -437,8 +616,8 @@ func TestServiceSubscribeRunReplayFlushesBufferedLiveEvents(t *testing.T) {
 
 	service := &Service{runtime: rt}
 	type result struct {
-		snapshot []runtimeevents.EventRecord
-		events   <-chan runtimeevents.EventRecord
+		snapshot []Event
+		events   <-chan Event
 		cancel   func()
 		err      error
 	}
