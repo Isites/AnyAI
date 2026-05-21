@@ -30,36 +30,40 @@ const (
 )
 
 type RunRecord struct {
-	ID                string    `json:"id"`
-	TraceID           string    `json:"trace_id,omitempty"`
-	TraceNodeID       string    `json:"trace_node_id,omitempty"`
-	ParentTraceNodeID string    `json:"parent_trace_node_id,omitempty"`
-	ParentAgentID     string    `json:"parent_agent_id,omitempty"`
-	AgentID           string    `json:"agent_id"`
-	SessionID         string    `json:"session_id"`
-	Model             string    `json:"model"`
-	Channel           string    `json:"channel,omitempty"`
-	Input             string    `json:"input,omitempty"`
-	Output            string    `json:"output,omitempty"`
-	Error             string    `json:"error,omitempty"`
-	Status            RunStatus `json:"status"`
-	CreatedAt         time.Time `json:"created_at"`
-	StartedAt         time.Time `json:"started_at"`
-	CompletedAt       time.Time `json:"completed_at,omitempty"`
+	ID                    string    `json:"id"`
+	RunNodeID             string    `json:"run_node_id,omitempty"`
+	ParentRunNodeID       string    `json:"parent_run_node_id,omitempty"`
+	LegacyRunNodeID       string    `json:"trace_node_id,omitempty"`
+	LegacyParentRunNodeID string    `json:"parent_trace_node_id,omitempty"`
+	ParentAgentID         string    `json:"parent_agent_id,omitempty"`
+	AgentID               string    `json:"agent_id"`
+	SessionID             string    `json:"session_id"`
+	TaskID                string    `json:"task_id,omitempty"`
+	ParentTaskID          string    `json:"parent_task_id,omitempty"`
+	Model                 string    `json:"model"`
+	Channel               string    `json:"channel,omitempty"`
+	Input                 string    `json:"input,omitempty"`
+	Output                string    `json:"output,omitempty"`
+	Error                 string    `json:"error,omitempty"`
+	Status                RunStatus `json:"status"`
+	CreatedAt             time.Time `json:"created_at"`
+	StartedAt             time.Time `json:"started_at"`
+	CompletedAt           time.Time `json:"completed_at,omitempty"`
 }
 
 type EventRecord struct {
-	SchemaVersion     int            `json:"schema_version,omitempty"`
-	Sequence          int            `json:"sequence"`
-	RunID             string         `json:"run_id"`
-	TraceID           string         `json:"trace_id,omitempty"`
-	TraceNodeID       string         `json:"trace_node_id,omitempty"`
-	ParentTraceNodeID string         `json:"parent_trace_node_id,omitempty"`
-	AgentID           string         `json:"agent_id"`
-	SessionID         string         `json:"session_id"`
-	Name              string         `json:"name"`
-	Timestamp         time.Time      `json:"timestamp"`
-	Payload           map[string]any `json:"payload,omitempty"`
+	SchemaVersion         int            `json:"schema_version,omitempty"`
+	Sequence              int            `json:"sequence"`
+	RunID                 string         `json:"run_id"`
+	RunNodeID             string         `json:"run_node_id,omitempty"`
+	ParentRunNodeID       string         `json:"parent_run_node_id,omitempty"`
+	LegacyRunNodeID       string         `json:"trace_node_id,omitempty"`
+	LegacyParentRunNodeID string         `json:"parent_trace_node_id,omitempty"`
+	AgentID               string         `json:"agent_id"`
+	SessionID             string         `json:"session_id"`
+	Name                  string         `json:"name"`
+	Timestamp             time.Time      `json:"timestamp"`
+	Payload               map[string]any `json:"payload,omitempty"`
 }
 
 type RunTreeRecord struct {
@@ -171,7 +175,7 @@ func (r *Recorder) StartRun(run RunRecord) {
 	defer r.mu.Unlock()
 
 	now := time.Now().UTC()
-	normalizeRunTraceFields(&run)
+	normalizeRunNodeFields(&run)
 	if run.CreatedAt.IsZero() {
 		run.CreatedAt = now
 	}
@@ -194,7 +198,7 @@ func (r *Recorder) StartRun(run RunRecord) {
 func (r *Recorder) BeginRun(run RunRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	normalizeRunTraceFields(&run)
+	normalizeRunNodeFields(&run)
 
 	now := time.Now().UTC()
 	if run.CreatedAt.IsZero() {
@@ -218,14 +222,17 @@ func (r *Recorder) BeginRun(run RunRecord) {
 		if run.Channel == "" {
 			run.Channel = existing.Channel
 		}
-		if run.TraceID == "" {
-			run.TraceID = existing.TraceID
+		if run.TaskID == "" {
+			run.TaskID = existing.TaskID
 		}
-		if run.TraceNodeID == "" {
-			run.TraceNodeID = existing.TraceNodeID
+		if run.ParentTaskID == "" {
+			run.ParentTaskID = existing.ParentTaskID
 		}
-		if run.ParentTraceNodeID == "" {
-			run.ParentTraceNodeID = existing.ParentTraceNodeID
+		if run.RunNodeID == "" {
+			run.RunNodeID = existing.RunNodeID
+		}
+		if run.ParentRunNodeID == "" {
+			run.ParentRunNodeID = existing.ParentRunNodeID
 		}
 	}
 
@@ -296,7 +303,7 @@ func (r *Recorder) publishEvent(event EventRecord, persist bool, notifyListeners
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
-	r.applyEventTraceFieldsLocked(&event)
+	r.applyEventRunNodeFieldsLocked(&event)
 	treeRunID = r.ensureRunTreeLocked(event.RunID)
 	r.attachSessionRunLocked(event.SessionID, event.RunID)
 	if persist {
@@ -359,19 +366,22 @@ func (r *Recorder) applyRunLifecycleEventLocked(event EventRecord) {
 	if strings.TrimSpace(run.SessionID) == "" {
 		run.SessionID = event.SessionID
 	}
-	if strings.TrimSpace(run.TraceID) == "" {
-		run.TraceID = event.TraceID
+	if strings.TrimSpace(run.TaskID) == "" {
+		run.TaskID = eventTaskID(&event)
 	}
-	if strings.TrimSpace(run.TraceNodeID) == "" {
-		run.TraceNodeID = event.TraceNodeID
+	if strings.TrimSpace(run.ParentTaskID) == "" {
+		run.ParentTaskID = eventParentTaskID(&event)
 	}
-	if strings.TrimSpace(run.ParentTraceNodeID) == "" {
-		run.ParentTraceNodeID = event.ParentTraceNodeID
+	if strings.TrimSpace(run.RunNodeID) == "" {
+		run.RunNodeID = event.RunNodeID
+	}
+	if strings.TrimSpace(run.ParentRunNodeID) == "" {
+		run.ParentRunNodeID = event.ParentRunNodeID
 	}
 	if run.CreatedAt.IsZero() {
 		run.CreatedAt = event.Timestamp
 	}
-	if eventTrace := strings.TrimSpace(event.TraceNodeID); eventTrace != "" && strings.TrimSpace(run.TraceNodeID) != "" && eventTrace != strings.TrimSpace(run.TraceNodeID) {
+	if eventTrace := strings.TrimSpace(event.RunNodeID); eventTrace != "" && strings.TrimSpace(run.RunNodeID) != "" && eventTrace != strings.TrimSpace(run.RunNodeID) {
 		r.persistRunLocked(*run)
 		return
 	}
@@ -635,28 +645,26 @@ func (r *Recorder) RunTree(runID string) ([]RunNode, bool) {
 }
 
 func EventRecordsForAgentEvent(run RunRecord, event AgentEvent) []EventRecord {
-	normalizeRunTraceFields(&run)
+	normalizeRunNodeFields(&run)
 	base := EventRecord{
-		RunID:             run.ID,
-		TraceID:           run.TraceID,
-		TraceNodeID:       run.TraceNodeID,
-		ParentTraceNodeID: run.ParentTraceNodeID,
-		AgentID:           run.AgentID,
-		SessionID:         run.SessionID,
-		Timestamp:         time.Now().UTC(),
+		RunID:           run.ID,
+		RunNodeID:       run.RunNodeID,
+		ParentRunNodeID: run.ParentRunNodeID,
+		AgentID:         run.AgentID,
+		SessionID:       run.SessionID,
+		Timestamp:       time.Now().UTC(),
 	}
 
 	build := func(name string, payload map[string]any) EventRecord {
 		return EventRecord{
-			RunID:             base.RunID,
-			TraceID:           base.TraceID,
-			TraceNodeID:       base.TraceNodeID,
-			ParentTraceNodeID: base.ParentTraceNodeID,
-			AgentID:           base.AgentID,
-			SessionID:         base.SessionID,
-			Name:              name,
-			Timestamp:         base.Timestamp,
-			Payload:           payload,
+			RunID:           base.RunID,
+			RunNodeID:       base.RunNodeID,
+			ParentRunNodeID: base.ParentRunNodeID,
+			AgentID:         base.AgentID,
+			SessionID:       base.SessionID,
+			Name:            name,
+			Timestamp:       base.Timestamp,
+			Payload:         payload,
 		}
 	}
 
@@ -1061,65 +1069,116 @@ func copyEventListeners(src map[int]Listener) []Listener {
 	return out
 }
 
-func normalizeRunTraceFields(run *RunRecord) {
+func normalizeRunNodeFields(run *RunRecord) {
 	if run == nil {
 		return
 	}
 	run.ID = strings.TrimSpace(run.ID)
 	run.AgentID = strings.TrimSpace(run.AgentID)
 	run.SessionID = strings.TrimSpace(run.SessionID)
-	run.TraceID = strings.TrimSpace(run.TraceID)
-	run.TraceNodeID = strings.TrimSpace(run.TraceNodeID)
-	run.ParentTraceNodeID = strings.TrimSpace(run.ParentTraceNodeID)
-	if run.TraceNodeID == "" {
-		run.TraceNodeID = TraceNodeID(run.ID, run.AgentID)
+	run.TaskID = strings.TrimSpace(run.TaskID)
+	run.ParentTaskID = strings.TrimSpace(run.ParentTaskID)
+	run.RunNodeID = strings.TrimSpace(run.RunNodeID)
+	run.ParentRunNodeID = strings.TrimSpace(run.ParentRunNodeID)
+	run.LegacyRunNodeID = strings.TrimSpace(run.LegacyRunNodeID)
+	run.LegacyParentRunNodeID = strings.TrimSpace(run.LegacyParentRunNodeID)
+	if run.RunNodeID == "" {
+		run.RunNodeID = run.LegacyRunNodeID
 	}
-	if run.TraceID == "" {
-		run.TraceID = firstNonEmptyTraceID(run.ID, run.TraceNodeID)
+	if run.ParentRunNodeID == "" {
+		run.ParentRunNodeID = run.LegacyParentRunNodeID
 	}
+	if run.RunNodeID == "" {
+		run.RunNodeID = RunNodeID(run.ID, run.AgentID, run.TaskID)
+	}
+	run.LegacyRunNodeID = ""
+	run.LegacyParentRunNodeID = ""
 }
 
-func (r *Recorder) applyEventTraceFieldsLocked(event *EventRecord) {
+func (r *Recorder) applyEventRunNodeFieldsLocked(event *EventRecord) {
 	if event == nil {
 		return
 	}
-	event.TraceID = strings.TrimSpace(event.TraceID)
-	event.TraceNodeID = strings.TrimSpace(event.TraceNodeID)
-	event.ParentTraceNodeID = strings.TrimSpace(event.ParentTraceNodeID)
+	event.RunNodeID = strings.TrimSpace(event.RunNodeID)
+	event.ParentRunNodeID = strings.TrimSpace(event.ParentRunNodeID)
+	event.LegacyRunNodeID = strings.TrimSpace(event.LegacyRunNodeID)
+	event.LegacyParentRunNodeID = strings.TrimSpace(event.LegacyParentRunNodeID)
+	if event.RunNodeID == "" {
+		event.RunNodeID = event.LegacyRunNodeID
+	}
+	if event.ParentRunNodeID == "" {
+		event.ParentRunNodeID = event.LegacyParentRunNodeID
+	}
 	if run := r.runs[event.RunID]; run != nil {
-		normalizeRunTraceFields(run)
-		if event.TraceID == "" {
-			event.TraceID = run.TraceID
-		}
-		if event.TraceNodeID == "" {
-			event.TraceNodeID = run.TraceNodeID
-		}
-		if event.ParentTraceNodeID == "" {
-			event.ParentTraceNodeID = run.ParentTraceNodeID
+		normalizeRunNodeFields(run)
+		applyEventRunNodeDefaults(event, run.RunNodeID, run.ParentRunNodeID, run.AgentID)
+	}
+	if event.RunNodeID == "" {
+		event.RunNodeID = RunNodeID(event.RunID, event.AgentID, eventTaskID(event))
+	}
+	event.LegacyRunNodeID = ""
+	event.LegacyParentRunNodeID = ""
+}
+
+func applyEventRunNodeDefaults(event *EventRecord, runRunNodeID, runParentRunNodeID, runAgentID string) {
+	if event == nil {
+		return
+	}
+	agentID := strings.TrimSpace(event.AgentID)
+	runAgentID = strings.TrimSpace(runAgentID)
+	runRunNodeID = strings.TrimSpace(runRunNodeID)
+	runParentRunNodeID = strings.TrimSpace(runParentRunNodeID)
+	if runRunNodeID == "" && runAgentID != "" {
+		runRunNodeID = RunNodeID(event.RunID, runAgentID, "")
+	}
+	if event.RunNodeID == "" {
+		if agentID == "" || runAgentID == "" || agentID == runAgentID {
+			event.RunNodeID = runRunNodeID
+		} else {
+			event.RunNodeID = RunNodeID(event.RunID, agentID, eventTaskID(event))
+			if event.ParentRunNodeID == "" {
+				event.ParentRunNodeID = runRunNodeID
+			}
 		}
 	}
-	if event.TraceNodeID == "" {
-		event.TraceNodeID = TraceNodeID(event.RunID, event.AgentID)
-	}
-	if event.TraceID == "" {
-		event.TraceID = firstNonEmptyTraceID(event.RunID, event.TraceNodeID)
+	if event.ParentRunNodeID == "" {
+		if strings.TrimSpace(event.RunNodeID) == runRunNodeID {
+			event.ParentRunNodeID = runParentRunNodeID
+		} else if runRunNodeID != "" {
+			event.ParentRunNodeID = runRunNodeID
+		}
 	}
 }
 
-func TraceNodeID(runID, agentID string) string {
+func RunNodeID(runID, agentID, taskID string) string {
 	runID = strings.TrimSpace(runID)
 	agentID = strings.TrimSpace(agentID)
+	taskID = strings.TrimSpace(taskID)
 	if runID == "" {
 		return ""
 	}
-	return runID + "::" + agentID
+	if taskID == "" {
+		return runID + "::" + agentID
+	}
+	return runID + "::" + agentID + "::" + taskID
 }
 
-func firstNonEmptyTraceID(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
+func eventTaskID(event *EventRecord) string {
+	if event == nil || event.Payload == nil {
+		return ""
+	}
+	if value, ok := event.Payload["task_id"].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func eventParentTaskID(event *EventRecord) string {
+	if event == nil || event.Payload == nil {
+		return ""
+	}
+	if value, ok := event.Payload["parent_task_id"].(string); ok {
+		return strings.TrimSpace(value)
 	}
 	return ""
 }
@@ -1147,7 +1206,7 @@ func (s *recorderState) apply(record persistedRecord) {
 			return
 		}
 		runCopy := *record.Run
-		normalizeRunTraceFields(&runCopy)
+		normalizeRunNodeFields(&runCopy)
 		s.runs[runCopy.ID] = &runCopy
 		s.attachRun(runCopy.ID)
 		s.attachSessionRun(runCopy.SessionID, runCopy.ID)
@@ -1156,19 +1215,24 @@ func (s *recorderState) apply(record persistedRecord) {
 			return
 		}
 		eventCopy := *record.Event
-		if eventCopy.TraceNodeID == "" {
-			if run := s.runs[eventCopy.RunID]; run != nil {
-				eventCopy.TraceID = run.TraceID
-				eventCopy.TraceNodeID = run.TraceNodeID
-				eventCopy.ParentTraceNodeID = run.ParentTraceNodeID
-			}
+		eventCopy.RunNodeID = strings.TrimSpace(eventCopy.RunNodeID)
+		eventCopy.ParentRunNodeID = strings.TrimSpace(eventCopy.ParentRunNodeID)
+		eventCopy.LegacyRunNodeID = strings.TrimSpace(eventCopy.LegacyRunNodeID)
+		eventCopy.LegacyParentRunNodeID = strings.TrimSpace(eventCopy.LegacyParentRunNodeID)
+		if eventCopy.RunNodeID == "" {
+			eventCopy.RunNodeID = eventCopy.LegacyRunNodeID
 		}
-		if eventCopy.TraceNodeID == "" {
-			eventCopy.TraceNodeID = TraceNodeID(eventCopy.RunID, eventCopy.AgentID)
+		if eventCopy.ParentRunNodeID == "" {
+			eventCopy.ParentRunNodeID = eventCopy.LegacyParentRunNodeID
 		}
-		if eventCopy.TraceID == "" {
-			eventCopy.TraceID = firstNonEmptyTraceID(eventCopy.RunID, eventCopy.TraceNodeID)
+		if run := s.runs[eventCopy.RunID]; run != nil {
+			applyEventRunNodeDefaults(&eventCopy, run.RunNodeID, run.ParentRunNodeID, run.AgentID)
 		}
+		if eventCopy.RunNodeID == "" {
+			eventCopy.RunNodeID = RunNodeID(eventCopy.RunID, eventCopy.AgentID, eventTaskID(&eventCopy))
+		}
+		eventCopy.LegacyRunNodeID = ""
+		eventCopy.LegacyParentRunNodeID = ""
 		if eventCopy.Sequence <= 0 {
 			eventCopy.Sequence = len(s.runEvents[eventCopy.RunID]) + 1
 		}

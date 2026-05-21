@@ -94,11 +94,13 @@ type IncompleteTurnConfig struct {
 }
 
 type turnProgress struct {
-	StreamedText   bool
-	SawToolCall    bool
-	ExecutedTool   bool
-	SavedAssistant bool
-	SideEffectRisk bool
+	StreamedText       bool
+	SawToolCall        bool
+	StartedToolCalls   int
+	CompletedToolCalls int
+	ExecutedTool       bool
+	SavedAssistant     bool
+	SideEffectRisk     bool
 }
 
 // Run executes the agent loop for a user message, returning a channel of events.
@@ -191,6 +193,7 @@ func (r *Runtime) collectLLMResponse(
 				sawMeaningfulOutput = true
 				if progress != nil {
 					progress.SawToolCall = true
+					progress.StartedToolCalls++
 				}
 				if event.ToolCall == nil || !isInlineGoalTool(event.ToolCall.Name) {
 					events <- AgentEvent{Type: EventToolCallRequested, ToolCall: event.ToolCall}
@@ -200,6 +203,9 @@ func (r *Runtime) collectLLMResponse(
 				runtimeactivity.Emit(ctx, nil)
 				sawMeaningfulOutput = true
 				if event.ToolCall != nil {
+					if progress != nil {
+						progress.CompletedToolCalls++
+					}
 					*toolCalls = append(*toolCalls, *event.ToolCall)
 				}
 
@@ -209,6 +215,9 @@ func (r *Runtime) collectLLMResponse(
 		}
 
 		if streamErr == nil {
+			if incomplete := incompleteToolCallError(progress); incomplete != nil {
+				return incomplete
+			}
 			if sawMeaningfulOutput {
 				return nil
 			}

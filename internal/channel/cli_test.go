@@ -57,17 +57,16 @@ func (s *cliTestSessionSurface) LoadSession(agentID, sessionID string) (gateway.
 	events := make([]gateway.Event, len(records))
 	for i, record := range records {
 		events[i] = gateway.Event{
-			SchemaVersion:     record.SchemaVersion,
-			Sequence:          record.Sequence,
-			RunID:             record.RunID,
-			TraceID:           record.TraceID,
-			TraceNodeID:       record.TraceNodeID,
-			ParentTraceNodeID: record.ParentTraceNodeID,
-			AgentID:           record.AgentID,
-			SessionID:         record.SessionID,
-			Name:              record.Name,
-			Timestamp:         record.Timestamp,
-			Payload:           record.Payload,
+			SchemaVersion:   record.SchemaVersion,
+			Sequence:        record.Sequence,
+			RunID:           record.RunID,
+			RunNodeID:       record.RunNodeID,
+			ParentRunNodeID: record.ParentRunNodeID,
+			AgentID:         record.AgentID,
+			SessionID:       record.SessionID,
+			Name:            record.Name,
+			Timestamp:       record.Timestamp,
+			Payload:         record.Payload,
 		}
 	}
 	return gateway.SessionView{
@@ -1524,6 +1523,328 @@ func TestCLIModelSurfacesBackgroundTaskLifecycle(t *testing.T) {
 	assert.Contains(t, trace, "subagents:")
 	assert.Contains(t, trace, "task done")
 	assert.Contains(t, trace, "coder task completed")
+}
+
+func TestCLIModelDoesNotCountToolTasksAsSubagents(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_root",
+			AgentID:   "lead",
+			SessionID: "cli_local",
+			Name:      "run.completed",
+			Timestamp: now,
+		},
+		{
+			RunID:     "run_root",
+			AgentID:   "lead",
+			SessionID: "cli_local",
+			Name:      "task.started",
+			Timestamp: now.Add(100 * time.Millisecond),
+			Payload: map[string]any{
+				"task_id":   "task_tool_1",
+				"task_kind": "tool",
+				"tool":      "write_file",
+				"status":    "running",
+			},
+		},
+		{
+			RunID:     "run_root",
+			AgentID:   "lead",
+			SessionID: "cli_local",
+			Name:      "task.completed",
+			Timestamp: now.Add(200 * time.Millisecond),
+			Payload: map[string]any{
+				"task_id":   "task_tool_1",
+				"task_kind": "tool",
+				"tool":      "write_file",
+				"status":    "completed",
+				"summary":   "wrote file",
+			},
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	summary := model.runtimeSummary()
+	assert.Equal(t, 0, summary.RunsLive)
+	assert.Equal(t, 1, summary.RunsDone)
+	assert.Equal(t, 0, summary.SubagentsActive)
+	assert.Equal(t, 0, summary.SubagentsDone)
+	assert.Equal(t, 0, summary.SubagentsFailed)
+
+	trace := model.renderTrace()
+	assert.NotContains(t, trace, "subagents:")
+	assert.Contains(t, trace, "write_file")
+}
+
+func TestCLIModelDoesNotDoubleCountAgentTaskAndAgentCallCompletion(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "review-lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.started",
+			Timestamp: now,
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "report-generator",
+			SessionID: "cli_local",
+			Name:      "task.started",
+			Timestamp: now.Add(100 * time.Millisecond),
+			Payload: map[string]any{
+				"task_id":      "task_report",
+				"task_kind":    "agent",
+				"target_agent": "report-generator",
+				"status":       "running",
+			},
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "agent.call.started",
+			Timestamp: now.Add(200 * time.Millisecond),
+			Payload: map[string]any{
+				"id":           "call_report",
+				"target_agent": "report-generator",
+				"task":         "generate final report",
+			},
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "report-generator",
+			SessionID: "agentcall_report-generator_run_root",
+			Name:      "run.started",
+			Timestamp: now.Add(300 * time.Millisecond),
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::report-generator",
+			AgentID:   "report-generator",
+			SessionID: "agentcall_report-generator_run_root",
+			Name:      "run.completed",
+			Timestamp: now.Add(400 * time.Millisecond),
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "report-generator",
+			SessionID: "cli_local",
+			Name:      "task.completed",
+			Timestamp: now.Add(500 * time.Millisecond),
+			Payload: map[string]any{
+				"task_id":      "task_report",
+				"task_kind":    "agent",
+				"target_agent": "report-generator",
+				"status":       "completed",
+				"summary":      "report generated",
+			},
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "agent.call.completed",
+			Timestamp: now.Add(600 * time.Millisecond),
+			Payload: map[string]any{
+				"id":           "call_report",
+				"task_id":      "task_report",
+				"target_agent": "report-generator",
+				"status":       "completed",
+				"summary":      "report generated",
+			},
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.completed",
+			Timestamp: now.Add(700 * time.Millisecond),
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	summary := model.runtimeSummary()
+	assert.Equal(t, 0, summary.RunsLive)
+	assert.Equal(t, 2, summary.RunsDone)
+	assert.Equal(t, 0, summary.SubagentsActive)
+	assert.Equal(t, 1, summary.SubagentsDone)
+	assert.Equal(t, 0, summary.SubagentsFailed)
+}
+
+func TestCLIModelIgnoresLegacyAgentBaseOutputNodeWhenTaskNodeCompleted(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "review-lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.started",
+			Timestamp: now,
+		},
+		{
+			RunID:           "run_root",
+			RunNodeID:       "run_root::report-generator",
+			ParentRunNodeID: "run_root::review-lead",
+			AgentID:         "report-generator",
+			SessionID:       "agentcall_report-generator_run_root",
+			Name:            "session.output.stored",
+			Timestamp:       now.Add(100 * time.Millisecond),
+			Payload: map[string]any{
+				"text": "final report ready",
+			},
+		},
+		{
+			RunID:           "run_root",
+			RunNodeID:       "run_root::report-generator::task_report",
+			ParentRunNodeID: "run_root::review-lead",
+			AgentID:         "report-generator",
+			SessionID:       "agentcall_report-generator_run_root",
+			Name:            "run.completed",
+			Timestamp:       now.Add(200 * time.Millisecond),
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.completed",
+			Timestamp: now.Add(300 * time.Millisecond),
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	summary := model.runtimeSummary()
+	assert.Equal(t, "idle", summary.State)
+	assert.Equal(t, 0, summary.RunsLive)
+	assert.Equal(t, 2, summary.RunsDone)
+	assert.Equal(t, "queued", model.traceNodes["run_root::report-generator"].status)
+	assert.Equal(t, 0, model.runningRunCount())
+	assert.Equal(t, "idle", model.runtimeStatusLabel())
+	assert.Contains(t, model.renderHeader(140), "idle")
+}
+
+func TestCLIModelTopStateIgnoresTerminalNodeWithStaleBackgroundTask(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "review-lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.started",
+			Timestamp: now,
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "task.running",
+			Timestamp: now.Add(100 * time.Millisecond),
+			Payload: map[string]any{
+				"task_id":   "task_tool",
+				"task_kind": "tool",
+				"tool":      "write_file",
+				"status":    "running",
+			},
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::review-lead",
+			AgentID:   "review-lead",
+			SessionID: "cli_local",
+			Name:      "run.completed",
+			Timestamp: now.Add(200 * time.Millisecond),
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	summary := model.runtimeSummary()
+	assert.Equal(t, 0, summary.RunsLive)
+	assert.Equal(t, 1, summary.RunsDone)
+	assert.Equal(t, "idle", summary.State)
+	assert.Equal(t, 0, model.runningRunCount())
+	assert.Equal(t, "idle", model.runtimeStatusLabel())
+}
+
+func TestCLIModelRunLifecycleUsesAgentTraceKeyWhenRunNodeIDConflicts(t *testing.T) {
+	model := newCLIModel("/tmp/demo-project", "lead", func(string) {})
+	now := time.Now()
+
+	events := []gateway.RunEvent{
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::lead",
+			AgentID:   "lead",
+			SessionID: "cli_local",
+			Name:      "run.started",
+			Timestamp: now,
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::lead",
+			AgentID:   "lead",
+			SessionID: "cli_local",
+			Name:      "run.completed",
+			Timestamp: now.Add(100 * time.Millisecond),
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::lead",
+			AgentID:   "worker",
+			SessionID: "agentcall_worker_run_root",
+			Name:      "run.started",
+			Timestamp: now.Add(200 * time.Millisecond),
+		},
+		{
+			RunID:     "run_root",
+			RunNodeID: "run_root::worker",
+			AgentID:   "worker",
+			SessionID: "agentcall_worker_run_root",
+			Name:      "run.completed",
+			Timestamp: now.Add(300 * time.Millisecond),
+		},
+	}
+	for _, event := range events {
+		updated, _ := model.Update(cliRunEventMsg{Event: event})
+		model = updated.(*cliModel)
+	}
+
+	summary := model.runtimeSummary()
+	assert.Equal(t, 0, summary.RunsLive)
+	assert.Equal(t, 2, summary.RunsDone)
+	assert.Equal(t, "completed", model.traceNodes["run_root::lead"].status)
+	assert.Equal(t, "completed", model.traceNodes["run_root::worker"].status)
 }
 
 func TestCLIModelSupportsShortcutQuit(t *testing.T) {

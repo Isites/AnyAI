@@ -31,6 +31,7 @@ type RunRequest struct {
 	MessageID     string
 	Images        []llm.ImageContent
 	TaskID        string
+	ParentTaskID  string
 	ParentAgentID string
 	Channel       string
 	Contract      // embedded

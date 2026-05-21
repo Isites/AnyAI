@@ -276,6 +276,7 @@ type cliTraceNode struct {
 	runID            string
 	agentID          string
 	sessionID        string
+	taskID           string
 	parentTraceKey   string
 	parentRunID      string
 	parentAgentID    string
@@ -288,6 +289,7 @@ type cliTraceNode struct {
 	lastEventAt      time.Time
 	eventCount       int
 	textDeltaCount   int
+	hasRunLifecycle  bool
 	activeToolCalls  map[string]string
 	activeAgentCalls map[string]string
 	backgroundTasks  map[string]cliBackgroundTask
@@ -298,11 +300,14 @@ type cliTraceNode struct {
 }
 
 type cliBackgroundTask struct {
-	agentID string
-	status  string
-	summary string
-	err     string
-	at      time.Time
+	taskID               string
+	agentID              string
+	kind                 string
+	status               string
+	summary              string
+	err                  string
+	at                   time.Time
+	representedAgentCall bool
 }
 
 type cliRuntimeSummary struct {
@@ -2384,6 +2389,9 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 			node.lastEventName = event.Name
 			node.lastEventSummary = summarizeCLITraceEvent(event)
 		}
+		if cliEventIsRunLifecycle(event.Name) {
+			node.hasRunLifecycle = true
+		}
 		node.lastEventAt = event.Timestamp
 
 		switch event.Name {
@@ -2460,8 +2468,12 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 				event.Timestamp,
 			)
 			if (status == "running" || status == "queued") && taskID != "" {
-				cliRememberBackgroundTask(node.backgroundTasks, taskID, target, status, payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
+				cliRememberBackgroundTask(node.backgroundTasks, taskID, "agent", target, status, payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
 				break
+			}
+			if taskID != "" {
+				cliRememberBackgroundTask(node.backgroundTasks, taskID, "agent", target, status, payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
+				cliMarkBackgroundTaskRepresentedByAgentCall(node.backgroundTasks, taskID)
 			}
 			if status == "failed" || payloadString(event.Payload, "error") != "" {
 				node.agentCallsFailed++
@@ -2470,7 +2482,14 @@ func (m *cliModel) applyRunEvent(event gateway.RunEvent) {
 			}
 		case "task.queued", "task.started", "task.running", "task.completed", "task.failed", "task.cancelled":
 			node.status = coalesceCLIStatus(node.status, "running")
-			cliRememberBackgroundTask(node.backgroundTasks, payloadString(event.Payload, "task_id"), nonEmptyCLI(payloadString(event.Payload, "target_agent"), "agent"), nonEmptyCLI(payloadString(event.Payload, "status"), strings.TrimPrefix(event.Name, "task.")), payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
+			taskKind := cliBackgroundTaskKind(event)
+			cliRememberBackgroundTask(node.backgroundTasks, payloadString(event.Payload, "task_id"), taskKind, cliBackgroundTaskLabel(event), nonEmptyCLI(payloadString(event.Payload, "status"), strings.TrimPrefix(event.Name, "task.")), payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
+			if cliTaskEventIsAgentChild(event) && (strings.TrimSpace(event.RunNodeID) == "" || strings.TrimSpace(event.ParentRunNodeID) != "") {
+				parentKey := nonEmptyCLI(strings.TrimSpace(event.ParentRunNodeID), node.parentTraceKey, cliTraceKey(event.RunID, event.AgentID))
+				if parent := m.traceNodes[parentKey]; parent != nil {
+					cliRememberBackgroundTask(parent.backgroundTasks, payloadString(event.Payload, "task_id"), taskKind, cliBackgroundTaskLabel(event), nonEmptyCLI(payloadString(event.Payload, "status"), strings.TrimPrefix(event.Name, "task.")), payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"), event.Timestamp)
+				}
+			}
 		case "run.completed":
 			node.status = "completed"
 			node.completedAt = event.Timestamp
@@ -2527,13 +2546,15 @@ func (m *cliModel) addActivity(title, detail string, at time.Time, tone string, 
 
 func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 	traceKey := cliTraceKeyForEvent(event)
+	nodeAgentID := cliEventRunNodeAgentID(event)
 	node, ok := m.traceNodes[traceKey]
 	if !ok {
 		node = &cliTraceNode{
 			traceKey:         traceKey,
 			runID:            event.RunID,
-			agentID:          event.AgentID,
+			agentID:          nodeAgentID,
 			sessionID:        event.SessionID,
+			taskID:           payloadString(event.Payload, "task_id"),
 			parentAgentID:    event.ParentAgentID,
 			status:           "queued",
 			startedAt:        event.Timestamp,
@@ -2551,15 +2572,23 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 		node.traceKey = traceKey
 	}
 	if node.agentID == "" {
-		node.agentID = event.AgentID
+		node.agentID = nodeAgentID
 	}
 	if node.sessionID == "" {
 		node.sessionID = event.SessionID
 	}
+	if node.taskID == "" {
+		if keyTask := cliTraceKeyTask(node.traceKey); keyTask != "" {
+			node.taskID = keyTask
+		}
+	}
+	if node.taskID == "" && cliTaskEventIsAgentChild(event) {
+		node.taskID = payloadString(event.Payload, "task_id")
+	}
 	if node.parentAgentID == "" {
 		node.parentAgentID = event.ParentAgentID
 	}
-	if strings.TrimSpace(event.ParentTraceNodeID) == "" &&
+	if strings.TrimSpace(event.ParentRunNodeID) == "" &&
 		node.parentRunID == "" &&
 		strings.TrimSpace(node.runID) != "" &&
 		strings.TrimSpace(node.traceKey) != strings.TrimSpace(m.lastTreeTraceKey) &&
@@ -2570,12 +2599,33 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 			node.parentRunID = parent.runID
 		}
 	}
-	if parentKey := strings.TrimSpace(event.ParentTraceNodeID); parentKey != "" && parentKey != node.traceKey {
+	if node.parentTraceKey == "" && cliTaskEventIsAgentChild(event) {
+		parentKey := cliTraceKey(event.RunID, event.AgentID)
+		if parentKey != "" && parentKey != node.traceKey {
+			node.parentTraceKey = parentKey
+			node.parentRunID = event.RunID
+			node.parentAgentID = event.AgentID
+		}
+	}
+	if parentKey := strings.TrimSpace(event.ParentRunNodeID); parentKey != "" && parentKey != node.traceKey {
 		node.parentTraceKey = parentKey
 		if parent := m.traceNodes[parentKey]; parent != nil {
 			node.parentRunID = parent.runID
 			if node.parentAgentID == "" {
 				node.parentAgentID = parent.agentID
+			}
+		}
+	}
+	if node.parentTraceKey == "" {
+		if parentKey := cliLifecycleMismatchedRunNodeID(event); parentKey != "" && parentKey != node.traceKey {
+			node.parentTraceKey = parentKey
+			node.parentRunID = cliTraceKeyRun(parentKey)
+			node.parentAgentID = cliTraceKeyAgent(parentKey)
+			if parent := m.traceNodes[parentKey]; parent != nil {
+				node.parentRunID = parent.runID
+				if node.parentAgentID == "" {
+					node.parentAgentID = parent.agentID
+				}
 			}
 		}
 	}
@@ -2602,23 +2652,114 @@ func (m *cliModel) ensureTraceNode(event gateway.RunEvent) *cliTraceNode {
 	return node
 }
 
-func cliTraceKey(runID, agentID string) string {
+func cliTraceKey(runID, agentID string, taskID ...string) string {
 	runID = strings.TrimSpace(runID)
 	agentID = strings.TrimSpace(agentID)
+	task := ""
+	if len(taskID) > 0 {
+		task = strings.TrimSpace(taskID[0])
+	}
 	if runID == "" {
 		return ""
 	}
-	if agentID == "" {
-		return runID + "::"
+	if task == "" {
+		return runID + "::" + agentID
 	}
-	return runID + "::" + agentID
+	return runID + "::" + agentID + "::" + task
 }
 
 func cliTraceKeyForEvent(event gateway.RunEvent) string {
-	if key := strings.TrimSpace(event.TraceNodeID); key != "" {
+	if key := strings.TrimSpace(event.RunNodeID); key != "" {
+		if cliRunLifecycleEventUsesAgentTraceKey(event, key) {
+			return cliTraceKey(event.RunID, event.AgentID, payloadString(event.Payload, "task_id"))
+		}
 		return key
 	}
+	if cliTaskEventIsAgentChild(event) {
+		return cliTraceKey(event.RunID, cliEventRunNodeAgentID(event), payloadString(event.Payload, "task_id"))
+	}
 	return cliTraceKey(event.RunID, event.AgentID)
+}
+
+func cliTaskEventIsAgentChild(event gateway.RunEvent) bool {
+	switch strings.TrimSpace(event.Name) {
+	case "task.queued", "task.started", "task.running", "task.completed", "task.failed", "task.cancelled":
+	default:
+		return false
+	}
+	if cliBackgroundTaskKind(event) != "agent" {
+		return false
+	}
+	return payloadString(event.Payload, "task_id") != ""
+}
+
+func cliEventRunNodeAgentID(event gateway.RunEvent) string {
+	if cliTaskEventIsAgentChild(event) {
+		return nonEmptyCLI(payloadString(event.Payload, "target_agent"), payloadString(event.Payload, "agent"), event.AgentID)
+	}
+	return event.AgentID
+}
+
+func cliRunLifecycleEventUsesAgentTraceKey(event gateway.RunEvent, traceKey string) bool {
+	switch strings.TrimSpace(event.Name) {
+	case "run.queued", "run.routed", "run.accepted", "run.started", "run.completed", "run.failed", "run.aborted":
+	default:
+		return false
+	}
+	agentID := strings.TrimSpace(event.AgentID)
+	traceAgentID := cliTraceKeyAgent(traceKey)
+	return agentID != "" && traceAgentID != "" && traceAgentID != agentID
+}
+
+func cliLifecycleMismatchedRunNodeID(event gateway.RunEvent) string {
+	traceKey := strings.TrimSpace(event.RunNodeID)
+	if traceKey == "" || !cliRunLifecycleEventUsesAgentTraceKey(event, traceKey) {
+		return ""
+	}
+	return traceKey
+}
+
+func cliTraceKeyRun(traceKey string) string {
+	traceKey = strings.TrimSpace(traceKey)
+	if traceKey == "" {
+		return ""
+	}
+	if idx := strings.Index(traceKey, "::"); idx >= 0 {
+		return strings.TrimSpace(traceKey[:idx])
+	}
+	return traceKey
+}
+
+func cliTraceKeyAgent(traceKey string) string {
+	traceKey = strings.TrimSpace(traceKey)
+	if traceKey == "" {
+		return ""
+	}
+	if idx := strings.Index(traceKey, "::"); idx >= 0 {
+		rest := traceKey[idx+2:]
+		if next := strings.Index(rest, "::"); next >= 0 {
+			return strings.TrimSpace(rest[:next])
+		}
+		return strings.TrimSpace(rest)
+	}
+	return ""
+}
+
+func cliTraceKeyTask(traceKey string) string {
+	traceKey = strings.TrimSpace(traceKey)
+	if traceKey == "" {
+		return ""
+	}
+	first := strings.Index(traceKey, "::")
+	if first < 0 {
+		return ""
+	}
+	rest := traceKey[first+2:]
+	second := strings.Index(rest, "::")
+	if second < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[second+2:])
 }
 
 func (m *cliModel) findTraceKeyByRunID(runID string) string {
@@ -2635,21 +2776,8 @@ func (m *cliModel) findTraceKeyByRunID(runID string) string {
 }
 
 func (m *cliModel) runningRunCount() int {
-	count := 0
-	for _, node := range m.traceNodes {
-		if node == nil {
-			continue
-		}
-		if node.status == "running" || node.status == "queued" {
-			count++
-		}
-	}
-	if count == 0 {
-		if active, _, _, _ := m.backgroundTaskCounts(); active > 0 {
-			return active
-		}
-	}
-	return count
+	running, _, _ := m.traceStatusCounts()
+	return running
 }
 
 func (m *cliModel) runtimeSummary() cliRuntimeSummary {
@@ -2668,8 +2796,15 @@ func (m *cliModel) runtimeSummary() cliRuntimeSummary {
 }
 
 func (m *cliModel) traceStatusCounts() (running, completed, failed int) {
-	for _, node := range m.traceNodes {
+	for key, node := range m.traceNodes {
 		if node == nil {
+			continue
+		}
+		if m.isShadowAgentBaseTraceNode(key, node) {
+			continue
+		}
+		if cliActiveBackgroundTaskCount(node) > 0 && !cliTraceNodeTerminal(node) {
+			running++
 			continue
 		}
 		switch node.status {
@@ -2684,31 +2819,129 @@ func (m *cliModel) traceStatusCounts() (running, completed, failed int) {
 	return running, completed, failed
 }
 
+func (m *cliModel) isShadowAgentBaseTraceNode(traceKey string, node *cliTraceNode) bool {
+	if m == nil || node == nil {
+		return false
+	}
+	traceKey = strings.TrimSpace(traceKey)
+	if traceKey == "" || cliTraceKeyTask(traceKey) != "" {
+		return false
+	}
+	agentID := strings.TrimSpace(node.agentID)
+	runID := strings.TrimSpace(node.runID)
+	if runID == "" {
+		runID = cliTraceKeyRun(traceKey)
+	}
+	if agentID == "" {
+		agentID = cliTraceKeyAgent(traceKey)
+	}
+	if runID == "" || agentID == "" || agentID == strings.TrimSpace(m.entryAgentID) {
+		return false
+	}
+	if hasRuntimeLifecycleEvent(node) || hasActiveRuntimeWork(node) {
+		return false
+	}
+	for otherKey, other := range m.traceNodes {
+		if other == nil || strings.TrimSpace(otherKey) == traceKey {
+			continue
+		}
+		if strings.TrimSpace(other.runID) != runID && cliTraceKeyRun(otherKey) != runID {
+			continue
+		}
+		if strings.TrimSpace(other.agentID) != agentID && cliTraceKeyAgent(otherKey) != agentID {
+			continue
+		}
+		if cliTraceKeyTask(otherKey) == "" {
+			continue
+		}
+		switch other.status {
+		case "completed", "failed", "aborted":
+			return true
+		}
+	}
+	return false
+}
+
+func hasRuntimeLifecycleEvent(node *cliTraceNode) bool {
+	if node == nil {
+		return false
+	}
+	return node.hasRunLifecycle
+}
+
+func cliEventIsRunLifecycle(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "run.queued", "run.routed", "run.accepted", "run.started", "run.completed", "run.failed", "run.aborted":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasActiveRuntimeWork(node *cliTraceNode) bool {
+	if node == nil {
+		return false
+	}
+	if cliTraceNodeTerminal(node) {
+		return false
+	}
+	if len(node.activeToolCalls) > 0 || len(node.activeAgentCalls) > 0 || cliActiveBackgroundTaskCount(node) > 0 {
+		return true
+	}
+	return false
+}
+
+func cliTraceNodeTerminal(node *cliTraceNode) bool {
+	if node == nil {
+		return false
+	}
+	switch strings.TrimSpace(node.status) {
+	case "completed", "failed", "aborted":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *cliModel) agentCallStatusCounts() (active, completed, failed int) {
-	taskActive, taskCompleted, taskFailed, taskCancelled := m.backgroundTaskCounts()
-	for _, node := range m.traceNodes {
+	for key, node := range m.traceNodes {
 		if node == nil {
 			continue
 		}
-		active += len(node.activeAgentCalls)
+		if m.isShadowAgentBaseTraceNode(key, node) {
+			continue
+		}
+		terminal := cliTraceNodeTerminal(node)
+		if !terminal {
+			active += len(node.activeAgentCalls)
+		}
 		completed += node.agentCallsDone
 		failed += node.agentCallsFailed
+		taskActive, taskCompleted, taskFailed, taskCancelled := cliBackgroundTaskAgentStatusCounts(node)
+		if !terminal {
+			active += taskActive
+		}
+		completed += taskCompleted
+		failed += taskFailed + taskCancelled
 	}
-	active += taskActive
-	completed += taskCompleted
-	failed += taskFailed + taskCancelled
 	return active, completed, failed
 }
 
 func (m *cliModel) backgroundTaskCounts() (active, completed, failed, cancelled int) {
-	for _, node := range m.traceNodes {
+	for key, node := range m.traceNodes {
 		if node == nil {
 			continue
 		}
+		if m.isShadowAgentBaseTraceNode(key, node) {
+			continue
+		}
+		terminal := cliTraceNodeTerminal(node)
 		for _, task := range node.backgroundTasks {
 			switch task.status {
 			case "queued", "running":
-				active++
+				if !terminal {
+					active++
+				}
 			case "completed":
 				completed++
 			case "failed":
@@ -2728,8 +2961,11 @@ func (m *cliModel) runtimeStatusLabel() string {
 	if active, _, _ := m.agentCallStatusCounts(); active > 0 {
 		return "subagent active"
 	}
-	for _, node := range m.traceNodes {
+	for key, node := range m.traceNodes {
 		if node == nil {
+			continue
+		}
+		if m.isShadowAgentBaseTraceNode(key, node) || cliTraceNodeTerminal(node) {
 			continue
 		}
 		if cliTracePhaseKind(node) == "generating" {
@@ -2737,8 +2973,11 @@ func (m *cliModel) runtimeStatusLabel() string {
 		}
 	}
 	activeTools := 0
-	for _, node := range m.traceNodes {
+	for key, node := range m.traceNodes {
 		if node == nil {
+			continue
+		}
+		if m.isShadowAgentBaseTraceNode(key, node) || cliTraceNodeTerminal(node) {
 			continue
 		}
 		activeTools += len(node.activeToolCalls)
@@ -3038,7 +3277,7 @@ func (m *cliModel) formatCLIEventDetail(event gateway.RunEvent) string {
 			lines = append(lines, "task "+taskID+"  •  "+nonEmptyCLI(payloadString(event.Payload, "status"), "running"))
 		}
 	case "task.queued", "task.started", "task.running", "task.completed", "task.failed", "task.cancelled":
-		lines = append(lines, "task "+shortID(payloadString(event.Payload, "task_id"))+"  •  "+nonEmptyCLI(payloadString(event.Payload, "target_agent"), "agent"))
+		lines = append(lines, "task "+shortID(payloadString(event.Payload, "task_id"))+"  •  "+cliBackgroundTaskLabel(event))
 		if summary := payloadString(event.Payload, "summary"); summary != "" {
 			lines = append(lines, trimForDisplay(summary, 180))
 		}
@@ -3171,7 +3410,7 @@ func renderCLITracePhase(node *cliTraceNode) string {
 		style = style.Foreground(cliSurfaceColor).Background(cliAssistantColor)
 	case "calling", "integrating":
 		style = style.Foreground(cliSurfaceColor).Background(cliAccentColor)
-	case "tooling":
+	case "tooling", "tasking":
 		style = style.Foreground(cliSurfaceColor).Background(cliUserColor)
 	default:
 		style = style.Foreground(cliSurfaceColor).Background(cliSystemColor)
@@ -3273,10 +3512,7 @@ func summarizeCLITraceEvent(event gateway.RunEvent) string {
 		}
 		return "agent call completed"
 	case "task.queued", "task.started", "task.running", "task.completed", "task.failed", "task.cancelled":
-		target := payloadString(event.Payload, "target_agent")
-		if target == "" {
-			target = "agent"
-		}
+		target := cliBackgroundTaskLabel(event)
 		status := nonEmptyCLI(payloadString(event.Payload, "status"), strings.TrimPrefix(event.Name, "task."))
 		if status == "failed" {
 			if errMsg := payloadString(event.Payload, "error"); errMsg != "" {
@@ -3852,9 +4088,6 @@ func cliTracePhaseKind(node *cliTraceNode) string {
 	if node == nil {
 		return "waiting"
 	}
-	if node.status == "completed" && cliActiveBackgroundTaskCount(node) > 0 {
-		return "calling"
-	}
 	switch node.status {
 	case "completed":
 		return "completed"
@@ -3867,7 +4100,10 @@ func cliTracePhaseKind(node *cliTraceNode) string {
 		return "calling"
 	}
 	if cliActiveBackgroundTaskCount(node) > 0 {
-		return "calling"
+		if cliActiveAgentBackgroundTaskCount(node) > 0 {
+			return "calling"
+		}
+		return "tasking"
 	}
 	if len(node.activeToolCalls) > 0 {
 		return "tooling"
@@ -3895,7 +4131,7 @@ func cliTracePhaseLabel(node *cliTraceNode) string {
 	case "calling":
 		active := 0
 		if node != nil {
-			active = len(node.activeAgentCalls) + cliActiveBackgroundTaskCount(node)
+			active = len(node.activeAgentCalls) + cliActiveAgentBackgroundTaskCount(node)
 		}
 		if active > 1 {
 			return fmt.Sprintf("subagents x%d", active)
@@ -3906,6 +4142,15 @@ func cliTracePhaseLabel(node *cliTraceNode) string {
 			return fmt.Sprintf("tools x%d", len(node.activeToolCalls))
 		}
 		return "tool active"
+	case "tasking":
+		active := 0
+		if node != nil {
+			active = cliActiveBackgroundTaskCount(node)
+		}
+		if active > 1 {
+			return fmt.Sprintf("tasks x%d", active)
+		}
+		return "task active"
 	case "generating":
 		return "generating"
 	case "integrating":
@@ -3935,10 +4180,15 @@ func cliTracePhaseDetail(node *cliTraceNode) string {
 	case "queued":
 		return "queued for execution"
 	case "calling":
-		if footprint := cliTraceBackgroundFootprint(node, 3); footprint != "" {
+		if footprint := cliTraceAgentBackgroundFootprint(node, 3); footprint != "" {
 			return "waiting on subagent " + footprint
 		}
 		return "waiting on subagent"
+	case "tasking":
+		if footprint := cliTraceBackgroundFootprint(node, 3); footprint != "" {
+			return "waiting on task " + footprint
+		}
+		return "waiting on background task"
 	case "tooling":
 		return "running tool " + cliTraceListNames(node.activeToolCalls, 3)
 	case "generating":
@@ -3963,7 +4213,7 @@ func cliTraceAgentCallFootprint(node *cliTraceNode) string {
 	if active := len(node.activeAgentCalls); active > 0 {
 		parts = append(parts, fmt.Sprintf("%d active", active))
 	}
-	backgroundActive, backgroundCompleted, backgroundFailed, backgroundCancelled := cliBackgroundTaskStatusCounts(node)
+	backgroundActive, backgroundCompleted, backgroundFailed, backgroundCancelled := cliBackgroundTaskAgentStatusCounts(node)
 	if backgroundActive > 0 {
 		parts = append(parts, fmt.Sprintf("%d task active", backgroundActive))
 	}
@@ -4008,11 +4258,15 @@ func cliTraceListNames(items map[string]string, limit int) string {
 	return strings.Join(values, ", ")
 }
 
-func cliRememberBackgroundTask(tasks map[string]cliBackgroundTask, taskID, agentID, status, summary, err string, at time.Time) {
+func cliRememberBackgroundTask(tasks map[string]cliBackgroundTask, taskID, kind, agentID, status, summary, err string, at time.Time) {
 	if tasks == nil || strings.TrimSpace(taskID) == "" {
 		return
 	}
 	current := tasks[taskID]
+	current.taskID = strings.TrimSpace(taskID)
+	if strings.TrimSpace(kind) != "" {
+		current.kind = kind
+	}
 	if strings.TrimSpace(agentID) != "" {
 		current.agentID = agentID
 	}
@@ -4031,8 +4285,29 @@ func cliRememberBackgroundTask(tasks map[string]cliBackgroundTask, taskID, agent
 	tasks[taskID] = current
 }
 
+func cliMarkBackgroundTaskRepresentedByAgentCall(tasks map[string]cliBackgroundTask, taskID string) {
+	if tasks == nil {
+		return
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	current := tasks[taskID]
+	if strings.TrimSpace(current.kind) == "" {
+		current.kind = "agent"
+	}
+	current.representedAgentCall = true
+	tasks[taskID] = current
+}
+
 func cliActiveBackgroundTaskCount(node *cliTraceNode) int {
 	active, _, _, _ := cliBackgroundTaskStatusCounts(node)
+	return active
+}
+
+func cliActiveAgentBackgroundTaskCount(node *cliTraceNode) int {
+	active, _, _, _ := cliBackgroundTaskAgentStatusCounts(node)
 	return active
 }
 
@@ -4055,6 +4330,67 @@ func cliBackgroundTaskStatusCounts(node *cliTraceNode) (active, completed, faile
 	return active, completed, failed, cancelled
 }
 
+func cliBackgroundTaskAgentStatusCounts(node *cliTraceNode) (active, completed, failed, cancelled int) {
+	if node == nil {
+		return 0, 0, 0, 0
+	}
+	for _, task := range node.backgroundTasks {
+		if !cliBackgroundTaskIsAgent(task) {
+			continue
+		}
+		if strings.TrimSpace(task.taskID) != "" && strings.TrimSpace(task.taskID) == strings.TrimSpace(node.taskID) {
+			continue
+		}
+		if task.representedAgentCall {
+			continue
+		}
+		switch task.status {
+		case "queued", "running":
+			active++
+		case "completed":
+			completed++
+		case "failed":
+			failed++
+		case "cancelled":
+			cancelled++
+		}
+	}
+	return active, completed, failed, cancelled
+}
+
+func cliBackgroundTaskIsAgent(task cliBackgroundTask) bool {
+	return strings.TrimSpace(task.kind) == "agent"
+}
+
+func cliBackgroundTaskLabel(event gateway.RunEvent) string {
+	switch cliBackgroundTaskKind(event) {
+	case "agent":
+		return nonEmptyCLI(payloadString(event.Payload, "target_agent"), "agent")
+	case "tool":
+		return nonEmptyCLI(payloadString(event.Payload, "tool"), payloadString(event.Payload, "target_agent"), "tool")
+	case "process":
+		return nonEmptyCLI(payloadString(event.Payload, "process"), "process")
+	default:
+		return nonEmptyCLI(payloadString(event.Payload, "target_agent"), payloadString(event.Payload, "tool"), payloadString(event.Payload, "process"), "task")
+	}
+}
+
+func cliBackgroundTaskKind(event gateway.RunEvent) string {
+	if kind := strings.TrimSpace(payloadString(event.Payload, "task_kind")); kind != "" {
+		return kind
+	}
+	if strings.TrimSpace(payloadString(event.Payload, "target_agent")) != "" {
+		return "agent"
+	}
+	if strings.TrimSpace(payloadString(event.Payload, "tool")) != "" {
+		return "tool"
+	}
+	if strings.TrimSpace(payloadString(event.Payload, "process")) != "" {
+		return "process"
+	}
+	return ""
+}
+
 func cliTraceBackgroundFootprint(node *cliTraceNode, limit int) string {
 	if node == nil {
 		return ""
@@ -4064,6 +4400,30 @@ func cliTraceBackgroundFootprint(node *cliTraceNode, limit int) string {
 		names[key] = value
 	}
 	for taskID, task := range node.backgroundTasks {
+		if task.status != "queued" && task.status != "running" {
+			continue
+		}
+		label := nonEmptyCLI(task.agentID, "agent")
+		if strings.TrimSpace(task.status) != "" {
+			label += " (" + task.status + ")"
+		}
+		names[taskID] = label
+	}
+	return cliTraceListNames(names, limit)
+}
+
+func cliTraceAgentBackgroundFootprint(node *cliTraceNode, limit int) string {
+	if node == nil {
+		return ""
+	}
+	names := make(map[string]string, len(node.activeAgentCalls)+len(node.backgroundTasks))
+	for key, value := range node.activeAgentCalls {
+		names[key] = value
+	}
+	for taskID, task := range node.backgroundTasks {
+		if !cliBackgroundTaskIsAgent(task) {
+			continue
+		}
 		if task.status != "queued" && task.status != "running" {
 			continue
 		}

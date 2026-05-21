@@ -140,7 +140,7 @@ func (r *Runtime) DoAgentParallel(ctx context.Context, tasks []tools.AgentCallRe
 func (r *Runtime) submitAgentTask(ctx context.Context, launch agentCallLaunch, req tools.AgentCallRequest, callback task.Callback) (string, error) {
 	return r.DoTask(ctx, task.Spec{
 		Kind:          task.KindAgent,
-		AgentID:       req.Agent,
+		AgentID:       launch.meta.AgentID,
 		RunID:         firstNonEmptyAgentCall(launch.meta.RunID, launch.runID),
 		SessionID:     launch.meta.SessionID,
 		IdleTimeoutMS: launch.idleTimeoutMS,

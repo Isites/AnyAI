@@ -222,14 +222,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 		defer close(events)
 		defer stream.Close()
 
-		// Track tool calls being built up across events
-		type pendingTC struct {
-			id        string
-			name      string
-			inputJSON string
-		}
-		var pendingTools []pendingTC
-		var currentBlockType string
+		tracker := newAnthropicToolCallTracker()
 
 		for stream.Next() {
 			event := stream.Current()
@@ -240,13 +233,8 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 				cb := event.ContentBlock
 				switch cb.Type {
 				case "text":
-					currentBlockType = "text"
 				case "tool_use":
-					currentBlockType = "tool_use"
-					pendingTools = append(pendingTools, pendingTC{
-						id:   cb.ID,
-						name: cb.Name,
-					})
+					tracker.start(event.Index, cb.ID, cb.Name, cb.Input)
 					events <- ChatEvent{
 						Type: EventToolCallStart,
 						ToolCall: &ToolCall{
@@ -265,24 +253,18 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 						Text: delta.Text,
 					}
 				case "input_json_delta":
-					if len(pendingTools) > 0 {
-						pendingTools[len(pendingTools)-1].inputJSON += delta.PartialJSON
-					}
+					tracker.append(event.Index, delta.PartialJSON)
 				}
 
 			case "content_block_stop":
-				if currentBlockType == "tool_use" && len(pendingTools) > 0 {
-					tc := pendingTools[len(pendingTools)-1]
-					events <- ChatEvent{
-						Type: EventToolCallDone,
-						ToolCall: &ToolCall{
-							ID:    tc.id,
-							Name:  tc.name,
-							Input: json.RawMessage(tc.inputJSON),
-						},
-					}
+				tc, ok, err := tracker.stop(event.Index)
+				if err != nil {
+					events <- ChatEvent{Type: EventError, Error: err}
+					return
 				}
-				currentBlockType = ""
+				if ok {
+					events <- ChatEvent{Type: EventToolCallDone, ToolCall: tc}
+				}
 
 			case "message_delta":
 				if event.Usage.OutputTokens > 0 {
@@ -295,10 +277,18 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 				}
 
 			case "message_stop":
-				// Final event — nothing extra to emit
+				if err := tracker.errIfPending(); err != nil {
+					events <- ChatEvent{Type: EventError, Error: err}
+					return
+				}
 
 			case "error":
 				runtimelogging.Error("anthropic stream error", "event", event.Type)
+				events <- ChatEvent{
+					Type:  EventError,
+					Error: fmt.Errorf("anthropic stream returned an error event"),
+				}
+				return
 			}
 		}
 
@@ -307,10 +297,114 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest) (<-
 				Type:  EventError,
 				Error: err,
 			}
+			return
+		}
+		if err := tracker.errIfPending(); err != nil {
+			events <- ChatEvent{Type: EventError, Error: err}
 		}
 	}()
 
 	return events, nil
+}
+
+type anthropicPendingToolCall struct {
+	id        string
+	name      string
+	inputJSON string
+}
+
+type anthropicToolCallTracker struct {
+	pending map[int64]*anthropicPendingToolCall
+}
+
+func newAnthropicToolCallTracker() *anthropicToolCallTracker {
+	return &anthropicToolCallTracker{
+		pending: make(map[int64]*anthropicPendingToolCall),
+	}
+}
+
+func (t *anthropicToolCallTracker) start(index int64, id, name string, initialInput ...any) {
+	if t == nil {
+		return
+	}
+	if t.pending == nil {
+		t.pending = make(map[int64]*anthropicPendingToolCall)
+	}
+	t.pending[index] = &anthropicPendingToolCall{
+		id:        id,
+		name:      name,
+		inputJSON: anthropicInitialToolInputJSON(initialInput...),
+	}
+}
+
+func (t *anthropicToolCallTracker) append(index int64, partialJSON string) {
+	if t == nil || partialJSON == "" {
+		return
+	}
+	pending := t.pending[index]
+	if pending == nil {
+		return
+	}
+	pending.inputJSON += partialJSON
+}
+
+func (t *anthropicToolCallTracker) stop(index int64) (*ToolCall, bool, error) {
+	if t == nil || len(t.pending) == 0 {
+		return nil, false, nil
+	}
+	pending := t.pending[index]
+	if pending == nil {
+		return nil, false, nil
+	}
+	delete(t.pending, index)
+	input := strings.TrimSpace(pending.inputJSON)
+	if input == "" {
+		input = "{}"
+	}
+	if !json.Valid([]byte(input)) {
+		return nil, false, fmt.Errorf("anthropic stream emitted malformed tool-call JSON for %s", pending.name)
+	}
+	return &ToolCall{
+		ID:    pending.id,
+		Name:  pending.name,
+		Input: json.RawMessage(input),
+	}, true, nil
+}
+
+func (t *anthropicToolCallTracker) errIfPending() error {
+	if t == nil || len(t.pending) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(t.pending))
+	for _, pending := range t.pending {
+		if pending == nil {
+			continue
+		}
+		name := strings.TrimSpace(pending.name)
+		if name == "" {
+			name = "unknown"
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("anthropic stream ended before %d tool call(s) completed", len(t.pending))
+	}
+	return fmt.Errorf("anthropic stream ended before tool call input completed for %s", strings.Join(names, ", "))
+}
+
+func anthropicInitialToolInputJSON(values ...any) string {
+	if len(values) == 0 || values[0] == nil {
+		return ""
+	}
+	data, err := json.Marshal(values[0])
+	if err != nil {
+		return ""
+	}
+	input := strings.TrimSpace(string(data))
+	if input == "" || input == "null" || input == "{}" || !strings.HasPrefix(input, "{") {
+		return ""
+	}
+	return input
 }
 
 func (p *AnthropicProvider) compactNative(ctx context.Context, req CompactRequest) (CompactResponse, error) {

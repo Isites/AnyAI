@@ -1589,36 +1589,18 @@ function displayChatAgentLabel(entry) {
 }
 
 function buildChatRuntimeStatusEntry() {
-  const counts = { live: 0, done: 0, failed: 0 };
-  const stateByKey = new Map();
-  appState.chat.runEvents.forEach((event) => {
-    const key = `${event.run_id || ''}:${event.agent_id || ''}:${event.session_id || ''}`;
-    if (!key.trim()) return;
-    const name = String(event.name || '').trim();
-    if (name === 'run.failed' || name === 'run.aborted' || name === 'agent.call.failed') {
-      stateByKey.set(key, 'failed');
-      return;
-    }
-    if (name === 'run.completed' || name === 'agent.call.completed') {
-      stateByKey.set(key, 'done');
-      return;
-    }
-    stateByKey.set(key, 'live');
-  });
-
-  stateByKey.forEach((state) => {
-    if (state === 'failed') {
-      counts.failed += 1;
-    } else if (state === 'done') {
-      counts.done += 1;
-    } else {
-      counts.live += 1;
-    }
-  });
+  const displayTree = getChatDisplayRunTree();
+  const runtime = getChatRuntimeStatusMeta(displayTree);
+  const treeStats = traceTreeStats(displayTree);
+  const counts = {
+    live: treeStats.running,
+    done: treeStats.completed,
+    failed: treeStats.failed,
+  };
 
   return {
     type: 'meta',
-    text: `state ${appState.chat.runStatus || 'idle'}   ${counts.live} live   ${counts.done} done   ${counts.failed} failed   ${appState.chat.runEvents.length} events`,
+    text: `state ${runtime.label || runtime.key || 'idle'}   ${counts.live} live   ${counts.done} done   ${counts.failed} failed   ${appState.chat.runEvents.length} events`,
   };
 }
 
@@ -2149,12 +2131,14 @@ function handleChatEvent(name, record) {
       name,
       timestamp: new Date().toISOString(),
       payload: { run: acceptedRun },
+      run_node_id: acceptedRun?.run_node_id,
+      parent_run_node_id: acceptedRun?.parent_run_node_id,
       agent_id: acceptedRun?.agent_id,
       session_id: acceptedRun?.session_id,
       run_id: acceptedRun?.id,
     });
     if (acceptedRun?.id) {
-      appState.chat.runView.selectedRunID = acceptedRun.id;
+      appState.chat.runView.selectedRunID = acceptedRun.run_node_id || acceptedRun.id;
     }
     if (acceptedRun?.id) {
       scheduleChatRunTreeSync(acceptedRun.id, true);
@@ -2174,6 +2158,8 @@ function handleChatEvent(name, record) {
     raw_name: name,
     timestamp: record.timestamp || new Date().toISOString(),
     payload: semanticPayload,
+    run_node_id: record.run_node_id,
+    parent_run_node_id: record.parent_run_node_id,
     agent_id: record.agent_id,
     session_id: record.session_id,
     run_id: record.run_id,
@@ -2335,6 +2321,7 @@ function buildActivityModel(events) {
 
   events.forEach((event) => {
     const payload = event.payload || {};
+    const traceKey = runtimeTraceKeyForEvent(event);
     if (shouldHideRuntimeActivityItem(event.name)) {
       return;
     }
@@ -2347,6 +2334,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: `已建立 run ${payload.run?.id || event.run_id || '--'}，等待进入执行态。`,
           runID: payload.run?.id || event.run_id || '',
+          traceKey: traceKey || payload.run?.run_node_id || '',
           raw: event,
         });
         break;
@@ -2358,6 +2346,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: `Agent ${event.agent_id || appState.chat.agentID} 已开始执行。`,
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2374,6 +2363,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeToolPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           input: payload.input,
           raw: event,
         }));
@@ -2389,11 +2379,13 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeToolPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         }));
         item.status = payload.error ? 'failed' : 'completed';
         item.summary = payload.error ? truncate(payload.error, 120) : truncate(payload.output || item.summary, 120);
         item.runID = event.run_id || item.runID;
+        item.traceKey = traceKey || item.traceKey;
         item.output = payload.output;
         item.error = payload.error;
         item.timestamp = event.timestamp;
@@ -2408,10 +2400,12 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeAgentCallPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         }));
         item.summary = summarizeAgentCallPayload(payload);
         item.runID = event.run_id || item.runID;
+        item.traceKey = traceKey || item.traceKey;
         item.request = payload;
         break;
       }
@@ -2424,11 +2418,13 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeAgentCallPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         }));
         item.status = payload.error || payload.status === 'failed' ? 'failed' : 'completed';
         item.summary = truncate(payload.summary || payload.error || payload.status || item.summary, 120);
         item.runID = event.run_id || item.runID;
+        item.traceKey = traceKey || item.traceKey;
         item.result = payload;
         item.timestamp = event.timestamp;
         item.raw = event;
@@ -2442,6 +2438,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: `completed ${payload.completed_count || 0}/${payload.total_count || 0}, failed ${payload.failed_count || 0}`,
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2453,6 +2450,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeMemoryPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           query: payload.query,
           entries: Array.isArray(payload.entries) ? payload.entries : [],
           raw: event,
@@ -2466,6 +2464,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeLLMRetryPayload(payload),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2477,6 +2476,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeCompactionPayload(payload, event.name),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2488,6 +2488,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeCompactionPayload(payload, event.name),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2499,11 +2500,13 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeTraceEventLine(event),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         }));
         item.status = 'retrying';
         item.summary = summarizeTraceEventLine(event);
         item.timestamp = event.timestamp;
+        item.traceKey = traceKey || item.traceKey;
         item.raw = event;
         break;
       }
@@ -2515,11 +2518,13 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: summarizeTraceEventLine(event),
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         }));
         item.status = payload.blocked ? 'failed' : 'warning';
         item.summary = summarizeTraceEventLine(event);
         item.timestamp = event.timestamp;
+        item.traceKey = traceKey || item.traceKey;
         item.raw = event;
         break;
       }
@@ -2531,6 +2536,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: '主运行已结束，建议回读 session history 作为最终事实来源。',
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2542,6 +2548,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: payload.message || '运行失败',
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2553,6 +2560,7 @@ function buildActivityModel(events) {
           timestamp: event.timestamp,
           summary: payload.message || payload.reason || '运行已中止',
           runID: event.run_id || '',
+          traceKey,
           raw: event,
         });
         break;
@@ -2569,7 +2577,7 @@ function buildActivityModel(events) {
 
 function activityMatchesRun(item, runID) {
   if (!runID) return false;
-  return item?.runID === runID;
+  return item?.traceKey === runID || item?.runID === runID;
 }
 
 function filterActivityItems(items, selectedRunID, relatedOnly) {
@@ -2642,10 +2650,10 @@ function traceTreeStats(tree) {
     if (!node || !node.run) return;
     stats.nodes += 1;
     stats.maxDepth = Math.max(stats.maxDepth, depth);
-    const status = String(node.run.status || 'idle').toLowerCase();
-    if (status === 'running' || status === 'queued') stats.running += 1;
-    else if (status === 'completed') stats.completed += 1;
-    else if (status === 'failed' || status === 'aborted') stats.failed += 1;
+    const phase = traceNodePhaseKind(node);
+    if (['retrying', 'calling', 'tooling', 'tasking', 'generating', 'integrating', 'thinking', 'running', 'queued'].includes(phase) && !traceNodeHasTerminalLifecycle(node)) stats.running += 1;
+    else if (phase === 'completed') stats.completed += 1;
+    else if (phase === 'failed') stats.failed += 1;
 
     const children = Array.isArray(node.children) ? node.children : [];
     if (!children.length) {
@@ -2674,23 +2682,119 @@ function mergeTraceRun(target, patch) {
   return target;
 }
 
+function runtimeTraceKey(runID, agentID = '', taskID = '') {
+  const run = String(runID || '').trim();
+  const agent = String(agentID || '').trim();
+  const task = String(taskID || '').trim();
+  if (!run) return '';
+  return task ? `${run}::${agent}::${task}` : `${run}::${agent}`;
+}
+
+function runtimeTraceKeyAgent(traceKey = '') {
+  const key = String(traceKey || '').trim();
+  const idx = key.indexOf('::');
+  if (idx < 0) return '';
+  const rest = key.slice(idx + 2);
+  const next = rest.indexOf('::');
+  return (next >= 0 ? rest.slice(0, next) : rest).trim();
+}
+
+function runtimeTraceKeyRun(traceKey = '') {
+  const key = String(traceKey || '').trim();
+  if (!key) return '';
+  const idx = key.indexOf('::');
+  return idx >= 0 ? key.slice(0, idx).trim() : key;
+}
+
+function runtimeTraceKeyTask(traceKey = '') {
+  const key = String(traceKey || '').trim();
+  if (!key) return '';
+  const first = key.indexOf('::');
+  if (first < 0) return '';
+  const rest = key.slice(first + 2);
+  const second = rest.indexOf('::');
+  return second >= 0 ? rest.slice(second + 2).trim() : '';
+}
+
+function runtimeRunLifecycleUsesAgentTraceKey(event, traceKey) {
+  const name = String(event?.name || '').trim();
+  if (!['run.queued', 'run.routed', 'run.accepted', 'run.started', 'run.completed', 'run.failed', 'run.aborted'].includes(name)) {
+    return false;
+  }
+  const agentID = String(event?.agent_id || '').trim();
+  const traceAgentID = runtimeTraceKeyAgent(traceKey);
+  return Boolean(agentID && traceAgentID && agentID !== traceAgentID);
+}
+
+function runtimeTraceKeyForEvent(event) {
+  const traceKey = String(event?.run_node_id || '').trim();
+  if (traceKey) {
+    if (runtimeRunLifecycleUsesAgentTraceKey(event, traceKey)) {
+      return runtimeTraceKey(event?.run_id, event?.agent_id, event?.payload?.task_id);
+    }
+    return traceKey;
+  }
+  return runtimeTraceKey(event?.run_id, event?.agent_id, event?.payload?.task_id);
+}
+
+function runtimeParentTraceKeyForEvent(event, traceKey) {
+  const explicit = String(event?.parent_run_node_id || '').trim();
+  if (explicit && explicit !== traceKey) return explicit;
+  const raw = String(event?.run_node_id || '').trim();
+  if (raw && raw !== traceKey && runtimeRunLifecycleUsesAgentTraceKey(event, raw)) {
+    return raw;
+  }
+  return '';
+}
+
+function runtimeTaskKind(event) {
+  const payload = event?.payload || {};
+  const kind = String(payload.task_kind || '').trim();
+  if (kind) return kind;
+  if (String(payload.target_agent || '').trim()) return 'agent';
+  if (String(payload.tool || '').trim()) return 'tool';
+  if (String(payload.process || '').trim()) return 'process';
+  return '';
+}
+
+function rememberRuntimeBackgroundTask(tasks, taskID, patch) {
+  const id = String(taskID || '').trim();
+  if (!id) return null;
+  const current = tasks.get(id) || {};
+  const next = { ...current, taskID: id, task_id: id };
+  Object.entries(patch || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return;
+    next[key] = value;
+  });
+  tasks.set(id, next);
+  return next;
+}
+
 function buildTraceTreeFromEvents(events, acceptedRun = null) {
   const nodes = new Map();
 
-  const ensureNode = (runID) => {
-    if (!runID) return null;
-    if (!nodes.has(runID)) {
-      nodes.set(runID, {
-        run: { id: runID, status: 'queued' },
+  const ensureNode = (traceKey, event = null) => {
+    const key = String(traceKey || '').trim();
+    if (!key) return null;
+    if (!nodes.has(key)) {
+      nodes.set(key, {
+        traceKey: key,
+        parentTraceKey: '',
+        run: { id: event?.run_id || key, run_node_id: key, status: 'queued', task_id: event?.payload?.task_id || '' },
         events: [],
         children: [],
+        backgroundTasks: new Map(),
       });
     }
-    return nodes.get(runID);
+    const node = nodes.get(key);
+    if (event) {
+      node.parentTraceKey = node.parentTraceKey || runtimeParentTraceKeyForEvent(event, key);
+    }
+    return node;
   };
 
   if (acceptedRun?.id) {
-    const entryNode = ensureNode(acceptedRun.id);
+    const entryNode = ensureNode(acceptedRun.run_node_id || runtimeTraceKey(acceptedRun.id, acceptedRun.agent_id, acceptedRun.task_id));
     mergeTraceRun(entryNode.run, acceptedRun);
   }
 
@@ -2698,22 +2802,26 @@ function buildTraceTreeFromEvents(events, acceptedRun = null) {
     const payload = event.payload || {};
     if (event.name === 'run.accepted') {
       const accepted = payload.run || {};
-      const node = ensureNode(accepted.id || event.run_id);
+      const node = ensureNode(accepted.run_node_id || runtimeTraceKey(accepted.id || event.run_id, accepted.agent_id || event.agent_id, accepted.task_id || event?.payload?.task_id), event);
       if (!node) return;
       mergeTraceRun(node.run, accepted);
       node.events.push(event);
       return;
     }
 
-    const node = ensureNode(event.run_id);
+    const traceKey = runtimeTraceKeyForEvent(event);
+    const node = ensureNode(traceKey, event);
     if (!node) return;
     node.events.push(event);
-      mergeTraceRun(node.run, {
-        id: event.run_id,
-        agent_id: event.agent_id,
-        session_id: event.session_id,
-        parent_agent_id: event.parent_agent_id,
-      });
+    mergeTraceRun(node.run, {
+      id: event.run_id,
+      run_node_id: traceKey,
+      parent_run_node_id: node.parentTraceKey || event.parent_run_node_id,
+      agent_id: event.agent_id,
+      session_id: event.session_id,
+      task_id: payload.task_id,
+      parent_agent_id: event.parent_agent_id || runtimeTraceKeyAgent(node.parentTraceKey),
+    });
 
     switch (event.name) {
       case 'run.started':
@@ -2726,11 +2834,37 @@ function buildTraceTreeFromEvents(events, acceptedRun = null) {
         mergeTraceRun(node.run, { status: node.run.status || 'running' });
         node.run.output = `${node.run.output || ''}${payload.text || ''}`;
         break;
+      case 'task.queued':
+      case 'task.started':
+      case 'task.running':
+      case 'task.completed':
+      case 'task.failed':
+      case 'task.cancelled':
+        rememberRuntimeBackgroundTask(node.backgroundTasks, payload.task_id, {
+          kind: runtimeTaskKind(event),
+          label: payload.target_agent || payload.tool || payload.process || 'task',
+          status: payload.status || String(event.name || '').replace('task.', ''),
+          summary: payload.summary,
+          error: payload.error,
+        });
+        break;
       case 'tool.call.started':
       case 'tool.called':
       case 'agent.call.started':
       case 'agent.call.completed':
       case 'agent.call.failed':
+        if (event.name === 'agent.call.completed' || event.name === 'agent.call.failed') {
+          const task = rememberRuntimeBackgroundTask(node.backgroundTasks, payload.task_id, {
+            kind: 'agent',
+            label: payload.target_agent || payload.agent || 'agent',
+            status: payload.status || (event.name === 'agent.call.failed' ? 'failed' : 'completed'),
+            summary: payload.summary,
+            error: payload.error,
+          });
+          if (task) task.representedAgentCall = true;
+        }
+        mergeTraceRun(node.run, { status: node.run.status || 'running' });
+        break;
       case 'llm.retrying':
       case 'tool.retrying':
         mergeTraceRun(node.run, { status: node.run.status || 'running' });
@@ -2761,7 +2895,18 @@ function buildTraceTreeFromEvents(events, acceptedRun = null) {
     }
   });
 
-  const roots = Array.from(nodes.values());
+  pruneShadowAgentBaseTraceNodes(nodes, acceptedRun);
+
+  nodes.forEach((node) => {
+    if (!node.parentTraceKey || node.parentTraceKey === node.traceKey) return;
+    const parent = nodes.get(node.parentTraceKey);
+    if (!parent) return;
+    if (!parent.children.includes(node)) {
+      parent.children.push(node);
+    }
+  });
+
+  const roots = Array.from(nodes.values()).filter((node) => !node.parentTraceKey || !nodes.has(node.parentTraceKey));
 
   const sortNode = (node) => {
     node.children.sort(compareTraceRuntime);
@@ -2771,6 +2916,47 @@ function buildTraceTreeFromEvents(events, acceptedRun = null) {
   roots.sort(compareTraceRuntime);
   roots.forEach(sortNode);
   return roots;
+}
+
+function traceNodeHasRunLifecycleEvent(node) {
+  return (Array.isArray(node?.events) ? node.events : []).some((event) => {
+    const name = String(event?.name || '').trim();
+    return ['run.queued', 'run.routed', 'run.accepted', 'run.started', 'run.completed', 'run.failed', 'run.aborted'].includes(name);
+  });
+}
+
+function traceNodeHasActiveWork(node) {
+  if (traceNodeHasTerminalLifecycle(node)) return false;
+  const facts = collectTraceRuntimeFacts(node);
+  return facts.activeTools.size > 0 || facts.activeAgentCalls.size > 0 || facts.activeBackgroundTasks > 0;
+}
+
+function pruneShadowAgentBaseTraceNodes(nodes, acceptedRun = null) {
+  if (!(nodes instanceof Map)) return;
+  const rootAgentID = String(acceptedRun?.agent_id || '').trim();
+  nodes.forEach((node, key) => {
+    const traceKey = String(key || '').trim();
+    if (!traceKey || runtimeTraceKeyTask(traceKey)) return;
+    const runID = String(node?.run?.id || runtimeTraceKeyRun(traceKey)).trim();
+    const agentID = String(node?.run?.agent_id || runtimeTraceKeyAgent(traceKey)).trim();
+    if (!runID || !agentID || agentID === rootAgentID) return;
+    if (traceNodeHasRunLifecycleEvent(node) || traceNodeHasActiveWork(node)) return;
+    let hasTerminalTaskNode = false;
+    nodes.forEach((other, otherKey) => {
+      if (hasTerminalTaskNode || String(otherKey || '').trim() === traceKey) return;
+      if (runtimeTraceKeyTask(otherKey) === '') return;
+      const otherRunID = String(other?.run?.id || runtimeTraceKeyRun(otherKey)).trim();
+      const otherAgentID = String(other?.run?.agent_id || runtimeTraceKeyAgent(otherKey)).trim();
+      if (otherRunID !== runID || otherAgentID !== agentID) return;
+      const status = String(other?.run?.status || '').toLowerCase();
+      if (status === 'completed' || status === 'failed' || status === 'aborted') {
+        hasTerminalTaskNode = true;
+      }
+    });
+    if (hasTerminalTaskNode) {
+      nodes.delete(traceKey);
+    }
+  });
 }
 
 function flattenTraceTree(tree) {
@@ -2826,11 +3012,19 @@ function createTraceNodeMap(tree) {
   const map = new Map();
   flattenTraceTree(tree).forEach((item) => {
     const runID = item?.node?.run?.id || '';
-    if (runID) {
+    const traceKey = item?.node?.traceKey || item?.node?.run?.run_node_id || '';
+    if (traceKey) {
+      map.set(traceKey, item);
+    }
+    if (runID && !map.has(runID)) {
       map.set(runID, item);
     }
   });
   return map;
+}
+
+function traceNodeSelectionKey(node) {
+  return String(node?.traceKey || node?.run?.run_node_id || node?.run?.id || '').trim();
 }
 
 function traceAncestorSet(tree, runID) {
@@ -2839,10 +3033,11 @@ function traceAncestorSet(tree, runID) {
   const nodeMap = createTraceNodeMap(tree);
   const set = new Set([selectedRunID]);
   let current = nodeMap.get(selectedRunID);
-  while (current?.parent?.run?.id) {
-    const parentRunID = current.parent.run.id;
-    set.add(parentRunID);
-    current = nodeMap.get(parentRunID);
+  while (current?.parent) {
+    const parentKey = traceNodeSelectionKey(current.parent);
+    if (!parentKey) break;
+    set.add(parentKey);
+    current = nodeMap.get(parentKey);
   }
   return set;
 }
@@ -2855,7 +3050,8 @@ function tracePathNodes(tree, runID) {
   let current = nodeMap.get(targetRunID);
   while (current?.node) {
     path.unshift(current.node);
-    current = current.parent?.run?.id ? nodeMap.get(current.parent.run.id) : null;
+    const parentKey = traceNodeSelectionKey(current.parent);
+    current = parentKey ? nodeMap.get(parentKey) : null;
   }
   return path;
 }
@@ -3090,12 +3286,12 @@ function ensureTraceViewSelection(tree, view, fallbackRunID = '') {
     view.selectedRunID = fallbackRunID;
     return view.selectedRunID;
   }
-  const focusRunID = pickTraceFocus(tree)?.node?.run?.id || '';
+  const focusRunID = traceNodeSelectionKey(pickTraceFocus(tree)?.node);
   if (focusRunID) {
     view.selectedRunID = focusRunID;
     return focusRunID;
   }
-  view.selectedRunID = tree?.[0]?.run?.id || '';
+  view.selectedRunID = traceNodeSelectionKey(tree?.[0]);
   return view.selectedRunID;
 }
 
@@ -3145,6 +3341,10 @@ function collectTraceRuntimeFacts(node) {
     activeAgentCalls: new Map(),
     agentCallsDone: 0,
     agentCallsFailed: 0,
+    activeBackgroundTasks: 0,
+    activeAgentBackgroundTasks: 0,
+    agentTaskDone: 0,
+    agentTaskFailed: 0,
     textDeltaCount: 0,
     latestEvent: latestTraceNodeEvent(node?.events),
   };
@@ -3197,7 +3397,32 @@ function collectTraceRuntimeFacts(node) {
         break;
     }
   });
+  if (node?.backgroundTasks instanceof Map) {
+    node.backgroundTasks.forEach((task) => {
+      const status = String(task?.status || '').trim();
+      const kind = String(task?.kind || '').trim();
+      const taskID = String(task?.taskID || task?.task_id || '').trim();
+      const selfTask = taskID && taskID === String(node?.run?.task_id || '').trim();
+      if (status === 'queued' || status === 'running') {
+        facts.activeBackgroundTasks += 1;
+        if (kind === 'agent' && !task.representedAgentCall && !selfTask) {
+          facts.activeAgentBackgroundTasks += 1;
+        }
+      }
+      if (kind === 'agent' && !task.representedAgentCall && !selfTask) {
+        if (status === 'completed') facts.agentTaskDone += 1;
+        if (status === 'failed' || status === 'cancelled') facts.agentTaskFailed += 1;
+      }
+    });
+  }
   return facts;
+}
+
+function traceNodeHasTerminalLifecycle(node) {
+  return (Array.isArray(node?.events) ? node.events : []).some((event) => {
+    const name = String(event?.name || '').trim();
+    return name === 'run.completed' || name === 'run.failed' || name === 'run.aborted';
+  });
 }
 
 function traceNodePhaseKind(node) {
@@ -3207,6 +3432,7 @@ function traceNodePhaseKind(node) {
   if (runStatus === 'failed' || runStatus === 'aborted') return 'failed';
   if (runStatus === 'queued') return 'queued';
   if (facts.activeAgentCalls.size) return 'calling';
+  if (facts.activeBackgroundTasks > 0) return facts.activeAgentBackgroundTasks > 0 ? 'calling' : 'tasking';
   if (facts.activeTools.size) return 'tooling';
   switch (facts.latestEvent?.name) {
     case 'llm.retrying':
@@ -3251,6 +3477,8 @@ function traceNodePhaseLabel(node) {
       return facts.activeAgentCalls.size > 1 ? `subagents x${facts.activeAgentCalls.size}` : 'subagent active';
     case 'tooling':
       return facts.activeTools.size > 1 ? `tools x${facts.activeTools.size}` : 'tool active';
+    case 'tasking':
+      return facts.activeBackgroundTasks > 1 ? `tasks x${facts.activeBackgroundTasks}` : 'task active';
     case 'generating':
       return 'generating';
     case 'integrating':
@@ -3266,8 +3494,11 @@ function traceNodeAgentCallFootprint(node) {
   const facts = collectTraceRuntimeFacts(node);
   const parts = [];
   if (facts.activeAgentCalls.size) parts.push(`${facts.activeAgentCalls.size} active`);
+  if (facts.activeAgentBackgroundTasks) parts.push(`${facts.activeAgentBackgroundTasks} task active`);
   if (facts.agentCallsDone) parts.push(`${facts.agentCallsDone} done`);
+  if (facts.agentTaskDone) parts.push(`${facts.agentTaskDone} task done`);
   if (facts.agentCallsFailed) parts.push(`${facts.agentCallsFailed} failed`);
+  if (facts.agentTaskFailed) parts.push(`${facts.agentTaskFailed} task failed`);
   return parts.join(' • ');
 }
 
@@ -3291,6 +3522,8 @@ function traceNodePhaseDetail(node) {
       return `waiting on subagent ${traceRuntimeListNames(facts.activeAgentCalls.values(), 3)}`;
     case 'tooling':
       return `running tool ${traceRuntimeListNames(facts.activeTools.values(), 3)}`;
+    case 'tasking':
+      return 'waiting on background task';
     case 'generating':
       return 'model is streaming a reply';
     case 'integrating':
@@ -3308,6 +3541,7 @@ function traceNodePhasePill(node) {
 
 function traceTreeOperationalStats(tree) {
   const stats = {
+    nodes: 0,
     activeAgentCalls: 0,
     agentCallsDone: 0,
     agentCallsFailed: 0,
@@ -3316,18 +3550,23 @@ function traceTreeOperationalStats(tree) {
     generating: 0,
     running: 0,
     queued: 0,
+    completed: 0,
+    failed: 0,
   };
   flattenTraceTree(tree).forEach(({ node }) => {
+    stats.nodes += 1;
     const facts = collectTraceRuntimeFacts(node);
     const phase = traceNodePhaseKind(node);
     stats.activeAgentCalls += facts.activeAgentCalls.size;
-    stats.agentCallsDone += facts.agentCallsDone;
-    stats.agentCallsFailed += facts.agentCallsFailed;
+    stats.agentCallsDone += facts.agentCallsDone + facts.agentTaskDone;
+    stats.agentCallsFailed += facts.agentCallsFailed + facts.agentTaskFailed;
     stats.activeTools += facts.activeTools.size;
     if (phase === 'retrying') stats.retrying += 1;
     if (phase === 'generating') stats.generating += 1;
     if (phase === 'queued') stats.queued += 1;
-    if (['retrying', 'calling', 'tooling', 'generating', 'integrating', 'thinking', 'running'].includes(phase)) stats.running += 1;
+    if (phase === 'completed') stats.completed += 1;
+    if (phase === 'failed') stats.failed += 1;
+    if (['retrying', 'calling', 'tooling', 'tasking', 'generating', 'integrating', 'thinking', 'running'].includes(phase) && !traceNodeHasTerminalLifecycle(node)) stats.running += 1;
   });
   return stats;
 }
@@ -3360,6 +3599,12 @@ function traceTreeRuntimeStatus(tree, fallbackStatus = 'idle') {
   }
   if (stats.queued > 0) {
     return { key: 'queued', label: 'queued' };
+  }
+  if (stats.nodes > 0 && stats.failed > 0) {
+    return { key: 'failed', label: 'failed' };
+  }
+  if (stats.nodes > 0 && stats.completed > 0) {
+    return { key: 'completed', label: 'completed' };
   }
   const normalized = String(fallbackStatus || 'idle').toLowerCase();
   if (normalized === 'completed') return { key: 'completed', label: 'completed' };
@@ -3451,7 +3696,7 @@ function buildChatRuntimePresentation() {
   const displayTree = getChatDisplayRunTree();
   const runtime = getChatRuntimeStatusMeta(displayTree);
   const liveStats = traceTreeOperationalStats(displayTree);
-  const selectedRunID = ensureTraceViewSelection(displayTree, appState.chat.runView, appState.chat.runRecord?.id || '');
+  const selectedRunID = ensureTraceViewSelection(displayTree, appState.chat.runView, appState.chat.runRecord?.run_node_id || appState.chat.runRecord?.id || '');
   const relatedOnly = Boolean(appState.chat.runView.relatedOnly && selectedRunID);
   const context = chatRuntimeFocusContext(displayTree, runtime, liveStats, model, selectedRunID);
   return {
@@ -3698,7 +3943,7 @@ function renderChatRuntimeSidebar(context, model, tree, selectedRunID, relatedOn
   const overview = renderChatRuntimeOverview(context, tree, model, selectedRunID);
   const runTreeBody = tree.length
     ? renderTraceTree(tree, {
-      selectedRunID: appState.chat.runRecord?.id || '',
+      selectedRunID: appState.chat.runRecord?.run_node_id || appState.chat.runRecord?.id || '',
       view: appState.chat.runView,
       activityItems: model.items,
       compact: true,
@@ -3924,12 +4169,13 @@ function renderTraceNodeTimeline(events) {
 
 function renderTraceNode(node, depth = 0, context = {}, parentNode = null) {
   const run = node?.run || {};
+  const nodeKey = traceNodeSelectionKey(node);
   const events = Array.isArray(node?.events) ? node.events : [];
   const children = Array.isArray(node?.children) ? node.children : [];
   const status = String(run.status || 'idle').toLowerCase();
   const phase = traceNodePhaseKind(node);
-  const selected = run.id === context.selectedRunID;
-  const open = traceNodeOpenState(run.id, depth, status, context.view, context.selectedRunID, context.ancestors);
+  const selected = nodeKey === context.selectedRunID;
+  const open = traceNodeOpenState(nodeKey, depth, status, context.view, context.selectedRunID, context.ancestors);
   const summary = summarizeTraceNode(node);
   const latestEvent = latestTraceNodeEvent(events);
   const routeLabel = parentNode?.run?.agent_id
@@ -3986,8 +4232,8 @@ function renderTraceNode(node, depth = 0, context = {}, parentNode = null) {
   }
 
   return `
-    <details class="trace-node ${escapeHTML(status)} ${escapeHTML(phase)} ${selected ? 'selected' : ''}" data-trace-node="${escapeHTML(run.id || '')}" ${open ? 'open' : ''}>
-      <summary data-trace-select="${escapeHTML(run.id || '')}">
+    <details class="trace-node ${escapeHTML(status)} ${escapeHTML(phase)} ${selected ? 'selected' : ''}" data-trace-node="${escapeHTML(nodeKey)}" ${open ? 'open' : ''}>
+      <summary data-trace-select="${escapeHTML(nodeKey)}">
         <div class="trace-node-head">
           <div class="trace-node-route">
             <span class="eyebrow subtle">${escapeHTML(depth === 0 ? 'ENTRY RUN' : `STEP · L${depth + 1}`)}</span>
@@ -4165,7 +4411,7 @@ function bindTraceTreeInteractions(host, tree, view, rerender) {
       const action = button.dataset.traceAction || '';
       switch (action) {
         case 'focus-current': {
-          const focusRunID = pickTraceFocus(tree)?.node?.run?.id || '';
+          const focusRunID = traceNodeSelectionKey(pickTraceFocus(tree)?.node);
           if (focusRunID) {
             view.selectedRunID = focusRunID;
           }
@@ -4173,12 +4419,14 @@ function bindTraceTreeInteractions(host, tree, view, rerender) {
         }
         case 'expand-all':
           flattenTraceTree(tree).forEach(({ node }) => {
-            if (node?.run?.id) view.expanded[node.run.id] = true;
+            const nodeKey = traceNodeSelectionKey(node);
+            if (nodeKey) view.expanded[nodeKey] = true;
           });
           break;
         case 'collapse-all':
           flattenTraceTree(tree).forEach(({ node }) => {
-            if (node?.run?.id) view.expanded[node.run.id] = false;
+            const nodeKey = traceNodeSelectionKey(node);
+            if (nodeKey) view.expanded[nodeKey] = false;
           });
           break;
         case 'reset-filters':
@@ -4364,9 +4612,9 @@ function updateChatSnippet() {
 
 function renderRunDetail(run, events, runTree = [], runView = createRunViewState()) {
   const activity = buildActivityModel(events || []);
-  const selectedRunID = ensureTraceViewSelection(runTree, runView, run.id);
+  const selectedRunID = ensureTraceViewSelection(runTree, runView, run.run_node_id || run.id);
   const nodeMap = createTraceNodeMap(runTree);
-  const rootNode = nodeMap.get(run.id)?.node || runTree[0] || null;
+  const rootNode = nodeMap.get(run.run_node_id || run.id)?.node || runTree[0] || null;
   const relatedOnly = runView.relatedOnly && selectedRunID;
   const runItems = filterActivityItems(activity.items.filter((item) => item.kind === 'run'), selectedRunID, relatedOnly);
   const toolItems = filterActivityItems(activity.items.filter((item) => item.kind === 'tool'), selectedRunID, relatedOnly);
@@ -4396,7 +4644,7 @@ function renderRunDetail(run, events, runTree = [], runView = createRunViewState
       <div class="micro-panel trace-tree-panel">
         ${sectionHeader('RunTree', '把入口 run、子 agent 和最近状态按照层级可视化出来，便于普通人员快速理解整条子 Agent 调用链。')}
         ${renderTraceTree(runTree, {
-          selectedRunID: run.id,
+          selectedRunID: run.run_node_id || run.id,
           view: runView,
           activityItems: activity.items,
         })}

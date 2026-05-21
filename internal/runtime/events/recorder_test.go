@@ -97,19 +97,47 @@ func TestRecorderIgnoresChildTraceLifecycleForParentRunStatus(t *testing.T) {
 
 	childCompletedAt := time.Now().UTC()
 	recorder.AppendEvent(EventRecord{
-		RunID:             "run_parent",
-		AgentID:           "worker",
-		SessionID:         "child-session",
-		TraceNodeID:       TraceNodeID("run_parent", "worker"),
-		ParentTraceNodeID: TraceNodeID("run_parent", "lead"),
-		Name:              EventRunCompleted,
-		Timestamp:         childCompletedAt,
+		RunID:           "run_parent",
+		AgentID:         "worker",
+		SessionID:       "child-session",
+		RunNodeID:       RunNodeID("run_parent", "worker", ""),
+		ParentRunNodeID: RunNodeID("run_parent", "lead", ""),
+		Name:            EventRunCompleted,
+		Timestamp:       childCompletedAt,
 	})
 
 	run, ok := recorder.GetRun("run_parent")
 	require.True(t, ok)
 	assert.Equal(t, RunStatusRunning, run.Status)
 	assert.True(t, run.CompletedAt.IsZero())
+}
+
+func TestRecorderDefaultsChildAgentEventsToChildTraceNode(t *testing.T) {
+	recorder := NewRecorder()
+	recorder.BeginRun(RunRecord{
+		ID:        "run_parent",
+		AgentID:   "lead",
+		SessionID: "session",
+	})
+
+	recorder.AppendEvent(EventRecord{
+		RunID:     "run_parent",
+		AgentID:   "worker",
+		SessionID: "child-session",
+		Name:      EventRunStarted,
+	})
+
+	events := recorder.ListRunEvents("run_parent")
+	require.Len(t, events, 1)
+	childStarted := events[0]
+	assert.Equal(t, "worker", childStarted.AgentID)
+	assert.Equal(t, RunNodeID("run_parent", "worker", ""), childStarted.RunNodeID)
+	assert.Equal(t, RunNodeID("run_parent", "lead", ""), childStarted.ParentRunNodeID)
+
+	run, ok := recorder.GetRun("run_parent")
+	require.True(t, ok)
+	assert.Equal(t, RunStatusRunning, run.Status)
+	assert.Equal(t, RunNodeID("run_parent", "lead", ""), run.RunNodeID)
 }
 
 func TestMemorySaveToolResultEmitsCapturedEvent(t *testing.T) {

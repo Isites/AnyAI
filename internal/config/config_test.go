@@ -42,6 +42,46 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 20, cfg.Logging.Rotation.MaxBackups)
 }
 
+func TestDefaultGatewayHostPortDerivedFromListen(t *testing.T) {
+	host, port, err := SplitListenAddr(defaultGatewayListen)
+	require.NoError(t, err)
+
+	cfg := DefaultConfig()
+	assert.Equal(t, host, cfg.Gateway.Host)
+	assert.Equal(t, port, cfg.Gateway.Port)
+
+	partial := &Config{
+		Agents: AgentsConfig{
+			List: []AgentConfig{{ID: "assistant", Model: "anthropic/claude-sonnet-4-5"}},
+		},
+	}
+	require.NoError(t, partial.Validate())
+	assert.Equal(t, host, partial.Gateway.Host)
+	assert.Equal(t, port, partial.Gateway.Port)
+}
+
+func TestSplitListenAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		listen   string
+		wantHost string
+		wantPort int
+	}{
+		{name: "host port", listen: "127.0.0.1:2333", wantHost: "127.0.0.1", wantPort: 2333},
+		{name: "host port with spaces", listen: " 0.0.0.0:19000 ", wantHost: "0.0.0.0", wantPort: 19000},
+		{name: "ipv6", listen: "[::1]:2333", wantHost: "::1", wantPort: 2333},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, err := SplitListenAddr(tt.listen)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantHost, host)
+			assert.Equal(t, tt.wantPort, port)
+		})
+	}
+}
+
 func TestValidateKeepsMemoryAutoCaptureOffByDefault(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Memory.Enabled = true

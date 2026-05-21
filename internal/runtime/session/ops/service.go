@@ -516,6 +516,7 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 	}
 
 	var assistantText strings.Builder
+	var assistantRefs session.EntryRefs
 	var fallbackReply string
 	var terminalMeta string
 	for _, event := range events {
@@ -527,6 +528,7 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 			if text != "" {
 				assistantText.Reset()
 				assistantText.WriteString(text)
+				assistantRefs = entryRefsFromEvent(event)
 			}
 		case runtimeevents.EventSessionRuntimeControlStored:
 			text := strings.TrimSpace(stringPayload(event.Payload, "text"))
@@ -624,9 +626,10 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 		text = strings.TrimSpace(firstNonEmpty(fallbackReply, run.Output))
 	}
 	if text != "" {
-		state.ensureSession().Append(session.ApplyEntryRefs(session.AssistantMessageEntry(text), session.EntryRefs{
-			RunID: run.ID,
-		}))
+		if strings.TrimSpace(assistantRefs.RunID) == "" {
+			assistantRefs.RunID = run.ID
+		}
+		state.ensureSession().Append(session.ApplyEntryRefs(session.AssistantMessageEntry(text), assistantRefs))
 	}
 	if terminalMeta == "" && !hasSessionMetaEvent(events, run.ID) {
 		terminalMeta = runRecordTerminalMetaText(run)
@@ -893,7 +896,7 @@ func sessionInputEntryFromEvents(events []runtimeevents.EventRecord) (session.Se
 func entryRefsFromEvent(event runtimeevents.EventRecord) session.EntryRefs {
 	refs := session.EntryRefs{
 		RunID:  strings.TrimSpace(event.RunID),
-		TaskID: strings.TrimSpace(firstNonEmptyStringPayload(event.Payload, "task_id")),
+		TaskID: strings.TrimSpace(firstNonEmpty(firstNonEmptyStringPayload(event.Payload, "task_id"), taskIDFromRunNodeID(event.RunNodeID))),
 	}
 	switch strings.TrimSpace(event.Name) {
 	case "session.plan.updated":
@@ -902,6 +905,23 @@ func entryRefsFromEvent(event runtimeevents.EventRecord) session.EntryRefs {
 		refs.ToolID = strings.TrimSpace(firstNonEmptyStringPayload(event.Payload, "tool_id", "tool_call_id", "id"))
 	}
 	return refs
+}
+
+func taskIDFromRunNodeID(runNodeID string) string {
+	runNodeID = strings.TrimSpace(runNodeID)
+	if runNodeID == "" {
+		return ""
+	}
+	first := strings.Index(runNodeID, "::")
+	if first < 0 {
+		return ""
+	}
+	rest := runNodeID[first+2:]
+	second := strings.Index(rest, "::")
+	if second < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[second+2:])
 }
 
 func todoDataFromPayload(payload map[string]any) (session.TodoData, bool) {

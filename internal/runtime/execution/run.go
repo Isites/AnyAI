@@ -46,6 +46,8 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 	if parentAgentID == "" {
 		parentAgentID = strings.TrimSpace(parentMeta.AgentID)
 	}
+	taskID := firstNonEmpty(strings.TrimSpace(req.TaskID), strings.TrimSpace(parentMeta.TaskID))
+	parentTaskID := firstNonEmpty(strings.TrimSpace(req.ParentTaskID), "")
 	ownsLifecycle := strings.TrimSpace(parentMeta.RunID) == ""
 
 	var sess *session.Session
@@ -59,17 +61,24 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 	}
 	sess.SetActiveRefs(session.EntryRefs{
 		RunID:  runID,
-		TaskID: firstNonEmpty(strings.TrimSpace(req.TaskID), strings.TrimSpace(parentMeta.TaskID)),
+		TaskID: taskID,
 	})
 
 	runRecord := runtimeevents.RunRecord{
-		ID:            runID,
-		ParentAgentID: parentAgentID,
-		AgentID:       resolved.Agent.ID,
-		SessionID:     sessionID,
-		Model:         resolved.Agent.Model,
-		Channel:       req.Channel,
-		Status:        runtimeevents.RunStatusRunning,
+		ID:              runID,
+		ParentAgentID:   parentAgentID,
+		AgentID:         resolved.Agent.ID,
+		SessionID:       sessionID,
+		TaskID:          taskID,
+		ParentTaskID:    parentTaskID,
+		RunNodeID:       runtimeevents.RunNodeID(runID, resolved.Agent.ID, taskID),
+		ParentRunNodeID: runtimeevents.RunNodeID(runID, parentAgentID, parentTaskID),
+		Model:           resolved.Agent.Model,
+		Channel:         req.Channel,
+		Status:          runtimeevents.RunStatusRunning,
+	}
+	if parentAgentID == "" {
+		runRecord.ParentRunNodeID = ""
 	}
 	inputAdapter := tools.NewRunInputAdapter(req.Envelope)
 	sessionState := runtimesessionstate.NewStateStore(sess, deps.Recorder, runRecord)
@@ -146,7 +155,7 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 		RunID:          runID,
 		AgentID:        resolved.Agent.ID,
 		SessionID:      sessionID,
-		TaskID:         firstNonEmpty(strings.TrimSpace(req.TaskID), strings.TrimSpace(parentMeta.TaskID)),
+		TaskID:         taskID,
 		InputMessageID: strings.TrimSpace(req.MessageID),
 		AssetsBaseDir:  input.ProjectAssetsDir(deps.Config),
 		CurrentRequest: strings.TrimSpace(inputText),
@@ -172,29 +181,35 @@ func StartManagedRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 		}
 		if payload := sessionInputPayload(inputText, req.Envelope, runMeta); payload != nil {
 			deps.Recorder.AppendEvent(runtimeevents.EventRecord{
-				RunID:     runRecord.ID,
-				AgentID:   runRecord.AgentID,
-				SessionID: runRecord.SessionID,
-				Name:      runtimeevents.EventSessionInputStored,
-				Payload:   payload,
+				RunID:           runRecord.ID,
+				RunNodeID:       runRecord.RunNodeID,
+				ParentRunNodeID: runRecord.ParentRunNodeID,
+				AgentID:         runRecord.AgentID,
+				SessionID:       runRecord.SessionID,
+				Name:            runtimeevents.EventSessionInputStored,
+				Payload:         payload,
 			})
 		}
 		recordAttachmentResolution(deps.Recorder, runRecord, inputAdapter)
 		deps.Recorder.AppendEvent(runtimeevents.EventRecord{
-			RunID:     runRecord.ID,
-			AgentID:   runRecord.AgentID,
-			SessionID: runRecord.SessionID,
-			Name:      runtimeevents.EventRunStarted,
+			RunID:           runRecord.ID,
+			RunNodeID:       runRecord.RunNodeID,
+			ParentRunNodeID: runRecord.ParentRunNodeID,
+			AgentID:         runRecord.AgentID,
+			SessionID:       runRecord.SessionID,
+			Name:            runtimeevents.EventRunStarted,
 		})
 	}
 
 	out := make(chan runtimeevents.EventRecord, 128)
 	startedRecord := runtimeevents.EventRecord{
-		RunID:     runRecord.ID,
-		AgentID:   runRecord.AgentID,
-		SessionID: runRecord.SessionID,
-		Name:      runtimeevents.EventRunStarted,
-		Timestamp: time.Now().UTC(),
+		RunID:           runRecord.ID,
+		RunNodeID:       runRecord.RunNodeID,
+		ParentRunNodeID: runRecord.ParentRunNodeID,
+		AgentID:         runRecord.AgentID,
+		SessionID:       runRecord.SessionID,
+		Name:            runtimeevents.EventRunStarted,
+		Timestamp:       time.Now().UTC(),
 	}
 	go func() {
 		defer close(out)
@@ -376,11 +391,13 @@ func recordAttachmentResolution(recorder *runtimeevents.Recorder, run runtimeeve
 			payload["url"] = url
 		}
 		recorder.AppendEvent(runtimeevents.EventRecord{
-			RunID:     run.ID,
-			AgentID:   run.AgentID,
-			SessionID: run.SessionID,
-			Name:      "attachment.resolved",
-			Payload:   payload,
+			RunID:           run.ID,
+			RunNodeID:       run.RunNodeID,
+			ParentRunNodeID: run.ParentRunNodeID,
+			AgentID:         run.AgentID,
+			SessionID:       run.SessionID,
+			Name:            "attachment.resolved",
+			Payload:         payload,
 		})
 	}
 }

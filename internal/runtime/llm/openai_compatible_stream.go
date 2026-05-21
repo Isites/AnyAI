@@ -144,6 +144,16 @@ func emitOpenAICompatibleStream(events chan ChatEvent, stream *openai.ChatComple
 		}
 	}
 
+	if len(toolCalls) > 0 {
+		completed, err := finalizeOpenAICompatibleToolCalls(toolCalls)
+		if err != nil {
+			events <- ChatEvent{Type: EventError, Error: fmt.Errorf("provider stream ended before tool-call arguments completed%s: %w", describeOpenAICompatibleTools(toolCalls), err)}
+			return
+		}
+		if len(completed) > 0 {
+			emitRecoveredToolCalls(events, completed)
+		}
+	}
 	events <- ChatEvent{Type: EventDone}
 }
 
@@ -215,8 +225,11 @@ func finalizeOpenAICompatibleToolCalls(toolCalls map[int]*streamedToolCall) ([]T
 	completed := make([]ToolCall, 0, len(indexes))
 	for _, idx := range indexes {
 		pending := toolCalls[idx]
-		if pending == nil || strings.TrimSpace(pending.name) == "" {
+		if pending == nil {
 			continue
+		}
+		if strings.TrimSpace(pending.name) == "" {
+			return nil, fmt.Errorf("provider emitted incomplete tool call at index %d without a function name", idx)
 		}
 		input := strings.TrimSpace(pending.argsJSON)
 		if input == "" {

@@ -203,38 +203,56 @@ func (d *dispatcher) forwardRunTreeRecord(ctx context.Context, ch Channel, event
 
 func (d *dispatcher) channelRunEventFromRecord(record Event) RunEvent {
 	out := RunEvent{
-		RunID:             record.RunID,
-		TraceID:           record.TraceID,
-		TraceNodeID:       record.TraceNodeID,
-		ParentTraceNodeID: record.ParentTraceNodeID,
-		AgentID:           record.AgentID,
-		SessionID:         record.SessionID,
-		Name:              record.Name,
-		Timestamp:         record.Timestamp,
-		Payload:           record.Payload,
+		RunID:           record.RunID,
+		RunNodeID:       record.RunNodeID,
+		ParentRunNodeID: record.ParentRunNodeID,
+		AgentID:         record.AgentID,
+		SessionID:       record.SessionID,
+		Name:            record.Name,
+		Timestamp:       record.Timestamp,
+		Payload:         record.Payload,
 	}
 	if d == nil || d.runtime == nil {
 		return out
 	}
 	if run, ok := d.runtime.GetRun(record.RunID); ok {
 		out.ParentAgentID = run.ParentAgentID
-		if out.TraceID == "" {
-			out.TraceID = run.TraceID
-		}
-		if out.TraceNodeID == "" {
-			out.TraceNodeID = run.TraceNodeID
-		}
-		if out.ParentTraceNodeID == "" {
-			out.ParentTraceNodeID = run.ParentTraceNodeID
-		}
+		applyChannelRunEventNodeDefaults(&out, run.RunNodeID, run.ParentRunNodeID, run.AgentID)
 	}
-	if out.TraceNodeID == "" {
-		out.TraceNodeID = traceNodeID(out.RunID, out.AgentID)
-	}
-	if out.TraceID == "" {
-		out.TraceID = out.RunID
+	if out.RunNodeID == "" {
+		out.RunNodeID = runNodeID(out.RunID, out.AgentID, eventTaskID(out.Payload))
 	}
 	return out
+}
+
+func applyChannelRunEventNodeDefaults(event *RunEvent, runRunNodeID, runParentRunNodeID, runAgentID string) {
+	if event == nil {
+		return
+	}
+	agentID := strings.TrimSpace(event.AgentID)
+	runAgentID = strings.TrimSpace(runAgentID)
+	runRunNodeID = strings.TrimSpace(runRunNodeID)
+	runParentRunNodeID = strings.TrimSpace(runParentRunNodeID)
+	if runRunNodeID == "" && runAgentID != "" {
+		runRunNodeID = runNodeID(event.RunID, runAgentID, "")
+	}
+	if event.RunNodeID == "" {
+		if agentID == "" || runAgentID == "" || agentID == runAgentID {
+			event.RunNodeID = runRunNodeID
+		} else {
+			event.RunNodeID = runNodeID(event.RunID, agentID, eventTaskID(event.Payload))
+			if event.ParentRunNodeID == "" {
+				event.ParentRunNodeID = runRunNodeID
+			}
+		}
+	}
+	if event.ParentRunNodeID == "" {
+		if strings.TrimSpace(event.RunNodeID) == runRunNodeID {
+			event.ParentRunNodeID = runParentRunNodeID
+		} else if runRunNodeID != "" {
+			event.ParentRunNodeID = runRunNodeID
+		}
+	}
 }
 
 func textDelta(event Event) string {
@@ -280,14 +298,25 @@ func toolName(event Event) string {
 	return ""
 }
 
-func traceNodeID(runID, agentID string) string {
+func eventTaskID(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	if value, ok := payload["task_id"].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func runNodeID(runID, agentID, taskID string) string {
 	runID = strings.TrimSpace(runID)
 	agentID = strings.TrimSpace(agentID)
+	taskID = strings.TrimSpace(taskID)
 	if runID == "" {
 		return ""
 	}
-	if agentID == "" {
-		return runID
+	if taskID == "" {
+		return runID + "::" + agentID
 	}
-	return runID + "::" + agentID
+	return runID + "::" + agentID + "::" + taskID
 }

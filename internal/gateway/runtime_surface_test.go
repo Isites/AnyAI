@@ -46,13 +46,12 @@ func TestChannelRunEventCarriesTraceIdentity(t *testing.T) {
 	dispatch := &dispatcher{runtime: &stubChannelPort{
 		runs: map[string]Run{
 			"run_child": gatewayRun(runtimeevents.RunRecord{
-				ID:                "run_child",
-				TraceID:           "trace_root",
-				TraceNodeID:       "node_child",
-				ParentTraceNodeID: "node_parent",
-				AgentID:           "coder",
-				SessionID:         "sess",
-				ParentAgentID:     "lead",
+				ID:              "run_child",
+				RunNodeID:       "node_child",
+				ParentRunNodeID: "node_parent",
+				AgentID:         "coder",
+				SessionID:       "sess",
+				ParentAgentID:   "lead",
 			}),
 		},
 	}}
@@ -64,9 +63,8 @@ func TestChannelRunEventCarriesTraceIdentity(t *testing.T) {
 		Name:      runtimeevents.EventRunStarted,
 	})
 
-	assert.Equal(t, "trace_root", event.TraceID)
-	assert.Equal(t, "node_child", event.TraceNodeID)
-	assert.Equal(t, "node_parent", event.ParentTraceNodeID)
+	assert.Equal(t, "node_child", event.RunNodeID)
+	assert.Equal(t, "node_parent", event.ParentRunNodeID)
 	assert.Equal(t, "lead", event.ParentAgentID)
 }
 

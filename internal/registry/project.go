@@ -525,7 +525,7 @@ func applyProjectChannelConfig(cfg *config.Config, projectCfg *config.ProjectCon
 		cfg.Channels.CLI.Enabled = enabled["cli"]
 	}
 	if listen := strings.TrimSpace(projectCfg.Channels.HTTP.Listen); listen != "" {
-		if host, port, err := splitListenAddr(listen); err == nil {
+		if host, port, err := config.SplitListenAddr(listen); err == nil {
 			cfg.Gateway.Host = host
 			cfg.Gateway.Port = port
 		}
@@ -571,18 +571,6 @@ func uniqueEntryID(agents []ProjectAgent) string {
 		entryID = a.ID
 	}
 	return entryID
-}
-
-func splitListenAddr(listen string) (string, int, error) {
-	host, portStr, ok := strings.Cut(listen, ":")
-	if !ok || portStr == "" {
-		return "", 0, fmt.Errorf("invalid listen address %q", listen)
-	}
-	var port int
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
-		return "", 0, fmt.Errorf("invalid listen port %q", listen)
-	}
-	return host, port, nil
 }
 
 func existingDir(path string) string {

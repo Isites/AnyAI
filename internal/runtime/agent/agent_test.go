@@ -848,6 +848,58 @@ func TestRuntimeRunSettlesQuietlyForEmptyCompletion(t *testing.T) {
 	assert.Equal(t, "user", history[0].Role)
 }
 
+func TestRuntimeRunFailsWhenToolCallNeverCompletes(t *testing.T) {
+	mock := &mockLLMProvider{
+		events: []llm.ChatEvent{
+			{Type: llm.EventTextDelta, Text: "writing"},
+			{Type: llm.EventToolCallStart, ToolCall: &llm.ToolCall{ID: "tc_write", Name: "write_file"}},
+			{Type: llm.EventDone},
+		},
+	}
+
+	sess := session.NewSession("test-agent", "test-key")
+	reg := tools.NewRegistry()
+
+	rt := &Runtime{
+		LLM:       mock,
+		Tools:     reg,
+		Session:   sess,
+		Model:     "mock-model",
+		Workspace: t.TempDir(),
+		MaxTurns:  5,
+	}
+
+	events, err := rt.Run(context.Background(), "write the report", nil)
+	require.NoError(t, err)
+
+	var requested bool
+	var gotDone bool
+	var runErr error
+	var fallback bool
+	for e := range events {
+		switch e.Type {
+		case EventToolCallRequested:
+			requested = true
+		case EventDone:
+			gotDone = true
+		case EventRunIncomplete, EventFallbackReply:
+			fallback = true
+		case EventError:
+			runErr = e.Error
+		}
+	}
+
+	require.True(t, requested)
+	require.False(t, gotDone)
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "tool call input completed")
+	assert.True(t, fallback)
+
+	for _, entry := range sess.History() {
+		assert.NotEqual(t, session.EntryTypeToolCall, entry.Type)
+	}
+}
+
 func TestRuntimeRunFailsAfterRepeatedEmptyGoalCompletionTurns(t *testing.T) {
 	callCount := 0
 	sess := session.NewSession("test-agent", "test-key")

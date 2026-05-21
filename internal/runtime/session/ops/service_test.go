@@ -97,6 +97,8 @@ func TestServiceRecordsAssistantSessionOutputFromSessionAppend(t *testing.T) {
 	require.Len(t, events, 1)
 	assert.Equal(t, runtimeevents.EventSessionOutputStored, events[0].Name)
 	assert.Equal(t, "answer", events[0].Payload["text"])
+	assert.Equal(t, "task_1", events[0].Payload["task_id"])
+	assert.Equal(t, runtimeevents.RunNodeID("run_1", "assistant", "task_1"), events[0].RunNodeID)
 }
 
 func TestServiceRecordsRuntimeControlFromSessionAppend(t *testing.T) {

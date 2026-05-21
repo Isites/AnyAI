@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/Isites/anyai/internal/runtime/session"
@@ -37,6 +38,13 @@ func (r *Runtime) maybeSurfaceIncompleteTurn(events chan<- AgentEvent, partialTe
 	if strings.TrimSpace(partialText) == "" {
 		events <- AgentEvent{Type: EventTextDelta, Text: fallback}
 	}
+}
+
+func incompleteToolCallError(progress *turnProgress) error {
+	if progress == nil || progress.StartedToolCalls <= progress.CompletedToolCalls {
+		return nil
+	}
+	return fmt.Errorf("model stream ended before tool call input completed (%d started, %d completed)", progress.StartedToolCalls, progress.CompletedToolCalls)
 }
 
 func (r *Runtime) incompleteTurnEnabled() bool {

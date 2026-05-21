@@ -521,6 +521,28 @@ func TestRuntimeDoTaskInheritsRunIDFromContext(t *testing.T) {
 	assert.Equal(t, string(parentTurn.ID), record.RunID)
 }
 
+func TestStoreAgentTaskParentRunNodeUsesCallerAgent(t *testing.T) {
+	var events []runtimeevents.EventRecord
+	store := NewStore(WithEventAppender(func(event runtimeevents.EventRecord) {
+		events = append(events, event)
+	}))
+
+	record := store.CreateSpec(Spec{
+		Kind:        KindAgent,
+		AgentID:     "review-lead",
+		RunID:       "run_parent",
+		SessionID:   "cli_local",
+		TargetAgent: "report-generator",
+		Input:       "generate report",
+	})
+	require.NotNil(t, record)
+	require.Len(t, events, 1)
+
+	assert.Equal(t, runtimeevents.RunNodeID("run_parent", "report-generator", record.ID), events[0].RunNodeID)
+	assert.Equal(t, runtimeevents.RunNodeID("run_parent", "review-lead", ""), events[0].ParentRunNodeID)
+	assert.Equal(t, "report-generator", events[0].AgentID)
+}
+
 func waitCompletion(t *testing.T, done <-chan Completion) Completion {
 	t.Helper()
 	select {

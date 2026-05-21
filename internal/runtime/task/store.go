@@ -462,13 +462,24 @@ func (s *Store) emit(name string, record Record) {
 	if s == nil {
 		return
 	}
+	parentAgentID := strings.TrimSpace(record.AgentID)
+	if parentAgentID == "" && record.Kind == KindAgent {
+		parentAgentID = metadataString(record.Metadata, "caller_agent")
+	}
 	event := runtimeevents.EventRecord{
-		RunID:     record.RunID,
-		AgentID:   record.AgentID,
-		SessionID: record.SessionID,
-		Name:      name,
-		Timestamp: time.Now().UTC(),
-		Payload:   buildPayload(record),
+		RunID:           record.RunID,
+		RunNodeID:       runtimeevents.RunNodeID(record.RunID, record.TargetAgent, record.ID),
+		ParentRunNodeID: runtimeevents.RunNodeID(record.RunID, parentAgentID, record.ParentTaskID),
+		AgentID:         firstNonEmpty(record.TargetAgent, record.AgentID),
+		SessionID:       record.SessionID,
+		Name:            name,
+		Timestamp:       time.Now().UTC(),
+		Payload:         buildPayload(record),
+	}
+	if record.Kind != KindAgent {
+		event.RunNodeID = runtimeevents.RunNodeID(record.RunID, record.AgentID, record.ParentTaskID)
+		event.ParentRunNodeID = ""
+		event.AgentID = record.AgentID
 	}
 	s.mu.RLock()
 	appender := s.appender
@@ -751,6 +762,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func maxInt(value, floor int) int {

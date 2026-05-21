@@ -79,6 +79,7 @@ func (e *Executor) Execute(ctx context.Context, taskRecord task.Record) (task.Re
 		Envelope:      envelope,
 		SessionID:     childSessionID,
 		TaskID:        taskRecord.ID,
+		ParentTaskID:  taskRecord.ParentTaskID,
 		ParentAgentID: firstNonEmptyString(metadataString(taskRecord.Metadata, "caller_agent"), taskRecord.AgentID),
 		Contract:      contract,
 	}

@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +18,6 @@ import (
 )
 
 const (
-	defaultGatewayHost                          = "127.0.0.1"
-	defaultGatewayPort                          = 2333
 	defaultGatewayListen                        = "127.0.0.1:2333"
 	defaultReloadMode                           = "hybrid"
 	defaultRuntimeIdleTimeoutMS                 = 300000
@@ -479,10 +479,11 @@ func Load(path string) (*Config, error) {
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
+	gatewayHost, gatewayPort := defaultGatewayHostPort()
 	return &Config{
 		Gateway: GatewayConfig{
-			Host:   defaultGatewayHost,
-			Port:   defaultGatewayPort,
+			Host:   gatewayHost,
+			Port:   gatewayPort,
 			Reload: ReloadConfig{Mode: defaultReloadMode},
 		},
 		Providers: map[string]ProviderConfig{},
@@ -606,11 +607,12 @@ func (c *Config) Validate() error {
 	if c.Providers == nil {
 		c.Providers = map[string]ProviderConfig{}
 	}
+	gatewayHost, gatewayPort := defaultGatewayHostPort()
 	if c.Gateway.Port == 0 {
-		c.Gateway.Port = defaultGatewayPort
+		c.Gateway.Port = gatewayPort
 	}
 	if c.Gateway.Host == "" {
-		c.Gateway.Host = defaultGatewayHost
+		c.Gateway.Host = gatewayHost
 	}
 	if c.Gateway.Reload.Mode == "" {
 		c.Gateway.Reload.Mode = defaultReloadMode
@@ -866,6 +868,41 @@ func applyMemoryAutoCaptureDefaults(cfg *MemoryConfig) {
 			cfg.AutoCapture.Enabled = true
 		}
 	}
+}
+
+func defaultGatewayHostPort() (string, int) {
+	host, port, err := SplitListenAddr(defaultGatewayListen)
+	if err != nil {
+		panic(fmt.Sprintf("invalid default gateway listen address %q: %v", defaultGatewayListen, err))
+	}
+	return host, port
+}
+
+// SplitListenAddr parses the project-level HTTP listen address into the legacy
+// gateway host/port fields used by the HTTP server wiring.
+func SplitListenAddr(listen string) (string, int, error) {
+	listen = strings.TrimSpace(listen)
+	host, portText, err := net.SplitHostPort(listen)
+	if err != nil {
+		if strings.Count(listen, ":") == 1 {
+			host, portText, _ = strings.Cut(listen, ":")
+		} else {
+			return "", 0, fmt.Errorf("invalid listen address %q: %w", listen, err)
+		}
+	}
+	host = strings.TrimSpace(host)
+	portText = strings.TrimSpace(portText)
+	if portText == "" {
+		return "", 0, fmt.Errorf("invalid listen address %q", listen)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 {
+		if err == nil {
+			err = fmt.Errorf("port must be > 0")
+		}
+		return "", 0, fmt.Errorf("invalid listen port %q: %w", listen, err)
+	}
+	return host, port, nil
 }
 
 func boolPtr(v bool) *bool {

@@ -241,6 +241,11 @@ func (c *runController) runTurn(turn int) {
 	}
 	c.lastTurnVisibleReply = strings.TrimSpace(textContent.String()) != ""
 	if len(toolCalls) == 0 {
+		if incomplete := incompleteToolCallError(&progress); incomplete != nil {
+			c.rt.maybeSurfaceIncompleteTurn(c.events, textContent.String(), progress)
+			c.finish(AgentEvent{Type: EventError, Error: incomplete})
+			return
+		}
 		if c.awaitingVisibleReply {
 			if !c.lastTurnVisibleReply {
 				c.finish(AgentEvent{

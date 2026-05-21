@@ -71,16 +71,15 @@ type MessagePolicyDecision struct {
 // message. Channels can optionally consume these events to surface runtime
 // status information to end-users.
 type RunEvent struct {
-	RunID             string
-	TraceID           string
-	TraceNodeID       string
-	ParentTraceNodeID string
-	AgentID           string
-	SessionID         string
-	ParentAgentID     string
-	Name              string
-	Timestamp         time.Time
-	Payload           map[string]any
+	RunID           string
+	RunNodeID       string
+	ParentRunNodeID string
+	AgentID         string
+	SessionID       string
+	ParentAgentID   string
+	Name            string
+	Timestamp       time.Time
+	Payload         map[string]any
 }
 
 // ChannelInfo is the read-only channel inventory view exposed by gateway.

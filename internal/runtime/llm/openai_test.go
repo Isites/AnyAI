@@ -196,6 +196,17 @@ func TestRecoverOpenAICompatibleStreamClassifiesToolCallArgumentFailure(t *testi
 	assert.Contains(t, err.Error(), "during tool-call arguments for callagent")
 }
 
+func TestFinalizeOpenAICompatibleToolCallsRejectsNamelessPendingCall(t *testing.T) {
+	_, err := finalizeOpenAICompatibleToolCalls(map[int]*streamedToolCall{
+		0: {
+			id: "call_1",
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "without a function name")
+}
+
 func TestOpenAIProviderRecoversTextWhenStreamJSONIsTruncatedAfterContent(t *testing.T) {
 	diags := captureOpenAICompatibleDiagnostics(t)
 	server := newLoopbackTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

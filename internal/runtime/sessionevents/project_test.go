@@ -33,3 +33,19 @@ func TestHistoryEventRecordsProjectsCallAgentLifecycleFromSessionRecords(t *test
 	assert.Equal(t, "修复已完成", events[3].Payload["summary"])
 	assert.Equal(t, "run_parent", events[3].RunID)
 }
+
+func TestHistoryEventRecordsPreservesTaskRunNodeForSessionOutput(t *testing.T) {
+	entry := session.ApplyEntryRefs(
+		session.AssistantMessageEntry("done"),
+		session.EntryRefs{RunID: "run_parent", TaskID: "task_child"},
+	)
+	entry.Timestamp = time.Unix(1700000000, 0).Unix()
+
+	events := HistoryEventRecords("worker", "sess_worker", []session.SessionEntry{entry})
+	require.Len(t, events, 1)
+
+	assert.Equal(t, runtimeevents.EventSessionOutputStored, events[0].Name)
+	assert.Equal(t, "task_child", events[0].Payload["task_id"])
+	assert.Equal(t, runtimeevents.RunNodeID("run_parent", "worker", "task_child"), events[0].RunNodeID)
+	assert.Equal(t, "done", events[0].Payload["text"])
+}

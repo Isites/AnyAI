@@ -41,6 +41,7 @@ func EntryEventRecords(agentID, sessionID string, entry session.SessionEntry, to
 			"entry_id": strings.TrimSpace(entry.ID),
 		},
 	}
+	applyEntryRunNodeRefs(&record, entry)
 
 	switch entry.Type {
 	case session.EntryTypeMessage:
@@ -296,15 +297,30 @@ func agentCallFinishedEventName(payload map[string]any) string {
 
 func withEvent(base runtimeevents.EventRecord, name string, payload map[string]any) runtimeevents.EventRecord {
 	return runtimeevents.EventRecord{
-		RunID:         base.RunID,
-		AgentID:       base.AgentID,
-		SessionID:     base.SessionID,
-		Name:          name,
-		Timestamp:     base.Timestamp,
-		Payload:       mergePayload(base.Payload, payload),
-		SchemaVersion: base.SchemaVersion,
-		Sequence:      base.Sequence,
+		RunID:           base.RunID,
+		RunNodeID:       base.RunNodeID,
+		ParentRunNodeID: base.ParentRunNodeID,
+		AgentID:         base.AgentID,
+		SessionID:       base.SessionID,
+		Name:            name,
+		Timestamp:       base.Timestamp,
+		Payload:         mergePayload(base.Payload, payload),
+		SchemaVersion:   base.SchemaVersion,
+		Sequence:        base.Sequence,
 	}
+}
+
+func applyEntryRunNodeRefs(record *runtimeevents.EventRecord, entry session.SessionEntry) {
+	if record == nil {
+		return
+	}
+	runID := strings.TrimSpace(record.RunID)
+	agentID := strings.TrimSpace(record.AgentID)
+	taskID := strings.TrimSpace(entry.TaskID)
+	if taskID != "" {
+		record.Payload["task_id"] = taskID
+	}
+	record.RunNodeID = runtimeevents.RunNodeID(runID, agentID, taskID)
 }
 
 func clonePayload(src map[string]any) map[string]any {

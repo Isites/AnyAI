@@ -113,6 +113,8 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 	for _, event := range events {
 		assert.Equal(t, "run_root", event.RunID)
 		assert.Equal(t, "worker", event.AgentID)
+		assert.Equal(t, "run_root::worker", event.RunNodeID)
+		assert.Equal(t, "run_root::lead", event.ParentRunNodeID)
 	}
 }
 

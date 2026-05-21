@@ -177,7 +177,7 @@ func availableTemplateNames() []string {
 func builtinTemplates() map[string]map[string]string {
 	return map[string]map[string]string{
 		"single-agent": {
-			"anyai.yaml": "# AnyAI defaults already include:\n# - memory recall and auto-capture\n# - runtime agent call limits\n# - `anyai start` listening on 127.0.0.1:18789\n# Add overrides here only when you really need them.\nname: single-agent\nmodels:\n  default: anthropic/claude-sonnet-4-5\n",
+			"anyai.yaml": "# AnyAI defaults already include:\n# - memory recall and auto-capture\n# - runtime agent call limits\n# - `anyai start` listening on 127.0.0.1:2333\n# Add overrides here only when you really need them.\nname: single-agent\nmodels:\n  default: anthropic/claude-sonnet-4-5\n",
 			"agent.md":   "---\nid: assistant\nname: Project Assistant\nentry: true\nmodel: anthropic/claude-sonnet-4-5\nmax_turns: 12\ntools:\n  allow:\n    - read_file\n    - write_file\n    - edit_file\n    - bash\n    - callagent\n---\n\n你是项目的主 Agent。\n\n工作原则：\n- 先理解用户目标，再执行\n- 能直接完成的任务直接完成\n- 需要拆解时再委派给子 Agent\n- 输出时说明结果与风险\n",
 			"README.md":  "# Single Agent Template\n\n1. 配置 Provider 环境变量。\n2. 运行 `anyai chat` 进入当前项目。\n3. 运行 `anyai start` 启动 HTTP / WebSocket Gateway。\n",
 		},

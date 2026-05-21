@@ -123,22 +123,23 @@ func gatewayEventChannel(events <-chan runtimeevents.EventRecord) <-chan Event {
 
 func gatewayRun(run runtimeevents.RunRecord) Run {
 	return Run{
-		ID:                run.ID,
-		TraceID:           run.TraceID,
-		TraceNodeID:       run.TraceNodeID,
-		ParentTraceNodeID: run.ParentTraceNodeID,
-		ParentAgentID:     run.ParentAgentID,
-		AgentID:           run.AgentID,
-		SessionID:         run.SessionID,
-		Model:             run.Model,
-		Channel:           run.Channel,
-		Input:             run.Input,
-		Output:            run.Output,
-		Error:             run.Error,
-		Status:            RunStatus(run.Status),
-		CreatedAt:         run.CreatedAt,
-		StartedAt:         run.StartedAt,
-		CompletedAt:       run.CompletedAt,
+		ID:              run.ID,
+		RunNodeID:       run.RunNodeID,
+		ParentRunNodeID: run.ParentRunNodeID,
+		ParentAgentID:   run.ParentAgentID,
+		AgentID:         run.AgentID,
+		SessionID:       run.SessionID,
+		TaskID:          run.TaskID,
+		ParentTaskID:    run.ParentTaskID,
+		Model:           run.Model,
+		Channel:         run.Channel,
+		Input:           run.Input,
+		Output:          run.Output,
+		Error:           run.Error,
+		Status:          RunStatus(run.Status),
+		CreatedAt:       run.CreatedAt,
+		StartedAt:       run.StartedAt,
+		CompletedAt:     run.CompletedAt,
 	}
 }
 
@@ -155,33 +156,31 @@ func gatewayRuns(runs []runtimeevents.RunRecord) []Run {
 
 func gatewayEvent(event runtimeevents.EventRecord) Event {
 	return Event{
-		SchemaVersion:     event.SchemaVersion,
-		Sequence:          event.Sequence,
-		RunID:             event.RunID,
-		TraceID:           event.TraceID,
-		TraceNodeID:       event.TraceNodeID,
-		ParentTraceNodeID: event.ParentTraceNodeID,
-		AgentID:           event.AgentID,
-		SessionID:         event.SessionID,
-		Name:              event.Name,
-		Timestamp:         event.Timestamp,
-		Payload:           cloneMap(event.Payload),
+		SchemaVersion:   event.SchemaVersion,
+		Sequence:        event.Sequence,
+		RunID:           event.RunID,
+		RunNodeID:       event.RunNodeID,
+		ParentRunNodeID: event.ParentRunNodeID,
+		AgentID:         event.AgentID,
+		SessionID:       event.SessionID,
+		Name:            event.Name,
+		Timestamp:       event.Timestamp,
+		Payload:         cloneMap(event.Payload),
 	}
 }
 
 func runtimeEvent(event Event) runtimeevents.EventRecord {
 	return runtimeevents.EventRecord{
-		SchemaVersion:     event.SchemaVersion,
-		Sequence:          event.Sequence,
-		RunID:             event.RunID,
-		TraceID:           event.TraceID,
-		TraceNodeID:       event.TraceNodeID,
-		ParentTraceNodeID: event.ParentTraceNodeID,
-		AgentID:           event.AgentID,
-		SessionID:         event.SessionID,
-		Name:              event.Name,
-		Timestamp:         event.Timestamp,
-		Payload:           cloneMap(event.Payload),
+		SchemaVersion:   event.SchemaVersion,
+		Sequence:        event.Sequence,
+		RunID:           event.RunID,
+		RunNodeID:       event.RunNodeID,
+		ParentRunNodeID: event.ParentRunNodeID,
+		AgentID:         event.AgentID,
+		SessionID:       event.SessionID,
+		Name:            event.Name,
+		Timestamp:       event.Timestamp,
+		Payload:         cloneMap(event.Payload),
 	}
 }
 

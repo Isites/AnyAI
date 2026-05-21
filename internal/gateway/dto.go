@@ -82,36 +82,36 @@ const (
 )
 
 type Run struct {
-	ID                string    `json:"id"`
-	TraceID           string    `json:"trace_id,omitempty"`
-	TraceNodeID       string    `json:"trace_node_id,omitempty"`
-	ParentTraceNodeID string    `json:"parent_trace_node_id,omitempty"`
-	ParentAgentID     string    `json:"parent_agent_id,omitempty"`
-	AgentID           string    `json:"agent_id"`
-	SessionID         string    `json:"session_id"`
-	Model             string    `json:"model"`
-	Channel           string    `json:"channel,omitempty"`
-	Input             string    `json:"input,omitempty"`
-	Output            string    `json:"output,omitempty"`
-	Error             string    `json:"error,omitempty"`
-	Status            RunStatus `json:"status"`
-	CreatedAt         time.Time `json:"created_at"`
-	StartedAt         time.Time `json:"started_at"`
-	CompletedAt       time.Time `json:"completed_at,omitempty"`
+	ID              string    `json:"id"`
+	RunNodeID       string    `json:"run_node_id,omitempty"`
+	ParentRunNodeID string    `json:"parent_run_node_id,omitempty"`
+	ParentAgentID   string    `json:"parent_agent_id,omitempty"`
+	AgentID         string    `json:"agent_id"`
+	SessionID       string    `json:"session_id"`
+	TaskID          string    `json:"task_id,omitempty"`
+	ParentTaskID    string    `json:"parent_task_id,omitempty"`
+	Model           string    `json:"model"`
+	Channel         string    `json:"channel,omitempty"`
+	Input           string    `json:"input,omitempty"`
+	Output          string    `json:"output,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	Status          RunStatus `json:"status"`
+	CreatedAt       time.Time `json:"created_at"`
+	StartedAt       time.Time `json:"started_at"`
+	CompletedAt     time.Time `json:"completed_at,omitempty"`
 }
 
 type Event struct {
-	SchemaVersion     int            `json:"schema_version,omitempty"`
-	Sequence          int            `json:"sequence"`
-	RunID             string         `json:"run_id"`
-	TraceID           string         `json:"trace_id,omitempty"`
-	TraceNodeID       string         `json:"trace_node_id,omitempty"`
-	ParentTraceNodeID string         `json:"parent_trace_node_id,omitempty"`
-	AgentID           string         `json:"agent_id"`
-	SessionID         string         `json:"session_id"`
-	Name              string         `json:"name"`
-	Timestamp         time.Time      `json:"timestamp"`
-	Payload           map[string]any `json:"payload,omitempty"`
+	SchemaVersion   int            `json:"schema_version,omitempty"`
+	Sequence        int            `json:"sequence"`
+	RunID           string         `json:"run_id"`
+	RunNodeID       string         `json:"run_node_id,omitempty"`
+	ParentRunNodeID string         `json:"parent_run_node_id,omitempty"`
+	AgentID         string         `json:"agent_id"`
+	SessionID       string         `json:"session_id"`
+	Name            string         `json:"name"`
+	Timestamp       time.Time      `json:"timestamp"`
+	Payload         map[string]any `json:"payload,omitempty"`
 }
 
 type RunTree struct {
