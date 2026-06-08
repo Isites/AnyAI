@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Isites/anyai/internal/runtime/contract"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 )
 
@@ -140,6 +141,7 @@ func (s *Store) Complete(id string, result Result) (Record, bool) {
 		if isTerminal(record.Status) {
 			return ""
 		}
+		result = sanitizeDurableResult(result)
 		record.Status = StatusCompleted
 		record.UpdatedAt = now
 		record.LastActivityAt = now
@@ -159,6 +161,7 @@ func (s *Store) Fail(id string, result Result) (Record, bool) {
 		if isTerminal(record.Status) {
 			return ""
 		}
+		result = sanitizeDurableResult(result)
 		record.Status = StatusFailed
 		record.UpdatedAt = now
 		record.LastActivityAt = now
@@ -308,6 +311,7 @@ func (s *Store) cancelWithResult(taskID string, result Result) (Record, bool) {
 		if isTerminal(record.Status) {
 			return ""
 		}
+		result = sanitizeDurableResult(result)
 		record.Status = StatusCancelled
 		record.UpdatedAt = now
 		record.LastActivityAt = now
@@ -322,6 +326,19 @@ func (s *Store) cancelWithResult(taskID string, result Result) (Record, bool) {
 	})
 }
 
+func sanitizeDurableResult(result Result) Result {
+	if result.Summary != "" {
+		result.Summary, _ = contract.SanitizeDurableText(result.Summary)
+	}
+	if result.Error != "" {
+		result.Error, _ = contract.SanitizeDurableText(result.Error)
+	}
+	if len(result.Metadata) > 0 {
+		result.Metadata = contract.SanitizeDurableMetadata(result.Metadata)
+	}
+	return result
+}
+
 func (s *Store) Rebuild(recorder *runtimeevents.Recorder) error {
 	if s == nil {
 		return nil
@@ -334,9 +351,9 @@ func (s *Store) Rebuild(recorder *runtimeevents.Recorder) error {
 	runs := recorder.ListRuns()
 	eventsByTask := make(map[string][]runtimeevents.EventRecord)
 	for _, run := range runs {
-		for _, event := range recorder.ListRunEvents(run.ID) {
+		for _, event := range recorder.ListRunEventsByNamePrefix(run.ID, "task.") {
 			taskID := taskIDFromPayload(event.Payload)
-			if taskID == "" || !strings.HasPrefix(event.Name, "task.") {
+			if taskID == "" {
 				continue
 			}
 			eventsByTask[taskID] = append(eventsByTask[taskID], event)
@@ -474,7 +491,7 @@ func (s *Store) emit(name string, record Record) {
 		SessionID:       record.SessionID,
 		Name:            name,
 		Timestamp:       time.Now().UTC(),
-		Payload:         buildPayload(record),
+		Payload:         contract.SanitizeDurablePayload(buildPayload(record)),
 	}
 	if record.Kind != KindAgent {
 		event.RunNodeID = runtimeevents.RunNodeID(record.RunID, record.AgentID, record.ParentTaskID)

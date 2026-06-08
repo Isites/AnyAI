@@ -39,6 +39,16 @@ func TestProjectWatcherIgnoresDataDirButReloadsProjectFiles(t *testing.T) {
 	case <-time.After(800 * time.Millisecond):
 	}
 
+	artifactDir := filepath.Join(root, "artifacts-1")
+	require.NoError(t, os.MkdirAll(artifactDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(artifactDir, "report.json"), []byte("ignored"), 0o644))
+
+	select {
+	case <-reloads:
+		t.Fatal("artifact write should not trigger project reload")
+	case <-time.After(800 * time.Millisecond):
+	}
+
 	require.NoError(t, os.WriteFile(agentPath, []byte("# Agent\n\nupdated"), 0o644))
 
 	select {

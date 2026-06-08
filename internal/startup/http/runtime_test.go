@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,10 @@ func (p *mockProvider) Models() []llm.ModelInfo {
 
 func (p *mockProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "http channel compact summary"}, nil
+}
+
+func (p *mockProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func testRuntime(t *testing.T) (*Service, *runtimeport.DependencySet, *gateway.ChannelManager) {
@@ -201,6 +206,64 @@ func TestRuntimeRebuildProjectionsEndpointUsesRecorderStorage(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), `"status":"ok"`)
 	assert.Contains(t, rec.Body.String(), `"runs":2`)
+}
+
+func TestRunsEndpointFiltersStatusSessionAgentAndLimit(t *testing.T) {
+	runtime, surface, _ := testRuntime(t)
+	recorder := surface.Recorder()
+	require.NotNil(t, recorder)
+
+	base := time.Now().UTC()
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_old_running",
+		AgentID:   "assistant",
+		SessionID: "sess_match",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: base.Add(-2 * time.Minute),
+	})
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_completed",
+		AgentID:   "assistant",
+		SessionID: "sess_match",
+		Status:    runtimeevents.RunStatusCompleted,
+		StartedAt: base.Add(-time.Minute),
+	})
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_new_running",
+		AgentID:   "assistant",
+		SessionID: "sess_match",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: base,
+	})
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_other_agent",
+		AgentID:   "worker",
+		SessionID: "sess_match",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: base.Add(time.Minute),
+	})
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_other_session",
+		AgentID:   "assistant",
+		SessionID: "sess_other",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: base.Add(2 * time.Minute),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/runs?status=running&agent_id=assistant&session_id=sess_match&limit=1", nil)
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var payload struct {
+		Runs []gateway.Run `json:"runs"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Runs, 1)
+	assert.Equal(t, "run_new_running", payload.Runs[0].ID)
+	assert.Equal(t, gateway.RunStatusRunning, payload.Runs[0].Status)
+	assert.Equal(t, "assistant", payload.Runs[0].AgentID)
+	assert.Equal(t, "sess_match", payload.Runs[0].SessionID)
 }
 
 func TestMemoryEndpointsExposeStatsSearchGetAndStaleCleanup(t *testing.T) {
@@ -512,14 +575,14 @@ func TestSessionEndpointsCreateListAndHistory(t *testing.T) {
 
 	var history struct {
 		Session struct {
-			History []map[string]any `json:"history"`
+			Events []gateway.Event `json:"events"`
 		} `json:"session"`
 	}
 	require.NoError(t, json.Unmarshal(getRec.Body.Bytes(), &history))
-	require.Len(t, history.Session.History, 2)
-	assert.Equal(t, "message", history.Session.History[0]["type"])
-	assert.Equal(t, "user", history.Session.History[0]["role"])
-	assert.Equal(t, "你好，这里是 AnyAI。", history.Session.History[1]["text"])
+	require.Len(t, history.Session.Events, 2)
+	assert.Equal(t, "session.input.stored", history.Session.Events[0].Name)
+	assert.Equal(t, "session.output.stored", history.Session.Events[1].Name)
+	assert.Equal(t, "你好，这里是 AnyAI。", history.Session.Events[1].Payload["text"])
 }
 
 func TestCatalogEndpointIncludesIntegrationGuide(t *testing.T) {
@@ -653,7 +716,7 @@ func TestRunTreeEndpointReturnsHierarchicalTree(t *testing.T) {
 		Timestamp: startedAt.Add(2 * time.Second),
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/runs/run_root/tree", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/runs/run_root/tree?events=1", nil)
 	rec := httptest.NewRecorder()
 	runtime.Server().Router().ServeHTTP(rec, req)
 
@@ -669,6 +732,42 @@ func TestRunTreeEndpointReturnsHierarchicalTree(t *testing.T) {
 	require.Len(t, payload.Tree[0].Events, 3)
 	assert.Equal(t, "researcher", payload.Tree[0].Events[1].AgentID)
 	assert.Equal(t, "run.completed", payload.Tree[0].Events[2].Name)
+}
+
+func TestRunTreeEndpointDefaultsToSummaryOnly(t *testing.T) {
+	runtime, surface, _ := testRuntime(t)
+	recorder := surface.Recorder()
+	require.NotNil(t, recorder)
+
+	startedAt := time.Now().UTC().Add(-2 * time.Second)
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_root",
+		AgentID:   "assistant",
+		SessionID: "sess_root",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: startedAt,
+	})
+	recorder.AppendEvent(runtimeevents.EventRecord{
+		RunID:     "run_root",
+		AgentID:   "assistant",
+		SessionID: "sess_root",
+		Name:      "run.started",
+		Timestamp: startedAt,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/runs/run_root/tree", nil)
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var payload struct {
+		Tree []runtimeevents.RunNode `json:"tree"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Tree, 1)
+	assert.Equal(t, "run_root", payload.Tree[0].Run.ID)
+	assert.Empty(t, payload.Tree[0].Events)
 }
 
 func TestRunTreeEventsEndpointReplaysSyntheticTextDelta(t *testing.T) {
@@ -734,6 +833,36 @@ func TestChatEndpointStreamsLifecycleFromSinglePOST(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"entry_id":"e_http_supplied"`)
 	assert.Contains(t, rec.Body.String(), "event: text.delta")
 	assert.Contains(t, rec.Body.String(), "Hello from agent!")
+}
+
+func TestSessionEventsEndpointReturnsPagedHistory(t *testing.T) {
+	runtime, deps, _ := testRuntime(t)
+	store := deps.SessionStore()
+
+	sess, err := store.Load("assistant", "history-demo")
+	require.NoError(t, err)
+	for i := 1; i <= 5; i++ {
+		sess.Append(session.UserMessageEntry("question " + strconv.Itoa(i)))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/assistant/history-demo/events?limit=2", nil)
+	rec := httptest.NewRecorder()
+	runtime.Server().Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var payload struct {
+		Events     []gateway.Event `json:"events"`
+		HasMore    bool            `json:"has_more"`
+		NextBefore string          `json:"next_before"`
+		Total      int             `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Events, 2)
+	assert.True(t, payload.HasMore)
+	assert.Equal(t, 5, payload.Total)
+	assert.Equal(t, "question 4", payload.Events[0].Payload["text"])
+	assert.Equal(t, "question 5", payload.Events[1].Payload["text"])
+	require.NotEmpty(t, payload.NextBefore)
 }
 
 func TestAttachmentUploadPersistsAssetsAndReturnsImageBlock(t *testing.T) {

@@ -8,6 +8,14 @@ func (s *Service) ListSessionEvents(agentID, sessionID string) []Event {
 	return gatewayEvents(rt.ListSessionEvents(agentID, sessionID))
 }
 
+func (s *Service) ListSessionEventPage(agentID, sessionID string, req SessionEventPageRequest) SessionEventPage {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return SessionEventPage{}
+	}
+	return gatewaySessionEventPage(rt.ListSessionEventPage(agentID, sessionID, runtimeSessionEventPageRequest(req)))
+}
+
 func (s *Service) ListSessions(agentID string) ([]SessionInfo, error) {
 	rt, err := s.runtimeOrErr()
 	if err != nil {

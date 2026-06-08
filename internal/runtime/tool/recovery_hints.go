@@ -142,6 +142,12 @@ func recoveryHintsForEditFile(errorClass, errorMessage string) []string {
 
 func recoveryHintsForReadFile(errorClass string) []string {
 	switch errorClass {
+	case "validation_error":
+		return []string{
+			"Fix the `read_file` arguments before retrying: use either `query`, `line_start`/`line_count`, or `offset`/`limit`, not several modes at once.",
+			"For large files, first search with `query` plus `context_lines`, then read the exact `line_start`/`line_count` range you need.",
+			"If the output was truncated, continue from `next_offset` or `next_line_start` instead of rereading the whole file.",
+		}
 	case "path_is_directory":
 		return []string{
 			"`read_file` reads file contents only; use `bash` to list or inspect directories.",
@@ -151,6 +157,11 @@ func recoveryHintsForReadFile(errorClass string) []string {
 		return []string{
 			"Check the path against the injected workspace/project root and switch to an absolute path if needed.",
 			"Use `bash` to list nearby directories or find the intended file before retrying.",
+		}
+	case "timeout":
+		return []string{
+			"Reduce the read scope with `query`, `line_start`/`line_count`, or `offset`/`limit`.",
+			"For structured or huge files, use `bash`/`python` to search or summarize locally, then read only the relevant slice.",
 		}
 	}
 	return nil

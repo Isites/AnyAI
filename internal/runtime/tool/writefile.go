@@ -36,16 +36,23 @@ func (t *WriteFileTool) ToolMetadata() ToolMetadata {
 }
 
 func (t *WriteFileTool) Parameters() json.RawMessage {
+	// Strict OpenAI-compatible gateways (e.g. jiekouai/highwayapi) reject
+	// function-call schemas that carry oneOf/anyOf/allOf/enum/not at the
+	// top level. We previously expressed "one of (path+content) /
+	// (patch) / (path+old_string+new_string)" via top-level anyOf — moved
+	// into runtime validation in Execute/normalizeWriteFileMode so the
+	// schema stays a flat type:"object". Mode-required combinations are
+	// documented in each field's description for the LLM to follow.
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
 			"path": {
 				"type": "string",
-				"description": "The absolute or relative path to the file. Required for overwrite, append, and replace modes. Optional for patch mode when the patch contains file paths."
+				"description": "Absolute or relative path to the file. Required for overwrite, append, and replace modes. Optional for patch mode when the patch contains file paths."
 			},
 			"content": {
 				"type": "string",
-				"description": "Content to write or append. For large files, send manageable chunks with mode=overwrite for the first chunk and mode=append for later chunks."
+				"description": "Content to write or append. Required with mode=overwrite or mode=append. For large files, send manageable chunks with mode=overwrite for the first chunk and mode=append for later chunks."
 			},
 			"mode": {
 				"type": "string",
@@ -54,26 +61,21 @@ func (t *WriteFileTool) Parameters() json.RawMessage {
 			},
 			"patch": {
 				"type": "string",
-				"description": "Codex-style patch text bounded by *** Begin Patch and *** End Patch. Supports Add File, Delete File, and Update File hunks."
+				"description": "Codex-style patch text bounded by *** Begin Patch and *** End Patch. Required with mode=patch. Supports Add File, Delete File, and Update File hunks."
 			},
 			"old_string": {
 				"type": "string",
-				"description": "Exact text to replace in replace mode. Must occur exactly once."
+				"description": "Exact text to replace in replace mode. Must occur exactly once. Required with mode=replace."
 			},
 			"new_string": {
 				"type": "string",
-				"description": "Replacement text for replace mode."
+				"description": "Replacement text for replace mode. Required with mode=replace."
 			},
 			"expected_offset": {
 				"type": "integer",
 				"description": "Optional byte size the target file must have before writing. Use with chunked large-file writes to catch missing or partial chunks."
 			}
-		},
-		"anyOf": [
-			{"required": ["path", "content"]},
-			{"required": ["patch"]},
-			{"required": ["path", "old_string", "new_string"]}
-		]
+		}
 	}`)
 }
 

@@ -104,6 +104,22 @@ func TestWriteFileTool(t *testing.T) {
 	assert.Equal(t, "test content", string(data))
 }
 
+func TestWriteFileToolParametersAreStrictOpenAICompatible(t *testing.T) {
+	// Strict OpenAI-compatible gateways (jiekouai/highwayapi etc.) reject any
+	// function-call schema with oneOf/anyOf/allOf/enum/not at the top level —
+	// observed in harness-coding session h5-online-coding-localhost-4321-r1
+	// where write_file's prior anyOf produced 5/5 retries with HTTP 400. Keep
+	// the schema flat so all upstream providers accept it; runtime validation
+	// in normalizeWriteFileMode handles mode-specific required-field checks.
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal((&WriteFileTool{}).Parameters(), &schema))
+	assert.Equal(t, "object", schema["type"])
+	for _, key := range []string{"oneOf", "anyOf", "allOf", "not", "enum"} {
+		_, present := schema[key]
+		assert.False(t, present, "write_file schema must not carry %q at the top level (rejected by strict OpenAI gateways)", key)
+	}
+}
+
 func TestWriteFileToolResolvesRelativePathAgainstWorkspace(t *testing.T) {
 	dir := t.TempDir()
 
@@ -420,4 +436,67 @@ func TestBuildAgentRegistryResolvesRelativePathsFromWorkspace(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "shared", result.Output)
 	assert.Empty(t, result.Error)
+}
+
+func TestReadFileDefaultsLargeTextToPagedPreview(t *testing.T) {
+	workspace := t.TempDir()
+	content := strings.Repeat("x", defaultReadFileMaxBytes+128)
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "large.txt"), []byte(content), 0o644))
+
+	tool := &ReadFileTool{WorkDir: workspace}
+	input, _ := json.Marshal(readFileInput{Path: "large.txt"})
+
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Empty(t, result.Error)
+	assert.Contains(t, result.Output, "use offset=")
+	assert.Equal(t, "bytes", result.Metadata["mode"])
+	assert.Equal(t, true, result.Metadata["truncated"])
+	assert.Equal(t, int64(defaultReadFileMaxBytes), result.Metadata["next_offset"])
+}
+
+func TestReadFileReadsByteRange(t *testing.T) {
+	workspace := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "data.txt"), []byte("0123456789"), 0o644))
+
+	tool := &ReadFileTool{WorkDir: workspace}
+	offset := int64(2)
+	limit := int64(4)
+	input, _ := json.Marshal(readFileInput{Path: "data.txt", Offset: &offset, Limit: &limit})
+
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Equal(t, "2345\n[read_file: returned bytes 2-6 of 10; use offset=6 to continue]", result.Output)
+	assert.Equal(t, int64(6), result.Metadata["next_offset"])
+}
+
+func TestReadFileReadsLineRange(t *testing.T) {
+	workspace := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "data.txt"), []byte("alpha\nbeta\ngamma\ndelta\n"), 0o644))
+
+	tool := &ReadFileTool{WorkDir: workspace}
+	start := 2
+	count := 2
+	input, _ := json.Marshal(readFileInput{Path: "data.txt", LineStart: &start, LineCount: &count})
+
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Equal(t, "2: beta\n3: gamma\n[read_file: returned lines 2-3 of 4; use line_start=4 to continue]", result.Output)
+	assert.Equal(t, "lines", result.Metadata["mode"])
+	assert.Equal(t, 4, result.Metadata["next_line_start"])
+}
+
+func TestReadFileSearchesWithContext(t *testing.T) {
+	workspace := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "data.txt"), []byte("one\ntwo\nneedle\nfour\nfive\n"), 0o644))
+
+	tool := &ReadFileTool{WorkDir: workspace}
+	contextLines := 1
+	input, _ := json.Marshal(readFileInput{Path: "data.txt", Query: "needle", ContextLines: &contextLines})
+
+	result, err := tool.Execute(context.Background(), input)
+	require.NoError(t, err)
+	assert.Equal(t, "2: two\n3: needle\n4: four", result.Output)
+	assert.Equal(t, "search", result.Metadata["mode"])
+	assert.Equal(t, 1, result.Metadata["matches"])
 }

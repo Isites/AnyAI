@@ -95,3 +95,11 @@ func (s *Service) RebuildEventProjections() error {
 	}
 	return rt.RebuildEventProjections()
 }
+
+func (s *Service) RebuildEventProjectionsFromEvents() error {
+	rt, err := s.runtimeOrErr()
+	if err != nil {
+		return err
+	}
+	return rt.RebuildEventProjectionsFromEvents()
+}

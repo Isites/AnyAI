@@ -120,11 +120,14 @@ func (s *Service) List(agentID string) ([]session.SessionInfo, error) {
 	if store == nil {
 		return nil, fmt.Errorf("session store not available")
 	}
+	if index, ok := s.readFreshIndex(store); ok {
+		items := append([]session.SessionInfo(nil), index.Agents[strings.TrimSpace(agentID)]...)
+		return items, nil
+	}
 	sessions, err := store.List(agentID)
 	if err != nil {
 		return nil, err
 	}
-	_ = s.RebuildIndex()
 	return sessions, nil
 }
 
@@ -166,6 +169,92 @@ func (s *Service) EventRecords(agentID, sessionID string) []runtimeevents.EventR
 		return nil
 	}
 	return runtimesessionevents.HistoryEventRecords(agentID, sessionID, sess.History())
+}
+
+func (s *Service) EventPage(agentID, sessionID string, req runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage {
+	store := s.Store()
+	if store == nil {
+		return runtimeevents.SessionEventPage{}
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 80
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	page, err := store.EntryPage(agentID, sessionID, limit, req.Before)
+	if err != nil {
+		return runtimeevents.SessionEventPage{}
+	}
+
+	var events []runtimeevents.EventRecord
+	if len(page.Entries) > 0 {
+		toolCalls := s.toolCallStateBefore(agentID, sessionID, strings.TrimSpace(page.Entries[0].ID), previousToolCallIDsNeededByPage(page.Entries))
+		events = make([]runtimeevents.EventRecord, 0, len(page.Entries))
+		for _, entry := range page.Entries {
+			events = append(events, runtimesessionevents.EntryEventRecords(agentID, sessionID, entry, toolCalls)...)
+		}
+	}
+	return runtimeevents.SessionEventPage{
+		Events:     events,
+		HasMore:    page.HasMore,
+		NextBefore: page.NextBefore,
+		Total:      page.Total,
+	}
+}
+
+func previousToolCallIDsNeededByPage(entries []session.SessionEntry) map[string]struct{} {
+	pageCalls := make(map[string]struct{})
+	needed := make(map[string]struct{})
+	for _, entry := range entries {
+		switch entry.Type {
+		case session.EntryTypeToolCall:
+			if callID, _, ok := runtimesessionevents.ToolCallStateFromEntry(entry); ok {
+				pageCalls[callID] = struct{}{}
+				delete(needed, callID)
+			}
+		case session.EntryTypeToolResult:
+			var result session.ToolResultData
+			if err := json.Unmarshal(entry.Data, &result); err != nil {
+				continue
+			}
+			callID := strings.TrimSpace(result.ToolCallID)
+			if callID == "" {
+				continue
+			}
+			if _, ok := pageCalls[callID]; !ok {
+				needed[callID] = struct{}{}
+			}
+		}
+	}
+	return needed
+}
+
+func (s *Service) toolCallStateBefore(agentID, sessionID, beforeEntryID string, needed map[string]struct{}) map[string]runtimesessionevents.ToolCallState {
+	toolCalls := make(map[string]runtimesessionevents.ToolCallState)
+	beforeEntryID = strings.TrimSpace(beforeEntryID)
+	if beforeEntryID == "" || len(needed) == 0 {
+		return toolCalls
+	}
+	store := s.Store()
+	if store == nil {
+		return toolCalls
+	}
+	_ = store.ForEachEntry(agentID, sessionID, func(entry session.SessionEntry) bool {
+		if strings.TrimSpace(entry.ID) == beforeEntryID {
+			return false
+		}
+		if callID, state, ok := runtimesessionevents.ToolCallStateFromEntry(entry); ok {
+			if _, wanted := needed[callID]; wanted {
+				toolCalls[callID] = state
+				delete(needed, callID)
+				return len(needed) > 0
+			}
+		}
+		return true
+	})
+	return toolCalls
 }
 
 func (s *Service) SubscribeEvents(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error) {
@@ -501,6 +590,62 @@ func (s *Service) ReadIndex() (Index, error) {
 		return Index{}, err
 	}
 	return index, nil
+}
+
+func (s *Service) readFreshIndex(store *session.Store) (Index, bool) {
+	index, err := s.readIndexFromStore(store)
+	if err != nil || len(index.Agents) == 0 || index.GeneratedAt.IsZero() {
+		return Index{}, false
+	}
+	if s.indexIsFresh(store, index.GeneratedAt) {
+		return index, true
+	}
+	return Index{}, false
+}
+
+func (s *Service) readIndexFromStore(store *session.Store) (Index, error) {
+	path := s.indexPath(store)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Index{}, err
+	}
+	var index Index
+	if err := json.Unmarshal(data, &index); err != nil {
+		return Index{}, err
+	}
+	return index, nil
+}
+
+func (s *Service) indexIsFresh(store *session.Store, generatedAt time.Time) bool {
+	baseDir := strings.TrimSpace(store.BaseDir())
+	if baseDir == "" || generatedAt.IsZero() {
+		return false
+	}
+	fresh := true
+	err := filepath.WalkDir(baseDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !fresh {
+			return err
+		}
+		if d == nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if path == s.indexPath(store) || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			fresh = false
+			return nil
+		}
+		if info.ModTime().After(generatedAt) {
+			fresh = false
+		}
+		return nil
+	})
+	return err == nil && fresh
 }
 
 func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, events []runtimeevents.EventRecord) {

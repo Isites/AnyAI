@@ -69,6 +69,10 @@ func (p *capturingProvider) Compact(_ context.Context, _ llm.CompactRequest) (ll
 	return llm.CompactResponse{Summary: "capturing compact summary"}, nil
 }
 
+func (p *capturingProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func (p *capturingProvider) Requests() []llm.ChatRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -107,6 +111,10 @@ func (p *stagedProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.C
 	return llm.CompactResponse{Summary: "staged compact summary"}, nil
 }
 
+func (p *stagedProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func (p *stagedProvider) Requests() []llm.ChatRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -127,6 +135,10 @@ func (p failingProvider) Models() []llm.ModelInfo {
 
 func (p failingProvider) Compact(context.Context, llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "failing compact summary"}, nil
+}
+
+func (p failingProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 type agentRuntimeConfigurerFunc func(*agent.Runtime)
@@ -179,6 +191,10 @@ func (p *streamingProvider) Compact(_ context.Context, _ llm.CompactRequest) (ll
 	return llm.CompactResponse{Summary: "streaming compact summary"}, nil
 }
 
+func (p *streamingProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 type activityHeartbeatProvider struct {
 	heartbeats int
 	delay      time.Duration
@@ -222,6 +238,10 @@ func (p *activityHeartbeatProvider) Compact(_ context.Context, _ llm.CompactRequ
 	return llm.CompactResponse{Summary: "activity compact summary"}, nil
 }
 
+func (p *activityHeartbeatProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 type contextCapturingProvider struct {
 	response string
 
@@ -253,6 +273,10 @@ func (p *contextCapturingProvider) Models() []llm.ModelInfo {
 
 func (p *contextCapturingProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "context compact summary"}, nil
+}
+
+func (p *contextCapturingProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (p *contextCapturingProvider) Contexts() []tools.RuntimeContext {

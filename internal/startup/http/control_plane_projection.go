@@ -13,6 +13,13 @@ func (p *ControlPlane) rebuildProjections() error {
 	return p.runtime.RebuildEventProjections()
 }
 
+func (p *ControlPlane) rebuildProjectionsFromEvents() error {
+	if p == nil || p.runtime == nil {
+		return fmt.Errorf("runtime not available")
+	}
+	return p.runtime.RebuildEventProjectionsFromEvents()
+}
+
 func (p *ControlPlane) eventStorageDir() string {
 	if p == nil || p.runtime == nil {
 		return ""
@@ -55,11 +62,25 @@ func (p *ControlPlane) runTree(runID string) ([]gateway.RunNode, bool) {
 	return p.run.RunTree(runID)
 }
 
+func (p *ControlPlane) runTreeSummary(runID string) ([]gateway.RunNode, bool) {
+	if p == nil || p.run == nil {
+		return nil, false
+	}
+	return p.run.RunTreeSummary(runID)
+}
+
 func (p *ControlPlane) listSessionEvents(agentID, sessionID string) []gateway.Event {
 	if p == nil || p.session == nil {
 		return nil
 	}
 	return p.session.ListSessionEvents(agentID, sessionID)
+}
+
+func (p *ControlPlane) listSessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage {
+	if p == nil || p.session == nil {
+		return gateway.SessionEventPage{}
+	}
+	return p.session.ListSessionEventPage(agentID, sessionID, req)
 }
 
 func (p *ControlPlane) subscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error) {

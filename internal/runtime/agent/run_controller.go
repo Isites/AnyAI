@@ -185,8 +185,8 @@ func (c *runController) buildChatRequest(
 		Messages:     msgs,
 		Tools:        toolDefs,
 		MaxTokens:    8192,
-		Temperature:  0.01,
 		SystemPrompt: systemPrompt,
+		Options:      c.rt.ModelOptions,
 	}
 	reqState, err := c.rt.applyBeforeModelResolveHooks(turnCtx, ModelResolveState{
 		Turn:        turn,

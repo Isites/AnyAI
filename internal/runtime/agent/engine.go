@@ -26,6 +26,7 @@ type Runtime struct {
 	AgentID                   string // agent identifier (e.g. "default", "coder")
 	AgentName                 string // human-readable name (e.g. "Assistant", "Coder")
 	Model                     string
+	ModelOptions              llm.ModelOptions // resolved once at build: runtime baseline ⊕ provider family ⊕ user override
 	Workspace                 string
 	ProjectRoot               string
 	AgentDefinitionDir        string

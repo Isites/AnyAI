@@ -39,6 +39,8 @@ type PythonProcessInput struct {
 	Cleanup    string   `json:"cleanup,omitempty"` // "run_end" (default) or "none"
 }
 
+const maxProcessOutputBytes = 256 * 1024
+
 // BackgroundProcessManager owns process groups detached during one agent
 // run-controller invocation.
 type BackgroundProcessManager struct {
@@ -445,11 +447,29 @@ func readCaptureFile(file *os.File) string {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return ""
 	}
-	data, err := io.ReadAll(file)
+	reader := io.LimitReader(file, maxProcessOutputBytes+1)
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	truncated := len(data) > maxProcessOutputBytes
+	if truncated {
+		data = data[:maxProcessOutputBytes]
+	} else if info, statErr := file.Stat(); statErr == nil && info.Size() > int64(len(data)) {
+		truncated = true
+	}
+	text := strings.ToValidUTF8(string(data), "\uFFFD")
+	if !truncated {
+		return text
+	}
+	size := int64(0)
+	if info, statErr := file.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	if size > 0 {
+		return fmt.Sprintf("%s\n[process output truncated; %d bytes captured, %d bytes total]", text, maxProcessOutputBytes, size)
+	}
+	return fmt.Sprintf("%s\n[process output truncated; %d bytes captured]", text, maxProcessOutputBytes)
 }
 
 type backgroundProcessOptions struct {

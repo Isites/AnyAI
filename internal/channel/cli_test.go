@@ -22,6 +22,13 @@ type cliTestSessionSurface struct {
 	store *runtimesession.Store
 }
 
+type countingCLISessionSurface struct {
+	SessionInfos []gateway.SessionInfo
+	Pages        map[string]gateway.SessionEventPage
+	LoadCalls    int
+	PageCalls    int
+}
+
 func newCLITestSessionSurface(projectRoot string) *cliTestSessionSurface {
 	return &cliTestSessionSurface{
 		store: runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions")),
@@ -77,6 +84,47 @@ func (s *cliTestSessionSurface) LoadSession(agentID, sessionID string) (gateway.
 	}, nil
 }
 
+func (s *cliTestSessionSurface) ListSessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage {
+	view, err := s.LoadSession(agentID, sessionID)
+	if err != nil {
+		return gateway.SessionEventPage{}
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 80
+	}
+	end := len(view.Events)
+	before := strings.TrimSpace(req.Before)
+	if before != "" {
+		for idx, event := range view.Events {
+			if payloadString(event.Payload, "entry_id") == before {
+				end = idx
+				break
+			}
+		}
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > len(view.Events) {
+		end = len(view.Events)
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	nextBefore := ""
+	if start < end {
+		nextBefore = payloadString(view.Events[start].Payload, "entry_id")
+	}
+	return gateway.SessionEventPage{
+		Events:     append([]gateway.Event(nil), view.Events[start:end]...),
+		HasMore:    start > 0,
+		NextBefore: nextBefore,
+		Total:      len(view.Events),
+	}
+}
+
 func (s *cliTestSessionSurface) CreateSession(agentID, requestedKey, prefix string) (string, error) {
 	sessionID := sanitizeCLISessionID(requestedKey)
 	if sessionID == "" {
@@ -86,6 +134,33 @@ func (s *cliTestSessionSurface) CreateSession(agentID, requestedKey, prefix stri
 		return sessionID, nil
 	}
 	return sessionID, s.store.Create(agentID, sessionID)
+}
+
+func (s *countingCLISessionSurface) ListSessions(string) ([]gateway.SessionInfo, error) {
+	return append([]gateway.SessionInfo(nil), s.SessionInfos...), nil
+}
+
+func (s *countingCLISessionSurface) LoadSession(agentID, sessionID string) (gateway.SessionView, error) {
+	s.LoadCalls++
+	return gateway.SessionView{AgentID: agentID, ID: sessionID}, nil
+}
+
+func (s *countingCLISessionSurface) ListSessionEventPage(agentID, sessionID string, _ gateway.SessionEventPageRequest) gateway.SessionEventPage {
+	s.PageCalls++
+	if s.Pages != nil {
+		if page, ok := s.Pages[strings.TrimSpace(agentID)+"/"+strings.TrimSpace(sessionID)]; ok {
+			return page
+		}
+	}
+	return gateway.SessionEventPage{}
+}
+
+func (s *countingCLISessionSurface) CreateSession(_, requestedKey, prefix string) (string, error) {
+	sessionID := sanitizeCLISessionID(requestedKey)
+	if sessionID == "" {
+		sessionID = input.DefaultSessionID(prefix, time.Now().UTC())
+	}
+	return sessionID, nil
 }
 
 func executeCLICommand(cmd tea.Cmd) []tea.Msg {
@@ -413,13 +488,61 @@ func TestCLIModelStartupCardUsesStatusLabel(t *testing.T) {
 	assert.NotContains(t, conversation, "SYSTEM")
 }
 
-func TestCLIModelSyncsRootSessionHistoryIntoConversation(t *testing.T) {
+func TestCLIModelDoesNotReloadSessionHistoryFromLifecycleEvents(t *testing.T) {
+	projectRoot := t.TempDir()
+	now := time.Now()
+	surface := &countingCLISessionSurface{
+		SessionInfos: []gateway.SessionInfo{{
+			ID:           "cli_local",
+			CreatedAt:    now.Add(-time.Minute),
+			LastActivity: now,
+			EntryCount:   1,
+		}},
+		Pages: map[string]gateway.SessionEventPage{
+			"lead/cli_local": {
+				Events: []gateway.Event{{
+					AgentID:   "lead",
+					SessionID: "cli_local",
+					Name:      "session.input.stored",
+					Timestamp: now,
+					Payload: map[string]any{
+						"entry_id": "msg_1",
+						"text":     "拆一下任务",
+					},
+				}},
+				Total: 1,
+			},
+		},
+	}
+
+	model := newCLIModelWithSession(projectRoot, "lead", surface, func(string, string, ...string) {})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+	require.Equal(t, 1, surface.PageCalls)
+	require.Len(t, model.sessionMessages, 1)
+
+	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
+		RunID:     "run_root",
+		AgentID:   "lead",
+		SessionID: "cli_local",
+		Name:      "run.started",
+		Timestamp: now.Add(time.Second),
+	}})
+	model = updated.(*cliModel)
+
+	assert.Equal(t, 1, surface.PageCalls)
+	require.Len(t, model.sessionMessages, 1)
+	assert.Equal(t, "拆一下任务", model.sessionMessages[0].text)
+}
+
+func TestCLIModelLoadsRootSessionHistoryOnlyWhenSessionCommandSelectsIt(t *testing.T) {
 	projectRoot := t.TempDir()
 	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
 
 	rootSession, err := store.Load("lead", "cli_local")
 	require.NoError(t, err)
 	rootSession.Append(runtimesession.UserMessageEntry("拆一下任务"))
+	rootSession.Append(runtimesession.AssistantMessageEntry("阶段一：先分析测试现状。"))
 
 	childSession, err := store.Load("researcher", "agentcall_researcher_trace_1")
 	require.NoError(t, err)
@@ -428,30 +551,14 @@ func TestCLIModelSyncsRootSessionHistoryIntoConversation(t *testing.T) {
 	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*cliModel)
-
-	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
-		RunID:     "run_root",
-		AgentID:   "lead",
-		SessionID: "cli_local",
-		Name:      "run.started",
-		Timestamp: time.Now(),
-	}})
+	model.input.SetValue("/session cli_local")
+	model.input.CursorEnd()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(*cliModel)
-	assert.Contains(t, model.renderConversation(), "拆一下任务")
-
-	rootSession.Append(runtimesession.AssistantMessageEntry("阶段一：先分析测试现状。"))
-
-	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
-		RunID:         "run_child",
-		AgentID:       "researcher",
-		SessionID:     "agentcall_researcher_trace_1",
-		ParentAgentID: "lead",
-		Name:          "run.started",
-		Timestamp:     time.Now().Add(time.Second),
-	}})
-	model = updated.(*cliModel)
+	executeCLICommand(cmd)
 
 	conversation := model.renderConversation()
+	assert.Contains(t, conversation, "拆一下任务")
 	assert.Contains(t, conversation, "阶段一：先分析测试现状。")
 	assert.NotContains(t, conversation, "子代理内部消息")
 }
@@ -541,7 +648,7 @@ func TestCLIModelDoesNotDuplicatePendingUserMessageWhenPersistedWithAttachment(t
 	assert.Empty(t, model.pendingMessages)
 }
 
-func TestCLIModelPreloadsLatestEntryAgentSession(t *testing.T) {
+func TestCLIModelSelectsLatestEntryAgentSessionAndLoadsRecentHistory(t *testing.T) {
 	projectRoot := t.TempDir()
 	store := runtimesession.NewStore(filepath.Join(projectRoot, "anyai", "sessions"))
 
@@ -560,6 +667,120 @@ func TestCLIModelPreloadsLatestEntryAgentSession(t *testing.T) {
 	assert.Equal(t, "cli_latest", model.cliSessionID)
 	assert.Contains(t, model.renderConversation(), "最近会话")
 	assert.NotContains(t, model.renderConversation(), "旧会话")
+}
+
+func TestCLIModelStartupLoadsRecentHistoryByPageWithoutSnapshot(t *testing.T) {
+	projectRoot := t.TempDir()
+	surface := &countingCLISessionSurface{SessionInfos: []gateway.SessionInfo{{
+		ID:           "cli_latest",
+		CreatedAt:    time.Now().Add(-time.Minute),
+		LastActivity: time.Now(),
+		EntryCount:   2,
+	}}}
+	surface.Pages = map[string]gateway.SessionEventPage{
+		"lead/cli_latest": {
+			Events: []gateway.Event{{
+				AgentID:   "lead",
+				SessionID: "cli_latest",
+				Name:      "session.input.stored",
+				Timestamp: time.Now(),
+				Payload: map[string]any{
+					"entry_id": "msg_existing",
+					"text":     "启动时应显示的最近历史",
+				},
+			}},
+			Total: 1,
+		},
+	}
+
+	model := newCLIModelWithSession(projectRoot, "lead", surface, func(string, string, ...string) {})
+	assert.Equal(t, "cli_latest", model.cliSessionID)
+	assert.Equal(t, 0, surface.LoadCalls)
+	assert.Equal(t, 1, surface.PageCalls)
+	require.Len(t, model.sessionMessages, 1)
+	assert.Equal(t, "启动时应显示的最近历史", model.sessionMessages[0].text)
+}
+
+func TestCLIModelAppliesSessionEventsIncrementallyWithoutLoadingSnapshot(t *testing.T) {
+	projectRoot := t.TempDir()
+	surface := &countingCLISessionSurface{SessionInfos: []gateway.SessionInfo{{
+		ID:           "cli_latest",
+		CreatedAt:    time.Now().Add(-time.Minute),
+		LastActivity: time.Now(),
+		EntryCount:   2,
+	}}}
+
+	model := newCLIModelWithSession(projectRoot, "lead", surface, func(string, string, ...string) {})
+	assert.Equal(t, "cli_latest", model.cliSessionID)
+	assert.Equal(t, 0, surface.LoadCalls)
+
+	updated, _ := model.Update(cliRunEventMsg{Event: gateway.RunEvent{
+		RunID:     "run_1",
+		AgentID:   "lead",
+		SessionID: "cli_latest",
+		Name:      "session.input.stored",
+		Timestamp: time.Now(),
+		Payload: map[string]any{
+			"entry_id": "msg_1",
+			"text":     "新的输入",
+		},
+	}})
+	model = updated.(*cliModel)
+
+	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
+		RunID:     "run_1",
+		AgentID:   "lead",
+		SessionID: "cli_latest",
+		Name:      "session.output.stored",
+		Timestamp: time.Now(),
+		Payload: map[string]any{
+			"entry_id": "msg_2",
+			"text":     "新的输出",
+		},
+	}})
+	model = updated.(*cliModel)
+
+	conversation := model.renderConversation()
+	assert.Contains(t, conversation, "新的输入")
+	assert.Contains(t, conversation, "新的输出")
+	assert.Equal(t, 0, surface.LoadCalls)
+}
+
+func TestCLIModelPgUpLoadsOlderSessionPage(t *testing.T) {
+	projectRoot := t.TempDir()
+	surface := newCLITestSessionSurface(projectRoot)
+	store := surface.store
+	sess, err := store.Load("lead", "cli_long")
+	require.NoError(t, err)
+	for i := 0; i < cliMaxMessages+5; i++ {
+		sess.Append(runtimesession.UserMessageEntry(fmt.Sprintf("历史消息 %03d", i)))
+	}
+	lastMessage := fmt.Sprintf("历史消息 %03d", cliMaxMessages+4)
+
+	model := newCLIModelWithSession(projectRoot, "lead", surface, func(string, string, ...string) {})
+	model.setActiveSession("lead", "cli_long")
+	require.True(t, model.syncActiveSessionConversation())
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	model = updated.(*cliModel)
+
+	conversation := model.renderConversation()
+	assert.NotContains(t, conversation, "历史消息 000")
+	assert.Contains(t, conversation, lastMessage)
+	require.True(t, model.sessionHistoryHasMore)
+
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	model = updated.(*cliModel)
+	require.True(t, model.sessionHistoryLoading)
+	msgs := executeCLICommand(cmd)
+	require.Len(t, msgs, 1)
+	updated, _ = model.Update(msgs[0])
+	model = updated.(*cliModel)
+
+	conversation = model.renderConversation()
+	assert.Contains(t, conversation, "历史消息 000")
+	assert.Contains(t, conversation, lastMessage)
+	assert.False(t, model.sessionHistoryHasMore)
+	assert.False(t, model.sessionHistoryLoading)
 }
 
 func TestCLIModelSessionCommandCreatesAndUsesSession(t *testing.T) {
@@ -763,15 +984,11 @@ func TestCLIModelRendersSessionTranscriptCardsForStructuredEntries(t *testing.T)
 	model := newCLIModelWithSession(projectRoot, "lead", newCLITestSessionSurface(projectRoot), func(string, string, ...string) {})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*cliModel)
-
-	updated, _ = model.Update(cliRunEventMsg{Event: gateway.RunEvent{
-		RunID:     "run_root",
-		AgentID:   "lead",
-		SessionID: "cli_local",
-		Name:      "run.completed",
-		Timestamp: time.Now(),
-	}})
+	model.input.SetValue("/session cli_local")
+	model.input.CursorEnd()
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(*cliModel)
+	executeCLICommand(cmd)
 
 	conversation := model.renderConversation()
 	assert.Contains(t, conversation, "USER")

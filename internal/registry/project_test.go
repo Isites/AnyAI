@@ -72,6 +72,32 @@ You are the coder.
 	assert.Equal(t, "coder", entry.ID)
 }
 
+func TestLoadProjectSkipsRuntimeArtifactAgentFiles(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "anyai.yaml"), []byte(`
+models:
+  default: anthropic/claude-sonnet-4-5
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "agent.md"), []byte(`
+---
+id: lead
+---
+
+lead
+`), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "anyai", "sessions", "ghost"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "anyai", "sessions", "ghost", "agent.md"), []byte("---\nid: ghost\n---\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "artifacts-1", "ghost"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "artifacts-1", "ghost", "agent.md"), []byte("---\nid: artifact\n---\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "node_modules", "ghost"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "node_modules", "ghost", "agent.md"), []byte("---\nid: dependency\n---\n"), 0o644))
+
+	project, err := LoadProject(root)
+	require.NoError(t, err)
+	require.Len(t, project.Agents, 1)
+	assert.Equal(t, "lead", project.Agents[0].ID)
+}
+
 func TestLoadProjectFileModeWithConfigScansWholeProject(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "anyai.yaml"), []byte(`

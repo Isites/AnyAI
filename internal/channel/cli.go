@@ -117,20 +117,21 @@ var (
 )
 
 const (
-	cliMinWidth        = 84
-	cliMinHeight       = 18
-	cliMaxMessages     = 80
-	cliMaxActivities   = 160
-	cliMaxPreviewRune  = 180
-	cliHeaderHeight    = 3
-	cliPanelHeaderRows = 1
-	cliBodyGap         = 1
-	cliChatMinHeight   = 8
-	cliTraceMinHeight  = 7
-	cliTraceMaxHeight  = 12
-	cliTraceCollapsed  = 4
-	cliComposeMinRows  = 1
-	cliComposeMaxRows  = 4
+	cliMinWidth          = 84
+	cliMinHeight         = 18
+	cliMaxMessages       = 80
+	cliMaxLoadedMessages = 800
+	cliMaxActivities     = 160
+	cliMaxPreviewRune    = 180
+	cliHeaderHeight      = 3
+	cliPanelHeaderRows   = 1
+	cliBodyGap           = 1
+	cliChatMinHeight     = 8
+	cliTraceMinHeight    = 7
+	cliTraceMaxHeight    = 12
+	cliTraceCollapsed    = 4
+	cliComposeMinRows    = 1
+	cliComposeMaxRows    = 4
 )
 
 // CLIChannel implements the Channel interface for terminal interaction.
@@ -150,7 +151,7 @@ type CLIChannel struct {
 
 type CLISessionSurface interface {
 	ListSessions(agentID string) ([]gateway.SessionInfo, error)
-	LoadSession(agentID, sessionID string) (gateway.SessionView, error)
+	ListSessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage
 	CreateSession(agentID, requestedKey, prefix string) (string, error)
 }
 
@@ -224,6 +225,13 @@ type cliClipboardImageMsg struct {
 	Err   error
 }
 
+type cliSessionEventPageMsg struct {
+	AgentID   string
+	SessionID string
+	Page      gateway.SessionEventPage
+	Older     bool
+}
+
 type cliQuitMsg struct{}
 
 var cliClipboardImageReader = readCLIClipboardImageFromSystem
@@ -238,6 +246,7 @@ type cliConversationEntry struct {
 	pending      bool
 	tool         string
 	toolCallID   string
+	toolSlotKey  string
 	input        string
 	output       string
 	error        string
@@ -324,37 +333,44 @@ type cliRuntimeSummary struct {
 const cliCommandHintText = "Enter send  •  Ctrl+J newline  •  Ctrl+V image  •  Alt+Up/Down hist  •  /session [id]  •  /paste-image  •  /quit"
 
 type cliModel struct {
-	projectRoot         string
-	entryAgentID        string
-	sessions            CLISessionSurface
-	input               textarea.Model
-	spinner             spinner.Model
-	chatView            viewport.Model
-	traceView           viewport.Model
-	width               int
-	height              int
-	ready               bool
-	panelWidth          int
-	chatHeight          int
-	traceHeight         int
-	statusEntry         cliConversationEntry
-	sessionMessages     []cliConversationEntry
-	pendingMessages     []cliConversationEntry
-	sessionNotice       string
-	activeSessionAgent  string
-	activeSessionID     string
-	cliSessionID        string
-	pendingBaseline     int
-	messages            []cliConversationEntry
-	activities          []cliActivityEntry
-	traceNodes          map[string]*cliTraceNode
-	sendInput           func(string, string, ...string)
-	sendInputWithBlocks func(string, string, []gateway.InputBlock, ...string)
-	lastTreeTraceKey    string
-	inspectorCollapsed  bool
-	selectedTraceKey    string
-	callStackExpanded   bool
-	composerAttachments []gateway.InputBlock
+	projectRoot           string
+	entryAgentID          string
+	sessions              CLISessionSurface
+	input                 textarea.Model
+	spinner               spinner.Model
+	chatView              viewport.Model
+	traceView             viewport.Model
+	width                 int
+	height                int
+	ready                 bool
+	panelWidth            int
+	chatHeight            int
+	traceHeight           int
+	statusEntry           cliConversationEntry
+	sessionMessages       []cliConversationEntry
+	pendingMessages       []cliConversationEntry
+	sessionNotice         string
+	activeSessionAgent    string
+	activeSessionID       string
+	cliSessionID          string
+	pendingBaseline       int
+	loadedSessionAgent    string
+	loadedSessionID       string
+	sessionHistoryBefore  string
+	sessionHistoryHasMore bool
+	sessionHistoryLoading bool
+	sessionHistoryTotal   int
+	toolSlots             map[string]int
+	messages              []cliConversationEntry
+	activities            []cliActivityEntry
+	traceNodes            map[string]*cliTraceNode
+	sendInput             func(string, string, ...string)
+	sendInputWithBlocks   func(string, string, []gateway.InputBlock, ...string)
+	lastTreeTraceKey      string
+	inspectorCollapsed    bool
+	selectedTraceKey      string
+	callStackExpanded     bool
+	composerAttachments   []gateway.InputBlock
 	// Input history for up/down navigation
 	inputHistory []string
 	historyIndex int // -1 means at current input, >=0 means navigating history
@@ -446,6 +462,10 @@ func (c *CLIChannel) Send(_ context.Context, msg gateway.OutboundMessage) error 
 }
 
 func (c *CLIChannel) WantsFinalResponseSend() bool {
+	return false
+}
+
+func (c *CLIChannel) WantsRunTreeReplay() bool {
 	return false
 }
 
@@ -578,6 +598,7 @@ func newCLIModelWithSession(projectRoot, entryAgentID string, sessions CLISessio
 		input:        in,
 		spinner:      sp,
 		traceNodes:   make(map[string]*cliTraceNode),
+		toolSlots:    make(map[string]int),
 		sendInput:    sendInput,
 		sendInputWithBlocks: func(text, sessionID string, blocks []gateway.InputBlock, messageID ...string) {
 			if sendInput != nil {
@@ -596,7 +617,9 @@ func newCLIModelWithSession(projectRoot, entryAgentID string, sessions CLISessio
 		historyIndex: -1,
 	}
 	model.preloadStartupSession()
-	model.rebuildConversation()
+	if !model.syncActiveSessionConversation() {
+		model.rebuildConversation()
+	}
 	return model
 }
 
@@ -728,104 +751,129 @@ func cliConversationEntriesFromSessionEvents(events []gateway.Event) []cliConver
 	toolSlots := make(map[string]int)
 
 	for _, event := range events {
-		at := event.Timestamp
-		if at.IsZero() {
-			at = time.Now()
-		} else {
-			at = at.Local()
+		entry, key, ok := cliConversationEntryFromRunEvent(gateway.RunEvent{
+			RunID:           event.RunID,
+			RunNodeID:       event.RunNodeID,
+			ParentRunNodeID: event.ParentRunNodeID,
+			AgentID:         event.AgentID,
+			SessionID:       event.SessionID,
+			Name:            event.Name,
+			Timestamp:       event.Timestamp,
+			Payload:         event.Payload,
+		})
+		if !ok {
+			continue
 		}
-		switch strings.TrimSpace(event.Name) {
-		case "session.input.stored":
-			text := strings.TrimSpace(payloadString(event.Payload, "text"))
-			attachments := summarizeCLISessionAttachments(event.Payload)
-			if text == "" {
-				text = attachments
-			} else if attachments != "" {
-				text += "\n" + attachments
-			}
-			if text == "" {
-				continue
-			}
-			items = append(items, cliConversationEntry{
-				messageID: payloadString(event.Payload, "entry_id"),
-				kind:      "message",
-				role:      "user",
-				text:      text,
-				at:        at,
-			})
-		case "session.output.stored":
-			text := strings.TrimSpace(payloadString(event.Payload, "text"))
-			if text == "" {
-				continue
-			}
-			items = append(items, cliConversationEntry{
-				messageID: payloadString(event.Payload, "entry_id"),
-				kind:      "message",
-				role:      "assistant",
-				text:      cliConversationAgentText(event.AgentID, text),
-				at:        at,
-			})
-		case "session.meta.stored":
-			text := strings.TrimSpace(payloadString(event.Payload, "text"))
-			if text == "" {
-				continue
-			}
-			items = append(items, cliConversationEntry{
-				messageID: payloadString(event.Payload, "entry_id"),
-				kind:      "meta",
-				role:      nonEmptyCLI(payloadString(event.Payload, "role"), "system"),
-				text:      text,
-				at:        at,
-			})
-		case "agent.call.completed", "agent.call.failed":
-			target := nonEmptyCLI(payloadString(event.Payload, "target_agent"), payloadString(event.Payload, "agent"))
-			text := nonEmptyCLI(payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"))
-			if strings.TrimSpace(target) == "" || strings.TrimSpace(text) == "" {
-				continue
-			}
-			items = append(items, cliConversationEntry{
-				messageID: payloadString(event.Payload, "entry_id"),
-				kind:      "message",
-				role:      "assistant",
-				text:      cliConversationAgentText(target, text),
-				at:        at,
-			})
-		case "tool.call.started", "tool.completed", "tool.failed":
-			toolName := strings.TrimSpace(gatewayEventToolName(event))
-			if shouldHideCLIConversationTool(toolName) {
-				continue
-			}
-			callID := strings.TrimSpace(payloadString(event.Payload, "id"))
-			key := cliConversationToolKey(event.RunID, event.AgentID, event.SessionID, callID, toolName)
-			status := "running"
-			if event.Name == "tool.completed" {
-				status = "success"
-			}
-			if event.Name == "tool.failed" || strings.TrimSpace(payloadString(event.Payload, "error")) != "" {
-				status = "failed"
-			}
-			label := cliConversationToolLabel(event.AgentID, toolName, status)
-			summary := summarizeCLIConversationValue(event.Payload["input"])
+		if strings.TrimSpace(entry.kind) == "tool_call" && key != "" {
+			entry.toolSlotKey = key
 			if idx, ok := toolSlots[key]; ok && idx >= 0 && idx < len(items) {
-				items[idx].tool = label
+				items[idx].tool = entry.tool
 				if items[idx].input == "" {
-					items[idx].input = summary
+					items[idx].input = entry.input
 				}
+				items[idx].toolSlotKey = key
 				continue
 			}
-			items = append(items, cliConversationEntry{
-				messageID:  payloadString(event.Payload, "entry_id"),
-				kind:       "tool_call",
-				role:       "assistant",
-				tool:       label,
-				toolCallID: callID,
-				input:      summary,
-				at:         at,
-			})
+			items = append(items, entry)
 			toolSlots[key] = len(items) - 1
+			continue
 		}
+		items = append(items, entry)
 	}
 	return items
+}
+
+func cliConversationEntryFromRunEvent(event gateway.RunEvent) (cliConversationEntry, string, bool) {
+	at := event.Timestamp
+	if at.IsZero() {
+		at = time.Now()
+	} else {
+		at = at.Local()
+	}
+	switch strings.TrimSpace(event.Name) {
+	case "session.input.stored":
+		text := strings.TrimSpace(payloadString(event.Payload, "text"))
+		attachments := summarizeCLISessionAttachments(event.Payload)
+		if text == "" {
+			text = attachments
+		} else if attachments != "" {
+			text += "\n" + attachments
+		}
+		if text == "" {
+			return cliConversationEntry{}, "", false
+		}
+		return cliConversationEntry{
+			messageID: payloadString(event.Payload, "entry_id"),
+			kind:      "message",
+			role:      "user",
+			text:      text,
+			at:        at,
+		}, "", true
+	case "session.output.stored":
+		text := strings.TrimSpace(payloadString(event.Payload, "text"))
+		if text == "" {
+			return cliConversationEntry{}, "", false
+		}
+		return cliConversationEntry{
+			messageID: payloadString(event.Payload, "entry_id"),
+			kind:      "message",
+			role:      "assistant",
+			text:      cliConversationAgentText(event.AgentID, text),
+			at:        at,
+		}, "", true
+	case "session.meta.stored":
+		text := strings.TrimSpace(payloadString(event.Payload, "text"))
+		if text == "" {
+			return cliConversationEntry{}, "", false
+		}
+		return cliConversationEntry{
+			messageID: payloadString(event.Payload, "entry_id"),
+			kind:      "meta",
+			role:      nonEmptyCLI(payloadString(event.Payload, "role"), "system"),
+			text:      text,
+			at:        at,
+		}, "", true
+	case "agent.call.completed", "agent.call.failed":
+		target := nonEmptyCLI(payloadString(event.Payload, "target_agent"), payloadString(event.Payload, "agent"))
+		text := nonEmptyCLI(payloadString(event.Payload, "summary"), payloadString(event.Payload, "error"))
+		if strings.TrimSpace(target) == "" || strings.TrimSpace(text) == "" {
+			return cliConversationEntry{}, "", false
+		}
+		return cliConversationEntry{
+			messageID: payloadString(event.Payload, "entry_id"),
+			kind:      "message",
+			role:      "assistant",
+			text:      cliConversationAgentText(target, text),
+			at:        at,
+		}, "", true
+	case "tool.call.started", "tool.completed", "tool.failed":
+		toolName := strings.TrimSpace(gatewayRunEventToolName(event))
+		if shouldHideCLIConversationTool(toolName) {
+			return cliConversationEntry{}, "", false
+		}
+		callID := strings.TrimSpace(payloadString(event.Payload, "id"))
+		key := cliConversationToolKey(event.RunID, event.AgentID, event.SessionID, callID, toolName)
+		status := "running"
+		if event.Name == "tool.completed" {
+			status = "success"
+		}
+		if event.Name == "tool.failed" || strings.TrimSpace(payloadString(event.Payload, "error")) != "" {
+			status = "failed"
+		}
+		label := cliConversationToolLabel(event.AgentID, toolName, status)
+		summary := summarizeCLIConversationValue(event.Payload["input"])
+		return cliConversationEntry{
+			messageID:  payloadString(event.Payload, "entry_id"),
+			kind:       "tool_call",
+			role:       "assistant",
+			tool:       label,
+			toolCallID: callID,
+			input:      summary,
+			at:         at,
+		}, key, true
+	default:
+		return cliConversationEntry{}, "", false
+	}
 }
 
 func cliConversationAgentText(agentID, text string) string {
@@ -866,6 +914,18 @@ func cliConversationToolKey(parts ...string) string {
 }
 
 func gatewayEventToolName(event gateway.Event) string {
+	if event.Payload == nil {
+		return ""
+	}
+	for _, key := range []string{"tool", "name", "tool_name"} {
+		if value, ok := event.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func gatewayRunEventToolName(event gateway.RunEvent) string {
 	if event.Payload == nil {
 		return ""
 	}
@@ -936,18 +996,9 @@ func (m *cliModel) rebuildConversation() {
 	body := make([]cliConversationEntry, 0, len(m.sessionMessages)+len(m.pendingMessages))
 	body = append(body, m.sessionMessages...)
 	body = append(body, m.pendingMessages...)
-
-	maxBody := cliMaxMessages
 	status := []cliConversationEntry(nil)
 	if strings.TrimSpace(m.statusEntry.text) != "" {
 		status = append(status, m.statusEntry)
-		maxBody--
-	}
-	if maxBody < 0 {
-		maxBody = 0
-	}
-	if len(body) > maxBody {
-		body = append([]cliConversationEntry(nil), body[len(body)-maxBody:]...)
 	}
 
 	m.messages = append(body, status...)
@@ -1014,6 +1065,13 @@ func (m *cliModel) setActiveSession(agentID, sessionID string) {
 		m.cliSessionID = sessionID
 	}
 	m.sessionMessages = nil
+	m.loadedSessionAgent = ""
+	m.loadedSessionID = ""
+	m.sessionHistoryBefore = ""
+	m.sessionHistoryHasMore = false
+	m.sessionHistoryLoading = false
+	m.sessionHistoryTotal = 0
+	m.toolSlots = make(map[string]int)
 	if resetPending {
 		m.pendingMessages = nil
 		m.pendingBaseline = 0
@@ -1042,7 +1100,6 @@ func (m *cliModel) preloadStartupSession() {
 	m.activeSessionAgent = agentID
 	m.activeSessionID = sessionID
 	m.cliSessionID = sessionID
-	m.syncActiveSessionConversation()
 }
 
 func (m *cliModel) defaultSubmissionSessionID() string {
@@ -1067,7 +1124,7 @@ func (m *cliModel) switchOrCreateSession(requested string) string {
 	}
 	if m.sessions != nil {
 		if !createOnly {
-			if _, err := m.sessions.LoadSession(agentID, sessionID); err == nil {
+			if m.cliSessionExists(agentID, sessionID) {
 				m.setActiveSession(agentID, sessionID)
 				m.syncActiveSessionConversation()
 				m.setSessionNotice("已切换到 session " + sessionID)
@@ -1093,15 +1150,39 @@ func (m *cliModel) switchOrCreateSession(requested string) string {
 	m.activeSessionID = sessionID
 	m.cliSessionID = sessionID
 	m.sessionMessages = nil
+	m.loadedSessionAgent = ""
+	m.loadedSessionID = ""
+	m.sessionHistoryBefore = ""
+	m.sessionHistoryHasMore = false
+	m.sessionHistoryLoading = false
+	m.sessionHistoryTotal = 0
+	m.toolSlots = make(map[string]int)
 	m.pendingMessages = nil
 	m.pendingBaseline = 0
 	if createOnly {
 		m.setSessionNotice("已创建并切换到 session " + sessionID)
 	} else {
 		m.setSessionNotice("已切换到 session " + sessionID)
+		m.syncActiveSessionConversation()
 	}
 	m.rebuildConversation()
 	return sessionID
+}
+
+func (m *cliModel) cliSessionExists(agentID, sessionID string) bool {
+	if m == nil || m.sessions == nil {
+		return false
+	}
+	infos, err := m.sessions.ListSessions(agentID)
+	if err != nil {
+		return false
+	}
+	for _, info := range infos {
+		if strings.TrimSpace(info.ID) == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *cliModel) reconcilePendingConversation() {
@@ -1169,11 +1250,154 @@ func (m *cliModel) syncActiveSessionConversation() bool {
 	if agentID == "" || sessionID == "" {
 		return false
 	}
-	view, err := m.sessions.LoadSession(agentID, sessionID)
-	if err != nil {
+	if m.loadedSessionAgent == agentID && m.loadedSessionID == sessionID {
+		m.rebuildConversation()
+		return true
+	}
+	page := m.sessions.ListSessionEventPage(agentID, sessionID, gateway.SessionEventPageRequest{Limit: cliMaxMessages})
+	m.sessionMessages = cliConversationEntriesFromSessionEvents(page.Events)
+	m.loadedSessionAgent = agentID
+	m.loadedSessionID = sessionID
+	m.sessionHistoryBefore = strings.TrimSpace(page.NextBefore)
+	m.sessionHistoryHasMore = page.HasMore
+	m.sessionHistoryLoading = false
+	m.sessionHistoryTotal = page.Total
+	m.rebuildToolSlots()
+	m.reconcilePendingConversation()
+	m.rebuildConversation()
+	return true
+}
+
+func (m *cliModel) rebuildToolSlots() {
+	if m == nil {
+		return
+	}
+	m.toolSlots = make(map[string]int)
+	for idx, item := range m.sessionMessages {
+		if strings.TrimSpace(item.kind) != "tool_call" {
+			continue
+		}
+		key := strings.TrimSpace(item.toolSlotKey)
+		if key == "" {
+			key = cliConversationToolKey(item.toolCallID, item.tool)
+		}
+		if key == "" {
+			continue
+		}
+		m.toolSlots[key] = idx
+	}
+}
+
+func (m *cliModel) appendSessionConversationEntry(entry cliConversationEntry) {
+	if m == nil {
+		return
+	}
+	m.sessionMessages = append(m.sessionMessages, entry)
+	if len(m.sessionMessages) > cliMaxLoadedMessages {
+		m.sessionMessages = append([]cliConversationEntry(nil), m.sessionMessages[len(m.sessionMessages)-cliMaxLoadedMessages:]...)
+		m.rebuildToolSlots()
+	}
+	if len(m.sessionMessages) == 1 && (m.loadedSessionAgent == "" || m.loadedSessionID == "") {
+		m.loadedSessionAgent = strings.TrimSpace(m.activeSessionAgent)
+		m.loadedSessionID = strings.TrimSpace(m.activeSessionID)
+	}
+}
+
+func (m *cliModel) loadOlderSessionConversationCmd() tea.Cmd {
+	if m == nil || m.sessions == nil || m.sessionHistoryLoading || !m.sessionHistoryHasMore {
+		return nil
+	}
+	agentID := strings.TrimSpace(m.activeSessionAgent)
+	sessionID := strings.TrimSpace(m.activeSessionID)
+	before := strings.TrimSpace(m.sessionHistoryBefore)
+	if agentID == "" || sessionID == "" || before == "" {
+		return nil
+	}
+	m.sessionHistoryLoading = true
+	return func() tea.Msg {
+		page := m.sessions.ListSessionEventPage(agentID, sessionID, gateway.SessionEventPageRequest{
+			Limit:  cliMaxMessages,
+			Before: before,
+		})
+		return cliSessionEventPageMsg{
+			AgentID:   agentID,
+			SessionID: sessionID,
+			Page:      page,
+			Older:     true,
+		}
+	}
+}
+
+func (m *cliModel) applySessionEventPage(msg cliSessionEventPageMsg) bool {
+	if m == nil {
 		return false
 	}
-	m.sessionMessages = cliConversationEntriesFromSessionEvents(view.Events)
+	m.sessionHistoryLoading = false
+	if strings.TrimSpace(msg.AgentID) != strings.TrimSpace(m.activeSessionAgent) || strings.TrimSpace(msg.SessionID) != strings.TrimSpace(m.activeSessionID) {
+		return false
+	}
+	entries := cliConversationEntriesFromSessionEvents(msg.Page.Events)
+	if msg.Older {
+		m.sessionMessages = prependUniqueConversationEntries(m.sessionMessages, entries)
+	} else {
+		m.sessionMessages = entries
+	}
+	if len(m.sessionMessages) > cliMaxLoadedMessages {
+		m.sessionMessages = append([]cliConversationEntry(nil), m.sessionMessages[len(m.sessionMessages)-cliMaxLoadedMessages:]...)
+	}
+	m.loadedSessionAgent = strings.TrimSpace(msg.AgentID)
+	m.loadedSessionID = strings.TrimSpace(msg.SessionID)
+	m.sessionHistoryBefore = strings.TrimSpace(msg.Page.NextBefore)
+	m.sessionHistoryHasMore = msg.Page.HasMore
+	m.sessionHistoryTotal = msg.Page.Total
+	m.rebuildToolSlots()
+	m.reconcilePendingConversation()
+	m.rebuildConversation()
+	return true
+}
+
+func (m *cliModel) applySessionConversationEvent(event gateway.RunEvent) bool {
+	if m == nil {
+		return false
+	}
+	if strings.TrimSpace(event.SessionID) == "" {
+		return false
+	}
+	activeAgentID := strings.TrimSpace(m.activeSessionAgent)
+	activeSessionID := strings.TrimSpace(m.activeSessionID)
+	if activeSessionID == "" {
+		m.setActiveSession(nonEmptyCLI(event.AgentID, m.entryAgentID), event.SessionID)
+		activeAgentID = strings.TrimSpace(m.activeSessionAgent)
+		activeSessionID = strings.TrimSpace(m.activeSessionID)
+	}
+	sameAgent := strings.TrimSpace(event.AgentID) == "" || activeAgentID == "" || strings.TrimSpace(event.AgentID) == activeAgentID
+	if strings.TrimSpace(event.SessionID) != activeSessionID || !sameAgent {
+		return false
+	}
+
+	entry, key, ok := cliConversationEntryFromRunEvent(event)
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(entry.kind) == "tool_call" && key != "" {
+		if m.toolSlots == nil {
+			m.toolSlots = make(map[string]int)
+		}
+		entry.toolSlotKey = key
+		if idx, exists := m.toolSlots[key]; exists && idx >= 0 && idx < len(m.sessionMessages) {
+			m.sessionMessages[idx].tool = entry.tool
+			if m.sessionMessages[idx].input == "" {
+				m.sessionMessages[idx].input = entry.input
+			}
+			m.sessionMessages[idx].toolSlotKey = key
+			m.rebuildConversation()
+			return true
+		}
+		m.appendSessionConversationEntry(entry)
+		m.toolSlots[key] = len(m.sessionMessages) - 1
+	} else {
+		m.appendSessionConversationEntry(entry)
+	}
 	m.reconcilePendingConversation()
 	m.rebuildConversation()
 	return true
@@ -1226,10 +1450,10 @@ func normalizeCLIConversationMatchText(role, text string) string {
 
 func shouldSyncCLIConversation(event gateway.RunEvent) bool {
 	switch strings.TrimSpace(event.Name) {
-	case "", "run.activity", "text.delta", "task.queued", "task.started", "task.running":
-		return false
-	default:
+	case "session.input.stored", "session.output.stored", "session.meta.stored", "agent.call.completed", "agent.call.failed", "tool.call.started", "tool.completed", "tool.failed":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -1274,11 +1498,11 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			return m.submitInput(cmds)
-		case "pgup":
+		case "pgup", "ctrl+u":
 			if m.ready {
 				m.chatView.HalfViewUp()
 			}
-			return m, nil
+			return m, m.loadOlderSessionConversationCmd()
 		case "pgdown":
 			if m.ready {
 				m.chatView.HalfViewDown()
@@ -1302,7 +1526,6 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setActiveSession(nonEmptyCLI(msgAgentID, m.entryAgentID), msgSessionID)
 				}
 			}
-			m.syncActiveSessionConversation()
 			if !m.hasAssistantSessionMessage(text) {
 				m.appendPendingConversation(cliConversationEntry{
 					kind: "message",
@@ -1320,7 +1543,7 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setActiveSession(msg.Event.AgentID, msg.Event.SessionID)
 		}
 		if shouldSyncCLIConversation(msg.Event) {
-			if !m.syncActiveSessionConversation() {
+			if !m.applySessionConversationEvent(msg.Event) {
 				m.rebuildConversation()
 			}
 		} else {
@@ -1340,6 +1563,11 @@ func (m *cliModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.width > 0 && m.height > 0 {
 			m.resize()
 		} else {
+			m.refreshViewports()
+		}
+		return m, nil
+	case cliSessionEventPageMsg:
+		if m.applySessionEventPage(msg) {
 			m.refreshViewports()
 		}
 		return m, nil
@@ -1462,12 +1690,30 @@ func (m *cliModel) View() string {
 	}
 
 	header := m.renderHeader(m.panelWidth)
-	chatMeta := fmt.Sprintf("%d message(s)", len(m.messages))
+	chatMeta := m.renderSessionWindowMeta()
 	body := m.renderPanel("Session Window", chatMeta, m.chatView.View(), m.panelWidth, m.chatHeight)
 	inputPanel := m.renderInputPanel(m.panelWidth)
 	content = lipgloss.JoinVertical(lipgloss.Left, header, body, inputPanel)
 
 	return m.renderApp(content)
+}
+
+func (m *cliModel) renderSessionWindowMeta() string {
+	loaded := len(m.sessionMessages)
+	if m.sessionHistoryTotal > loaded {
+		meta := fmt.Sprintf("%d/%d loaded", loaded, m.sessionHistoryTotal)
+		if m.sessionHistoryLoading {
+			return meta + "  loading older"
+		}
+		if m.sessionHistoryHasMore {
+			return meta + "  PgUp loads older"
+		}
+		return meta
+	}
+	if m.sessionHistoryLoading {
+		return fmt.Sprintf("%d message(s)  loading older", len(m.messages))
+	}
+	return fmt.Sprintf("%d message(s)", len(m.messages))
 }
 
 func (m *cliModel) renderApp(content string) string {
@@ -1598,7 +1844,7 @@ func (m *cliModel) renderHeader(width int) string {
 		" ",
 		cliHeaderSubtitleStyle.Render("single-column agent + tool timeline"),
 	)
-	right := cliHintStyle.Render("PgUp/PgDn page  •  Alt+Up/Down history  •  /session [id]  •  Esc quit")
+	right := cliHintStyle.Render("PgUp load/page  •  PgDn page  •  /session [id]  •  Esc quit")
 
 	line1 := cliTopBarStyle.Width(width).Render(alignInline(width, left, right))
 	line2 := renderHeaderRow(width, []string{
@@ -3125,10 +3371,58 @@ func renderTraceNodeRow(node *cliTraceNode, treeRunID string, depth, width int, 
 
 func appendTrimmedConversation(entries []cliConversationEntry, entry cliConversationEntry) []cliConversationEntry {
 	entries = append(entries, entry)
-	if len(entries) > cliMaxMessages {
-		return append([]cliConversationEntry(nil), entries[len(entries)-cliMaxMessages:]...)
+	if len(entries) > cliMaxLoadedMessages {
+		return append([]cliConversationEntry(nil), entries[len(entries)-cliMaxLoadedMessages:]...)
 	}
 	return entries
+}
+
+func prependUniqueConversationEntries(existing, older []cliConversationEntry) []cliConversationEntry {
+	if len(older) == 0 {
+		return existing
+	}
+	seen := make(map[string]struct{}, len(existing))
+	for _, entry := range existing {
+		if key := cliConversationEntryIdentity(entry); key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	filtered := make([]cliConversationEntry, 0, len(older))
+	for _, entry := range older {
+		key := cliConversationEntryIdentity(entry)
+		if key != "" {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		filtered = append(filtered, entry)
+	}
+	if len(filtered) == 0 {
+		return existing
+	}
+	out := make([]cliConversationEntry, 0, len(filtered)+len(existing))
+	out = append(out, filtered...)
+	out = append(out, existing...)
+	return out
+}
+
+func cliConversationEntryIdentity(entry cliConversationEntry) string {
+	if id := strings.TrimSpace(entry.messageID); id != "" {
+		return "entry:" + id
+	}
+	parts := []string{
+		strings.TrimSpace(entry.kind),
+		strings.TrimSpace(entry.role),
+		strings.TrimSpace(entry.toolCallID),
+		strings.TrimSpace(entry.tool),
+		strings.TrimSpace(entry.text),
+		strings.TrimSpace(entry.input),
+		strings.TrimSpace(entry.output),
+		strings.TrimSpace(entry.error),
+		entry.at.Format(time.RFC3339Nano),
+	}
+	return strings.TrimSpace(strings.Join(parts, "\x00"))
 }
 
 func appendPreview(current, delta string) string {

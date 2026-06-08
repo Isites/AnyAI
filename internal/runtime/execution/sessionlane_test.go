@@ -70,6 +70,10 @@ func (p *blockingQueueProvider) Compact(_ context.Context, _ llm.CompactRequest)
 	return llm.CompactResponse{Summary: "blocking queue compact summary"}, nil
 }
 
+func (p *blockingQueueProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func (p *blockingQueueProvider) Requests() []llm.ChatRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()

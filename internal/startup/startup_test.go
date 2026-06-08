@@ -382,6 +382,10 @@ func (p *startupMockProvider) Compact(_ context.Context, _ llm.CompactRequest) (
 	return llm.CompactResponse{Summary: "startup compact summary"}, nil
 }
 
+func (p *startupMockProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 type startupCapturingProvider struct {
 	response         string
 	autoGoalFinalize bool
@@ -415,6 +419,10 @@ func (p *startupCapturingProvider) Models() []llm.ModelInfo {
 
 func (p *startupCapturingProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "startup capturing compact summary"}, nil
+}
+
+func (p *startupCapturingProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (p *startupCapturingProvider) Requests() []llm.ChatRequest {

@@ -3,6 +3,9 @@ package ops
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -65,6 +68,74 @@ func TestServiceCreateListIndexAndCompact(t *testing.T) {
 	assert.Equal(t, runtimeevents.EventRunStarted, compactEvents[0].Name)
 	assert.Equal(t, "session.compact.requested", compactEvents[1].Name)
 	assert.Equal(t, "session.compact.completed", compactEvents[2].Name)
+}
+
+func TestServiceListUsesFreshIndexWithoutScanningSessionFiles(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+	dir := t.TempDir()
+	store := session.NewStore(dir)
+	service := NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return runtimeevents.NewRecorder() },
+	)
+
+	index := Index{
+		GeneratedAt: time.Now().Add(time.Hour).UTC(),
+		Agents: map[string][]session.SessionInfo{
+			"assistant": {{
+				ID:           "from-index",
+				CreatedAt:    time.Unix(10, 0),
+				LastActivity: time.Unix(20, 0),
+				EntryCount:   2,
+			}},
+		},
+	}
+	data, err := json.Marshal(index)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, indexFileName), append(data, '\n'), 0o644))
+
+	sessionDir := filepath.Join(dir, "assistant")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "from-disk.jsonl"), []byte("{}\n"), 0o600))
+
+	items, err := service.List("assistant")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "from-index", items[0].ID)
+}
+
+func TestServiceEventPageReturnsTailAndOlderPage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+
+	store := session.NewStore(t.TempDir())
+	service := NewService(
+		func() *config.Config { return cfg },
+		func() *session.Store { return store },
+		func() *runtimeevents.Recorder { return runtimeevents.NewRecorder() },
+	)
+
+	sess, err := service.Load("assistant", "manual")
+	require.NoError(t, err)
+	for i := 1; i <= 5; i++ {
+		sess.Append(session.UserMessageEntry(fmt.Sprintf("question %d", i)))
+	}
+
+	tail := service.EventPage("assistant", "manual", runtimeevents.SessionEventPageRequest{Limit: 2})
+	require.Len(t, tail.Events, 2)
+	assert.True(t, tail.HasMore)
+	assert.Equal(t, 5, tail.Total)
+	assert.Equal(t, "question 4", tail.Events[0].Payload["text"])
+	assert.Equal(t, "question 5", tail.Events[1].Payload["text"])
+	require.NotEmpty(t, tail.NextBefore)
+
+	older := service.EventPage("assistant", "manual", runtimeevents.SessionEventPageRequest{Limit: 2, Before: tail.NextBefore})
+	require.Len(t, older.Events, 2)
+	assert.True(t, older.HasMore)
+	assert.Equal(t, "question 2", older.Events[0].Payload["text"])
+	assert.Equal(t, "question 3", older.Events[1].Payload["text"])
 }
 
 func TestServiceRecordsAssistantSessionOutputFromSessionAppend(t *testing.T) {

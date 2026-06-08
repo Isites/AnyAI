@@ -80,6 +80,14 @@ func (s *RunView) RawRunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	return recorder.RunTree(runID)
 }
 
+func (s *RunView) RunTreeSummary(runID string) ([]runtimeevents.RunNode, bool) {
+	recorder := s.Recorder()
+	if recorder == nil {
+		return nil, false
+	}
+	return recorder.RunTreeSummary(runID)
+}
+
 func (s *RunView) SubscribeRawRunTree(runID string) (<-chan runtimeevents.EventRecord, func(), error) {
 	recorder := s.Recorder()
 	if recorder == nil {

@@ -90,6 +90,7 @@ type RunVisibilityReader interface {
 	ListRunEvents(runID string) []runtimeevents.EventRecord
 	GetRunTree(runID string) (runtimeevents.RunTreeRecord, bool)
 	RunTree(runID string) ([]runtimeevents.RunNode, bool)
+	RunTreeSummary(runID string) ([]runtimeevents.RunNode, bool)
 }
 
 // RunReplayStreamSource exposes runtime-owned replay streams. Replay is a
@@ -111,6 +112,7 @@ type RawRunProjectionReader interface {
 // callers that need the raw session object.
 type SessionProjectionReader interface {
 	ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord
+	ListSessionEventPage(agentID, sessionID string, req runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage
 	ListSessions(agentID string) ([]session.SessionInfo, error)
 	LoadSession(agentID, sessionID string) (*session.Session, error)
 	LoadSessionSnapshot(agentID, sessionID string) (SessionSnapshot, error)
@@ -119,6 +121,7 @@ type SessionProjectionReader interface {
 // SessionVisibilityReader exposes session read models for gateway consumers.
 type SessionVisibilityReader interface {
 	ListSessionEvents(agentID, sessionID string) []runtimeevents.EventRecord
+	ListSessionEventPage(agentID, sessionID string, req runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage
 	ListSessions(agentID string) ([]session.SessionInfo, error)
 	LoadSessionSnapshot(agentID, sessionID string) (SessionSnapshot, error)
 }
@@ -178,6 +181,7 @@ type ProjectionStreamSource interface {
 // runtime state.
 type ProjectionController interface {
 	RebuildEventProjections() error
+	RebuildEventProjectionsFromEvents() error
 	CreateSession(agentID, requestedKey, prefix string) (string, error)
 	DeleteSession(agentID, sessionID string) error
 	CompactSession(agentID, sessionID string, keepEntries int) error
@@ -218,6 +222,7 @@ type GatewayProjectionReader interface {
 // GatewayController is the runtime control surface consumed by gateway.
 type GatewayController interface {
 	RebuildEventProjections() error
+	RebuildEventProjectionsFromEvents() error
 	CreateSession(agentID, requestedKey, prefix string) (string, error)
 	DeleteSession(agentID, sessionID string) error
 	MemoryStaleCleanup(now time.Time) (int, error)

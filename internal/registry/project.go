@@ -229,8 +229,7 @@ func scanAgentFiles(rootDir, inputPath string, mode LoadMode, fileModeSingle boo
 			return walkErr
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" {
+			if shouldSkipProjectScanDir(rootDir, path, d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -245,6 +244,23 @@ func scanAgentFiles(rootDir, inputPath string, mode LoadMode, fileModeSingle boo
 	}
 	sort.Strings(paths)
 	return paths, nil
+}
+
+func shouldSkipProjectScanDir(rootDir, path, name string) bool {
+	if filepath.Clean(path) == filepath.Clean(rootDir) {
+		return false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	switch name {
+	case ".git", ".hg", ".svn", "node_modules", "vendor", ".cache", ".next", ".astro", "dist", "build", "coverage", "tmp", "temp":
+		return true
+	case "anyai":
+		return true
+	}
+	return name == "artifacts" || strings.HasPrefix(name, "artifacts-") || strings.HasPrefix(name, "workflow-artifacts")
 }
 
 func (p *Project) buildAgents(agentPaths []string) error {
@@ -419,6 +435,7 @@ func (p *Project) buildRuntimeConfig() (*config.Config, error) {
 		cfg.Providers = providers
 		applyProjectChannelConfig(cfg, p.ProjectConfig)
 		applyProjectSecurityConfig(cfg, p.ProjectConfig)
+		cfg.Models = buildRuntimeModelsConfig(p.ProjectConfig.Models)
 	}
 
 	entryID := p.rootAgentID()
@@ -571,6 +588,29 @@ func uniqueEntryID(agents []ProjectAgent) string {
 		entryID = a.ID
 	}
 	return entryID
+}
+
+// buildRuntimeModelsConfig lifts ProjectModelsConfig into the runtime
+// ModelsConfig consumed by the agent factory. Only the per-model knobs are
+// carried over — Default and Aliases are already applied earlier when each
+// agent's model string is resolved.
+func buildRuntimeModelsConfig(src config.ProjectModelsConfig) config.ModelsConfig {
+	out := config.ModelsConfig{
+		DefaultTemperature: src.DefaultTemperature,
+	}
+	if len(src.Options) > 0 {
+		out.Options = make(map[string]config.ModelOptionsConfig, len(src.Options))
+		for key, opts := range src.Options {
+			out.Options[key] = config.ModelOptionsConfig{
+				Temperature:      opts.Temperature,
+				MaxTokensField:   opts.MaxTokensField,
+				EnableThinking:   opts.EnableThinking,
+				Stream:           opts.Stream,
+				NativeCompaction: opts.NativeCompaction,
+			}
+		}
+	}
+	return out
 }
 
 func existingDir(path string) string {

@@ -156,6 +156,9 @@ func (d *dispatcher) forwardRunTree(ctx context.Context, ch Channel, run *Manage
 	if !ok || d == nil || d.runtime == nil || run == nil || strings.TrimSpace(run.RunID) == "" {
 		return nil
 	}
+	if replayAware, ok := ch.(RunTreeReplayAware); ok && !replayAware.WantsRunTreeReplay() {
+		return nil
+	}
 
 	snapshot, treeEvents, cancelTree, err := d.runtime.SubscribeRunTreeReplay(run.RunID)
 	if err != nil || cancelTree == nil {

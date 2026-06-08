@@ -62,6 +62,36 @@ func TestSanitizeToolResultRedactsOutputAndMetadata(t *testing.T) {
 	assert.Equal(t, "[REDACTED]", nested["password"])
 }
 
+func TestSanitizeToolResultForTranscriptSummarizesLargeOutput(t *testing.T) {
+	result := ToolResult{
+		Output: strings.Repeat("a", 12*1024) + " api_key=sk-secret-value",
+		Error:  "authorization=Bearer topsecret",
+		Metadata: map[string]any{
+			"note": strings.Repeat("b", 12*1024),
+		},
+	}
+
+	sanitized := SanitizeToolResultForTranscript(result)
+
+	assert.Less(t, len(sanitized.Output), len(result.Output))
+	assert.Contains(t, sanitized.Output, "content omitted from durable transcript")
+	assert.NotContains(t, sanitized.Output, "sk-secret-value")
+	assert.Equal(t, "authorization=[REDACTED]", sanitized.Error)
+	assert.Contains(t, sanitized.Metadata["note"], "content omitted from durable transcript")
+}
+
+func TestSanitizeToolResultForTranscriptDoesNotParseLargeJSON(t *testing.T) {
+	result := ToolResult{
+		Output: `{"items":["` + strings.Repeat("a", 300*1024) + `"],"api_key":"sk-secret-value"}`,
+	}
+
+	sanitized := SanitizeToolResultForTranscript(result)
+
+	assert.Less(t, len(sanitized.Output), 16*1024)
+	assert.Contains(t, sanitized.Output, "content omitted from durable transcript")
+	assert.NotContains(t, sanitized.Output, "sk-secret-value")
+}
+
 func TestSanitizeToolInputForTranscriptSummarizesWriteFileContent(t *testing.T) {
 	raw := json.RawMessage(`{"path":"report.md","content":"` + strings.Repeat("a", 400) + `"}`)
 

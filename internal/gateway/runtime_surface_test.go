@@ -74,6 +74,9 @@ func (s *stubRuntimeSurface) Resources() *runtimeresources.Catalog { return nil 
 func (s *stubRuntimeSurface) JobScheduler() tools.JobScheduler     { return nil }
 func (s *stubRuntimeSurface) EventStorageDir() string              { return "" }
 func (s *stubRuntimeSurface) RebuildEventProjections() error       { return nil }
+func (s *stubRuntimeSurface) RebuildEventProjectionsFromEvents() error {
+	return nil
+}
 func (s *stubRuntimeSurface) StartManagedRun(context.Context, runtimeport.RunRequest) (*runtimeport.ManagedRun, error) {
 	return nil, nil
 }
@@ -153,6 +156,13 @@ func (s *stubRuntimeSurface) RunTree(runID string) ([]runtimeevents.RunNode, boo
 	}
 	return nil, false
 }
+func (s *stubRuntimeSurface) RunTreeSummary(runID string) ([]runtimeevents.RunNode, bool) {
+	tree, ok := s.RunTree(runID)
+	if !ok {
+		return nil, false
+	}
+	return stripRuntimeTestRunNodeEvents(tree), true
+}
 func (s *stubRuntimeSurface) SubscribeRawRunTree(string) (<-chan runtimeevents.EventRecord, func(), error) {
 	if s.traceSubscribed != nil {
 		close(s.traceSubscribed)
@@ -165,6 +175,21 @@ func (s *stubRuntimeSurface) SubscribeRawRunTree(string) (<-chan runtimeevents.E
 	}
 	return s.traceSub, func() {}, nil
 }
+
+func stripRuntimeTestRunNodeEvents(nodes []runtimeevents.RunNode) []runtimeevents.RunNode {
+	if len(nodes) == 0 {
+		return nil
+	}
+	out := make([]runtimeevents.RunNode, len(nodes))
+	for i, node := range nodes {
+		out[i] = runtimeevents.RunNode{
+			Run:      node.Run,
+			Children: stripRuntimeTestRunNodeEvents(node.Children),
+		}
+	}
+	return out
+}
+
 func (s *stubRuntimeSurface) SubscribeRunReplay(runID string) ([]runtimeevents.EventRecord, <-chan runtimeevents.EventRecord, func(), error) {
 	return stubSubscribeReplayStream(
 		func() (<-chan runtimeevents.EventRecord, func(), error) {
@@ -196,6 +221,9 @@ func (s *stubRuntimeSurface) SubscribeRunTreeReplay(runID string) ([]runtimeeven
 }
 func (s *stubRuntimeSurface) ListSessionEvents(string, string) []runtimeevents.EventRecord {
 	return nil
+}
+func (s *stubRuntimeSurface) ListSessionEventPage(string, string, runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage {
+	return runtimeevents.SessionEventPage{}
 }
 func (s *stubRuntimeSurface) ListSessions(string) ([]session.SessionInfo, error)   { return nil, nil }
 func (s *stubRuntimeSurface) LoadSession(string, string) (*session.Session, error) { return nil, nil }

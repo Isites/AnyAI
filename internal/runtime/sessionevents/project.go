@@ -16,6 +16,22 @@ type ToolCallState struct {
 	input json.RawMessage
 }
 
+func ToolCallStateFromEntry(entry session.SessionEntry) (string, ToolCallState, bool) {
+	if entry.Type != session.EntryTypeToolCall {
+		return "", ToolCallState{}, false
+	}
+	var call session.ToolCallData
+	if err := json.Unmarshal(entry.Data, &call); err != nil {
+		return "", ToolCallState{}, false
+	}
+	callID := strings.TrimSpace(call.ID)
+	toolName := strings.TrimSpace(call.Tool)
+	if callID == "" || toolName == "" {
+		return "", ToolCallState{}, false
+	}
+	return callID, ToolCallState{name: toolName, input: call.Input}, true
+}
+
 // HistoryEventRecords projects persisted session history into transport-facing
 // event records so session APIs can stream directly from session files.
 func HistoryEventRecords(agentID, sessionID string, history []session.SessionEntry) []runtimeevents.EventRecord {

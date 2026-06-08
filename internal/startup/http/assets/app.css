@@ -1510,6 +1510,16 @@ pre {
   height: 100%;
 }
 
+.chat-history-control {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 12px;
+}
+
+.chat-history-control button {
+  min-width: 120px;
+}
+
 .chat-transcript-shell.runtime-open {
   gap: 16px;
 }

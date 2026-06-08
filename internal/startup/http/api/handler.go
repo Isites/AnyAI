@@ -34,6 +34,7 @@ type InventoryPlane interface {
 
 type RuntimePlane interface {
 	RebuildProjections() error
+	RebuildProjectionsFromEvents() error
 	EventStorageDir() string
 	AttachmentBaseDir() string
 }
@@ -50,10 +51,13 @@ type RunPlane interface {
 	) (*gateway.ManagedRun, gateway.Run, error)
 	RunRecord(runID string) (gateway.Run, bool)
 	RunEvents(runID string) []gateway.Event
+	SubscribeRunLive(runID string) (<-chan gateway.Event, func(), error)
 	SubscribeRunReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error)
 	CancelRun(runID string) error
 	RunTreeRecord(runID string) (gateway.RunTree, bool)
 	RunTree(runID string) ([]gateway.RunNode, bool)
+	RunTreeSummary(runID string) ([]gateway.RunNode, bool)
+	SubscribeRunTreeLive(runID string) (<-chan gateway.Event, func(), error)
 	SubscribeRunTreeReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error)
 }
 
@@ -62,6 +66,7 @@ type SessionPlane interface {
 	SessionCreate(agentID, requestedKey, prefix string) (string, error)
 	SessionLoad(agentID, sessionID string) (gateway.SessionView, error)
 	SessionEvents(agentID, sessionID string) []gateway.Event
+	SessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage
 	SubscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error)
 	SessionDelete(agentID, sessionID string) error
 }
@@ -238,8 +243,15 @@ func (h *Handler) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"overview": h.inventory.OverviewPayload()})
 }
 
-func (h *Handler) handleRuntimeRebuildProjections(w http.ResponseWriter, _ *http.Request) {
-	if err := h.runtime.RebuildProjections(); err != nil {
+func (h *Handler) handleRuntimeRebuildProjections(w http.ResponseWriter, r *http.Request) {
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	var err error
+	if mode == "from_events" || mode == "full" {
+		err = h.runtime.RebuildProjectionsFromEvents()
+	} else {
+		err = h.runtime.RebuildProjections()
+	}
+	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not available") {
 			status = http.StatusServiceUnavailable
@@ -249,10 +261,19 @@ func (h *Handler) handleRuntimeRebuildProjections(w http.ResponseWriter, _ *http
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "ok",
+		"mode":       projectionRebuildModeLabel(mode),
 		"runs":       len(h.run.RunList()),
 		"events_dir": h.runtime.EventStorageDir(),
 		"rebuild_at": time.Now().UTC(),
 	})
+}
+
+func projectionRebuildModeLabel(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "from_events" || mode == "full" {
+		return "from_events"
+	}
+	return "index"
 }
 
 func (h *Handler) handleMemoryStats(w http.ResponseWriter, _ *http.Request) {
@@ -322,13 +343,73 @@ func (h *Handler) handleMemoryPromote(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"promoted": promoted, "stats": h.memory.MemoryStats()})
 }
 
-func (h *Handler) handleRuns(w http.ResponseWriter, _ *http.Request) {
-	runs := h.run.RunList()
+func (h *Handler) handleRuns(w http.ResponseWriter, r *http.Request) {
+	runs := filterRuns(h.run.RunList(), r)
 	if len(runs) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"runs": []gateway.Run{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
+func filterRuns(runs []gateway.Run, r *http.Request) []gateway.Run {
+	if len(runs) == 0 || r == nil {
+		if len(runs) == 0 {
+			return nil
+		}
+		return runs
+	}
+	query := r.URL.Query()
+	statuses := parseRunStatusFilter(query.Get("status"))
+	agentID := strings.TrimSpace(query.Get("agent_id"))
+	sessionID := strings.TrimSpace(query.Get("session_id"))
+	limit := parsePositiveInt(query.Get("limit"))
+
+	filtered := make([]gateway.Run, 0, len(runs))
+	for _, run := range runs {
+		if len(statuses) > 0 {
+			if _, ok := statuses[run.Status]; !ok {
+				continue
+			}
+		}
+		if agentID != "" && run.AgentID != agentID {
+			continue
+		}
+		if sessionID != "" && run.SessionID != sessionID {
+			continue
+		}
+		filtered = append(filtered, run)
+		if limit > 0 && len(filtered) >= limit {
+			break
+		}
+	}
+	return filtered
+}
+
+func parseRunStatusFilter(raw string) map[gateway.RunStatus]struct{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "all") {
+		return nil
+	}
+	statuses := map[gateway.RunStatus]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		switch status := gateway.RunStatus(strings.ToLower(strings.TrimSpace(part))); status {
+		case gateway.RunStatusQueued, gateway.RunStatusRunning, gateway.RunStatusCompleted, gateway.RunStatusFailed, gateway.RunStatusAborted:
+			statuses[status] = struct{}{}
+		}
+	}
+	if len(statuses) == 0 {
+		return nil
+	}
+	return statuses
+}
+
+func parsePositiveInt(raw string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
 }
 
 func (h *Handler) handleRunCreate(w http.ResponseWriter, r *http.Request) {
@@ -449,8 +530,7 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 	}
 
 	// TODO: 临时不定，后期需要废弃ManagedRun的events，进作为一个句柄，可以操控本次生命周期停止和继续，其余的消费只暴露recorder/replay/subscribe即可
-	drainManagedRunEvents(run)
-	h.observeRunMetrics(run.RunID)
+	h.drainManagedRunEvents(run)
 
 	if req.Stream || wantsEventStream(r) {
 		h.streamAcceptedRun(w, r, run.RunID, map[string]any{"run": record})
@@ -460,12 +540,13 @@ func (h *Handler) handleRunSubmission(w http.ResponseWriter, r *http.Request, se
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": record})
 }
 
-func drainManagedRunEvents(run *gateway.ManagedRun) {
+func (h *Handler) drainManagedRunEvents(run *gateway.ManagedRun) {
 	if run == nil || run.Events == nil {
 		return
 	}
 	go func() {
-		for range run.Events {
+		for event := range run.Events {
+			h.observeRunMetricEvent(event)
 		}
 	}()
 }
@@ -481,6 +562,15 @@ func (h *Handler) handleRunGet(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
+	if wantsEventStream(r) {
+		if _, ok := h.run.RunRecord(runID); !ok {
+			http.NotFound(w, r)
+			return
+		}
+		h.streamAcceptedRun(w, r, runID, nil)
+		return
+	}
+
 	events := h.run.RunEvents(runID)
 	if len(events) == 0 {
 		if _, ok := h.run.RunRecord(runID); !ok {
@@ -488,12 +578,7 @@ func (h *Handler) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !wantsEventStream(r) {
-		writeJSON(w, http.StatusOK, map[string]any{"events": events})
-		return
-	}
-
-	h.streamAcceptedRun(w, r, runID, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func (h *Handler) handleRunCancel(w http.ResponseWriter, r *http.Request) {
@@ -502,32 +587,6 @@ func (h *Handler) handleRunCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (h *Handler) observeRunMetrics(runID string) {
-	if h == nil || h.run == nil || strings.TrimSpace(runID) == "" {
-		return
-	}
-
-	events, ch, cancel, err := h.run.SubscribeRunReplay(runID)
-	if err != nil || cancel == nil {
-		return
-	}
-
-	for _, event := range events {
-		h.observeRunMetricEvent(event)
-	}
-	if ch == nil || (len(events) > 0 && isTerminalEvent(events[len(events)-1])) {
-		cancel()
-		return
-	}
-
-	go func() {
-		defer cancel()
-		for event := range ch {
-			h.observeRunMetricEvent(event)
-		}
-	}()
 }
 
 func (h *Handler) observeRunMetricEvent(event gateway.Event) {
@@ -551,7 +610,18 @@ func (h *Handler) streamAcceptedRun(w http.ResponseWriter, r *http.Request, runI
 		return
 	}
 
-	events, ch, cancel, err := h.run.SubscribeRunReplay(runID)
+	replay := wantsReplay(r)
+	var (
+		events []gateway.Event
+		ch     <-chan gateway.Event
+		cancel func()
+		err    error
+	)
+	if replay {
+		events, ch, cancel, err = h.run.SubscribeRunReplay(runID)
+	} else {
+		ch, cancel, err = h.run.SubscribeRunLive(runID)
+	}
 	if err != nil || cancel == nil {
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
 			http.NotFound(w, r)
@@ -629,26 +699,39 @@ func (h *Handler) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	agentID := chi.URLParam(r, "agentID")
 	sessionID := chi.URLParam(r, "sessionID")
-	sess, err := h.session.SessionLoad(agentID, sessionID)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
+	req := sessionEventPageRequestFromQuery(r)
+	if req.Limit <= 0 && strings.TrimSpace(req.Before) == "" {
+		req.Limit = 80
 	}
-
+	page := h.session.SessionEventPage(agentID, sessionID, req)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"session": map[string]any{
 			"agent_id": agentID,
 			"id":       sessionID,
-			"history":  sess.History,
-			"events":   h.session.SessionEvents(agentID, sessionID),
+			"history":  []map[string]any{},
+			"events":   page.Events,
 		},
+		"has_more":    page.HasMore,
+		"next_before": page.NextBefore,
+		"total":       page.Total,
 	})
 }
 
 func (h *Handler) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	agentID := chi.URLParam(r, "agentID")
 	sessionID := chi.URLParam(r, "sessionID")
-	events := h.session.SessionEvents(agentID, sessionID)
+	req := sessionEventPageRequestFromQuery(r)
+	var events []gateway.Event
+	if req.Limit > 0 || strings.TrimSpace(req.Before) != "" {
+		page := h.session.SessionEventPage(agentID, sessionID, req)
+		if !wantsEventStream(r) {
+			writeJSON(w, http.StatusOK, page)
+			return
+		}
+		events = page.Events
+	} else {
+		events = h.session.SessionEvents(agentID, sessionID)
+	}
 	if !wantsEventStream(r) {
 		writeJSON(w, http.StatusOK, map[string]any{"events": events})
 		return
@@ -691,6 +774,22 @@ func (h *Handler) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func sessionEventPageRequestFromQuery(r *http.Request) gateway.SessionEventPageRequest {
+	if r == nil {
+		return gateway.SessionEventPageRequest{}
+	}
+	limit := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	return gateway.SessionEventPageRequest{
+		Limit:  limit,
+		Before: strings.TrimSpace(r.URL.Query().Get("before")),
+	}
+}
+
 func (h *Handler) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	agentID := chi.URLParam(r, "agentID")
 	sessionID := chi.URLParam(r, "sessionID")
@@ -702,7 +801,15 @@ func (h *Handler) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleRunTree(w http.ResponseWriter, r *http.Request) {
-	tree, ok := h.run.RunTree(chi.URLParam(r, "runID"))
+	var (
+		tree []gateway.RunNode
+		ok   bool
+	)
+	if wantsRunTreeSummary(r) {
+		tree, ok = h.run.RunTreeSummary(chi.URLParam(r, "runID"))
+	} else {
+		tree, ok = h.run.RunTree(chi.URLParam(r, "runID"))
+	}
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -712,14 +819,20 @@ func (h *Handler) handleRunTree(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleRunTreeEvents(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
-	tree, ok := h.run.RunTreeRecord(runID)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
 	if !wantsEventStream(r) {
+		tree, ok := h.run.RunTreeRecord(runID)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"events": tree.Events})
 		return
+	}
+	if !wantsReplay(r) {
+		if _, ok := h.run.RunRecord(runID); !ok {
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	flusher, ok := w.(http.Flusher)
@@ -728,7 +841,18 @@ func (h *Handler) handleRunTreeEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, ch, cancel, err := h.run.SubscribeRunTreeReplay(runID)
+	replay := wantsReplay(r)
+	var (
+		snapshot []gateway.Event
+		ch       <-chan gateway.Event
+		cancel   func()
+		err      error
+	)
+	if replay {
+		snapshot, ch, cancel, err = h.run.SubscribeRunTreeReplay(runID)
+	} else {
+		ch, cancel, err = h.run.SubscribeRunTreeLive(runID)
+	}
 	if err != nil || cancel == nil {
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "not found") {
 			http.NotFound(w, r)
@@ -885,6 +1009,41 @@ func wantsEventStream(r *http.Request) bool {
 	return r.URL.Query().Get("stream") == "1" || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
+func wantsReplay(r *http.Request) bool {
+	if r == nil {
+		return true
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("replay"))
+	if raw == "" {
+		return true
+	}
+	return !isFalseQueryValue(raw)
+}
+
+func wantsRunTreeEvents(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("events"))
+	if raw == "" {
+		return false
+	}
+	return !isFalseQueryValue(raw)
+}
+
+func wantsRunTreeSummary(r *http.Request) bool {
+	return !wantsRunTreeEvents(r)
+}
+
+func isFalseQueryValue(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
 func prepareEventStream(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
@@ -911,7 +1070,7 @@ func isTerminalStatus(status gateway.RunStatus) bool {
 }
 
 func isTerminalEvent(event gateway.Event) bool {
-	return event.Name == "run.completed" || event.Name == "run.failed"
+	return event.Name == "run.completed" || event.Name == "run.failed" || event.Name == "run.aborted"
 }
 
 func parseMemoryLayers(raw string) []gateway.MemoryLayer {

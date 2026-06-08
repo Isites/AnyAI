@@ -35,6 +35,10 @@ func (p *compactFallbackProvider) Compact(ctx context.Context, req CompactReques
 	return compactViaChatStream(ctx, p.ChatStream, req)
 }
 
+func (p *compactFallbackProvider) DefaultModelOptions(_ string) ModelOptions {
+	return ModelOptions{}
+}
+
 type compactNativeProvider struct {
 	response CompactResponse
 	err      error
@@ -68,6 +72,10 @@ func (p *compactNativeProvider) Compact(_ context.Context, req CompactRequest) (
 	return p.response, nil
 }
 
+func (p *compactNativeProvider) DefaultModelOptions(_ string) ModelOptions {
+	return ModelOptions{}
+}
+
 func TestCompactWithProviderFallsBackToChatStream(t *testing.T) {
 	provider := &compactFallbackProvider{
 		events: []ChatEvent{
@@ -80,9 +88,9 @@ func TestCompactWithProviderFallsBackToChatStream(t *testing.T) {
 		Model:        "mock-model",
 		Messages:     []Message{{Role: "user", Content: "older history"}},
 		MaxTokens:    128,
-		Temperature:  0.01,
 		SystemPrompt: "compact system",
 		UserPrompt:   "compact user",
+		Options:      ModelOptions{Temperature: Float64Ptr(0.01)},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "summary", resp.Summary)

@@ -55,6 +55,37 @@ func TestOpenAIProviderChatStreamUsesMaxTokensForNonReasoningModels(t *testing.T
 	assert.False(t, hasMaxCompletionTokens)
 }
 
+func TestOpenAIProviderChatStreamOmitsTemperatureForReasoningModels(t *testing.T) {
+	cases := []string{"gpt-5.5-light", "gpt-5", "o1-preview", "o3-mini", "o4-mini"}
+	for _, model := range cases {
+		t.Run(model, func(t *testing.T) {
+			body := captureOpenAIChatRequestWith(t, ChatRequest{
+				Model:     model,
+				Messages:  []Message{{Role: "user", Content: "hello"}},
+				MaxTokens: 1234,
+				// Caller supplies the runtime baseline (0.2); the helper merges
+				// the provider's family defaults on top. For reasoning models
+				// that means OmitTemperature=true clears the baseline.
+				Options: ModelOptions{Temperature: Float64Ptr(0.2)},
+			})
+			_, hasTemperature := body["temperature"]
+			assert.False(t, hasTemperature, "reasoning models lock temperature at 1; the field must be omitted")
+		})
+	}
+}
+
+func TestOpenAIProviderChatStreamSendsTemperatureForChatModels(t *testing.T) {
+	body := captureOpenAIChatRequestWith(t, ChatRequest{
+		Model:     "gpt-4o",
+		Messages:  []Message{{Role: "user", Content: "hello"}},
+		MaxTokens: 1234,
+		Options:   ModelOptions{Temperature: Float64Ptr(0.2)},
+	})
+	temperature, ok := body["temperature"].(float64)
+	require.True(t, ok, "non-reasoning models must still receive the configured temperature")
+	assert.InDelta(t, 0.2, temperature, 1e-6)
+}
+
 func TestOpenAIProviderChatStreamDisablesThinkingForQwen3(t *testing.T) {
 	body := captureOpenAIChatRequest(t, "qwen3:1.7b")
 
@@ -80,6 +111,9 @@ func TestOpenAIProviderChatStreamUsesNonStreamingCompletionForQwen3(t *testing.T
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
 		Model:    "qwen3:1.7b",
 		Messages: []Message{{Role: "user", Content: "hello"}},
+		// Direct provider call bypasses the agent runtime, so apply the
+		// family defaults explicitly (Stream=&false routes to non-streaming).
+		Options: provider.DefaultModelOptions("qwen3:1.7b"),
 	})
 	require.NoError(t, err)
 
@@ -131,7 +165,7 @@ func TestNewOpenAIProviderNormalizesBareBaseURLToV1(t *testing.T) {
 
 	provider := NewOpenAIProvider("test-key", server.URL, nil)
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:     "gpt-5.4",
+		Model:     "gpt-4o",
 		Messages:  []Message{{Role: "user", Content: "hello"}},
 		MaxTokens: 1234,
 	})
@@ -226,7 +260,7 @@ func TestOpenAIProviderRecoversTextWhenStreamJSONIsTruncatedAfterContent(t *test
 
 	provider := NewOpenAIProvider("test-key", server.URL+"/v1", nil)
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:    "gpt-5.4",
+		Model:    "gpt-4o",
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	})
 	require.NoError(t, err)
@@ -266,7 +300,7 @@ func TestOpenAIProviderFailsWhenFirstPacketIsTruncated(t *testing.T) {
 
 	provider := NewOpenAIProvider("test-key", server.URL+"/v1", nil)
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:    "gpt-5.4",
+		Model:    "gpt-4o",
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	})
 	require.NoError(t, err)
@@ -307,7 +341,7 @@ func TestOpenAIProviderFailsWhenToolCallArgumentsAreTruncated(t *testing.T) {
 
 	provider := NewOpenAIProvider("test-key", server.URL+"/v1", nil)
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:    "gpt-5.4",
+		Model:    "gpt-4o",
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	})
 	require.NoError(t, err)
@@ -340,7 +374,7 @@ func TestOpenAIProviderEmitsToolCallStartOnlyOnceWhenNameRepeats(t *testing.T) {
 
 	provider := NewOpenAIProvider("test-key", server.URL+"/v1", nil)
 	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:    "gpt-5.4",
+		Model:    "gpt-4o",
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	})
 	require.NoError(t, err)
@@ -368,7 +402,18 @@ func captureOpenAIChatRequest(t *testing.T, model string) map[string]any {
 
 func captureOpenAIChatRequestWithTools(t *testing.T, model string, tools []ToolDef) map[string]any {
 	t.Helper()
+	return captureOpenAIChatRequestWith(t, ChatRequest{
+		Model:     model,
+		Messages:  []Message{{Role: "user", Content: "hello"}},
+		MaxTokens: 1234,
+		Tools:     tools,
+	})
+}
 
+func captureOpenAIChatRequestWith(t *testing.T, chatReq ChatRequest) map[string]any {
+	t.Helper()
+
+	model := chatReq.Model
 	var body map[string]any
 	server := newLoopbackTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
@@ -393,12 +438,13 @@ func captureOpenAIChatRequestWithTools(t *testing.T, model string, tools []ToolD
 	defer server.Close()
 
 	provider := NewOpenAIProvider("test-key", server.URL+"/v1", nil)
-	stream, err := provider.ChatStream(context.Background(), ChatRequest{
-		Model:     model,
-		Messages:  []Message{{Role: "user", Content: "hello"}},
-		MaxTokens: 1234,
-		Tools:     tools,
-	})
+	// Mirror the agent runtime layering: caller's options are the baseline,
+	// the provider's family defaults merge on top. Without this, a test that
+	// passes "gpt-5.4" (a reasoning-family name) would skip the
+	// max_completion_tokens routing now that ChatStream no longer branches on
+	// the model string itself.
+	chatReq.Options = MergeModelOptions(chatReq.Options, provider.DefaultModelOptions(chatReq.Model))
+	stream, err := provider.ChatStream(context.Background(), chatReq)
 	require.NoError(t, err)
 
 	for event := range stream {

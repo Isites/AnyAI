@@ -73,6 +73,7 @@ type Config struct {
 	Heartbeat HeartbeatConfig           `json:"heartbeat"`
 	Memory    MemoryConfig              `json:"memory"`
 	Cortex    CortexConfig              `json:"cortex"`
+	Models    ModelsConfig              `json:"models,omitempty"`
 	Runtime   RuntimeConfig             `json:"runtime,omitempty"`
 	Logging   LoggingConfig             `json:"logging,omitempty"`
 	Security  SecurityConfig            `json:"security"`
@@ -94,6 +95,24 @@ type ProviderConfig struct {
 	BaseURL string            `json:"base_url"`          // custom API endpoint (e.g. LiteLLM)
 	APIKey  string            `json:"api_key"`           // API key or auth token
 	Headers map[string]string `json:"headers,omitempty"` // additional HTTP headers for provider verification/routing
+}
+
+// ModelsConfig is the runtime mirror of ProjectModelsConfig used by the agent
+// runtime to resolve per-model defaults at construction time. The map key is
+// the resolved "provider/model" string, matched exactly against an agent's
+// model field.
+type ModelsConfig struct {
+	DefaultTemperature *float64                      `json:"defaultTemperature,omitempty"`
+	Options            map[string]ModelOptionsConfig `json:"options,omitempty"`
+}
+
+// ModelOptionsConfig is the per-model override surface; mirrors the YAML schema.
+type ModelOptionsConfig struct {
+	Temperature      *float64 `json:"temperature,omitempty"`
+	MaxTokensField   string   `json:"maxTokensField,omitempty"`
+	EnableThinking   *bool    `json:"enableThinking,omitempty"`
+	Stream           *bool    `json:"stream,omitempty"`
+	NativeCompaction *bool    `json:"nativeCompaction,omitempty"`
 }
 
 type GatewayConfig struct {

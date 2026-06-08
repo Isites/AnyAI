@@ -8,6 +8,8 @@ import (
 	"github.com/Isites/anyai/internal/runtime/contract"
 )
 
+const maxStructuredToolOutputSanitizeBytes = 256 * 1024
+
 // SanitizeText redacts obvious credentials and secrets from a free-form string.
 func SanitizeText(text string) string {
 	return contract.SanitizeText(text)
@@ -27,11 +29,11 @@ func SanitizeRawJSON(raw json.RawMessage) json.RawMessage {
 // that would otherwise bloat future model context. It must not be used for
 // actual execution, only for logs, events, tasks, and session history.
 func SanitizeToolInputForTranscript(toolName string, raw json.RawMessage) json.RawMessage {
-	sanitized := SanitizeRawJSON(raw)
 	if strings.TrimSpace(toolName) != "write_file" {
-		return sanitized
+		return contract.SanitizeDurableRawJSON(raw)
 	}
 
+	sanitized := SanitizeRawJSON(raw)
 	var payload map[string]any
 	if err := json.Unmarshal(sanitized, &payload); err != nil {
 		return sanitized
@@ -62,7 +64,11 @@ func SanitizeToolInputForTranscript(toolName string, raw json.RawMessage) json.R
 // or runtime event stream.
 func SanitizeToolResult(result ToolResult) ToolResult {
 	if strings.TrimSpace(result.Output) != "" {
-		result.Output = string(contract.SanitizeRawJSON(json.RawMessage(result.Output)))
+		if len(result.Output) <= maxStructuredToolOutputSanitizeBytes {
+			result.Output = string(contract.SanitizeRawJSON(json.RawMessage(result.Output)))
+		} else {
+			result.Output = contract.SanitizeText(result.Output)
+		}
 	}
 	if strings.TrimSpace(result.Error) != "" {
 		result.Error = contract.SanitizeText(result.Error)
@@ -71,6 +77,32 @@ func SanitizeToolResult(result ToolResult) ToolResult {
 		result.Metadata = contract.SanitizeMetadata(result.Metadata)
 	}
 	return result
+}
+
+// SanitizeToolResultForTranscript prepares a tool result for durable logs,
+// events, task summaries, and session history. It keeps current execution
+// semantics separate from the compact transcript representation.
+func SanitizeToolResultForTranscript(result ToolResult) ToolResult {
+	if result.Output != "" {
+		if len(result.Output) <= maxStructuredToolOutputSanitizeBytes {
+			result.Output = string(contract.SanitizeRawJSON(json.RawMessage(result.Output)))
+		} else {
+			result.Output = contract.SanitizeText(result.Output)
+		}
+		result.Output, _ = contract.SanitizeDurableText(result.Output)
+	}
+	if result.Error != "" {
+		result.Error = contract.SanitizeText(result.Error)
+		result.Error, _ = contract.SanitizeDurableText(result.Error)
+	}
+	if len(result.Metadata) > 0 {
+		result.Metadata = contract.SanitizeDurableMetadata(result.Metadata)
+	}
+	return result
+}
+
+func SanitizeDurableText(text string) (string, bool) {
+	return contract.SanitizeDurableText(text)
 }
 
 func summarizeLargeToolString(value string) string {

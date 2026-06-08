@@ -210,7 +210,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 		Messages: msgs,
 		Stream:   true,
 	}
-	if usesMaxCompletionTokens(model) {
+	if req.Options.MaxTokensField == "max_completion_tokens" {
 		openaiReq.MaxCompletionTokens = maxTokens
 	} else {
 		openaiReq.MaxTokens = maxTokens
@@ -219,19 +219,19 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 	if len(tools) > 0 {
 		openaiReq.Tools = tools
 	}
-	if shouldDisableThinkingForModel(model) {
+	if req.Options.EnableThinking != nil {
 		openaiReq.ChatTemplateKwargs = map[string]any{
-			"enable_thinking": false,
+			"enable_thinking": *req.Options.EnableThinking,
 		}
 	}
 
-	if req.Temperature > 0 {
-		openaiReq.Temperature = float32(req.Temperature)
+	if req.Options.Temperature != nil {
+		openaiReq.Temperature = float32(*req.Options.Temperature)
 	}
 
 	logOpenAICompatibleRequestSummary(p.baseURL, openaiReq, req)
 
-	if shouldUseNonStreamingCompletion(model) {
+	if req.Options.Stream != nil && !*req.Options.Stream {
 		return p.chatNonStreaming(ctx, openaiReq)
 	}
 
@@ -307,22 +307,38 @@ func (p *OpenAIProvider) chatNonStreaming(ctx context.Context, req openai.ChatCo
 	return events, nil
 }
 
-func usesMaxCompletionTokens(model string) bool {
+// DefaultModelOptions captures OpenAI-family knowledge about how to shape a
+// request for a given model. The agent runtime layers these between its
+// runtime-wide baseline and any user-supplied overrides; ChatStream itself
+// consumes only req.Options and never branches on req.Model.
+func (p *OpenAIProvider) DefaultModelOptions(model string) ModelOptions {
+	opts := ModelOptions{}
 	model = strings.TrimSpace(strings.ToLower(model))
+	if isOpenAIReasoningModel(model) {
+		// o1/o3/o4/gpt-5 reasoning models require max_completion_tokens and
+		// reject any custom sampling: temperature/top_p/n must equal the API
+		// defaults. Force-omit Temperature so the SDK's ReasoningValidator
+		// accepts the request, even when a runtime baseline supplied 0.2.
+		opts.MaxTokensField = "max_completion_tokens"
+		opts.OmitTemperature = true
+	}
+	if strings.Contains(model, "qwen3") {
+		// Qwen3 served through OpenAI-compatible endpoints needs the visible
+		// reasoning trace disabled and refuses streamed completions reliably.
+		opts.EnableThinking = BoolPtr(false)
+		opts.Stream = BoolPtr(false)
+	}
+	return opts
+}
+
+// isOpenAIReasoningModel mirrors the model set enforced by go-openai's
+// ReasoningValidator: o1/o3/o4/gpt-5 reasoning families lock sampling and
+// require max_completion_tokens.
+func isOpenAIReasoningModel(model string) bool {
 	return strings.HasPrefix(model, "o1") ||
 		strings.HasPrefix(model, "o3") ||
 		strings.HasPrefix(model, "o4") ||
 		strings.HasPrefix(model, "gpt-5")
-}
-
-func shouldDisableThinkingForModel(model string) bool {
-	model = strings.TrimSpace(strings.ToLower(model))
-	return strings.Contains(model, "qwen3")
-}
-
-func shouldUseNonStreamingCompletion(model string) bool {
-	model = strings.TrimSpace(strings.ToLower(model))
-	return strings.Contains(model, "qwen3")
 }
 
 func logOpenAICompatibleRequestSummary(baseURL string, openaiReq openai.ChatCompletionRequest, req ChatRequest) {

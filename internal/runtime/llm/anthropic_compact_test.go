@@ -56,9 +56,12 @@ func TestAnthropicProviderCompactUsesNativeCompactionWhenEligible(t *testing.T) 
 		Model:        "claude-sonnet-4-6",
 		Messages:     longAnthropicCompactHistory(),
 		MaxTokens:    512,
-		Temperature:  0.01,
 		SystemPrompt: "compact system",
 		UserPrompt:   "compact user",
+		Options: ModelOptions{
+			Temperature:      Float64Ptr(0.01),
+			NativeCompaction: BoolPtr(true),
+		},
 	})
 
 	require.NoError(t, err)
@@ -157,6 +160,7 @@ func TestAnthropicProviderCompactFallsBackWhenNativeCompactionFails(t *testing.T
 		MaxTokens:    256,
 		SystemPrompt: "compact system",
 		UserPrompt:   "compact user",
+		Options:      ModelOptions{NativeCompaction: BoolPtr(true)},
 	})
 
 	require.NoError(t, err)

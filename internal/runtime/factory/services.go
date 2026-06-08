@@ -76,6 +76,9 @@ func BuildBaseComponents(
 	if err != nil {
 		return nil, fmt.Errorf("create event recorder: %w", err)
 	}
+	if aborted := recorder.AbortActiveRuns("run interrupted by runtime restart"); aborted > 0 {
+		runtimelogging.Info("aborted stale active runs from previous runtime", "count", aborted)
+	}
 
 	memoryPipeline := runtimememorylifecycle.NewPipeline(memMgr, cfg.Memory)
 	deps := runtimeport.NewDependencySet(providers, sessionStore, cfg)

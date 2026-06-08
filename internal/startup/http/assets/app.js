@@ -6,6 +6,7 @@ const pageSubtitle = document.getElementById('page-subtitle');
 const pageName = document.getElementById('page-name');
 const pageTime = document.getElementById('page-time');
 const authToken = new URLSearchParams(window.location.search).get('token') || '';
+const CHAT_HISTORY_PAGE_SIZE = 80;
 
 const appState = {
   inventory: {
@@ -19,6 +20,10 @@ const appState = {
     sessions: [],
     sessionID: '',
     history: [],
+    historyHasMore: false,
+    historyBefore: '',
+    historyLoadingOlder: false,
+    historyTotal: 0,
     pendingEntries: [],
     pendingHistoryBaseline: 0,
     pendingUserText: '',
@@ -195,7 +200,7 @@ async function fetchJSON(url, options = {}) {
 
 async function fetchRunTree(runID) {
   if (!runID) return [];
-  const payload = await fetchJSON(`/api/runs/${encodeURIComponent(runID)}/tree`).catch(() => ({ tree: [] }));
+  const payload = await fetchJSON(`/api/runs/${encodeURIComponent(runID)}/tree?events=0`).catch(() => ({ tree: [] }));
   return Array.isArray(payload.tree) ? payload.tree : [];
 }
 
@@ -1257,6 +1262,10 @@ async function loadChatSessions(agentID, preferredSession = '') {
 
   if (!nextSessionID) {
     appState.chat.history = [];
+    appState.chat.historyHasMore = false;
+    appState.chat.historyBefore = '';
+    appState.chat.historyLoadingOlder = false;
+    appState.chat.historyTotal = 0;
     resetChatPendingState();
     renderChatSessionHead();
     renderChatTranscript(true);
@@ -1279,9 +1288,58 @@ async function createChatSession() {
 }
 
 async function loadChatHistory(agentID, sessionID) {
-  const payload = await fetchJSON(`/api/sessions/${encodeURIComponent(agentID)}/${encodeURIComponent(sessionID)}`);
+  const payload = await fetchJSON(`/api/sessions/${encodeURIComponent(agentID)}/${encodeURIComponent(sessionID)}/events?limit=${CHAT_HISTORY_PAGE_SIZE}`);
   safeStorageSet(`anyai.chat.session.${agentID}`, sessionID);
-  applyChatHistory(payload.session.events || [], true);
+  applyChatHistory(payload.events || [], true, {
+    hasMore: Boolean(payload.has_more),
+    nextBefore: payload.next_before || '',
+    total: Number(payload.total || 0),
+  });
+}
+
+async function loadOlderChatHistory() {
+  const agentID = appState.chat.agentID;
+  const sessionID = appState.chat.sessionID;
+  const before = appState.chat.historyBefore;
+  if (!agentID || !sessionID || !before || !appState.chat.historyHasMore || appState.chat.historyLoadingOlder) return;
+
+  const host = document.getElementById('chat-transcript');
+  const previousScrollHeight = host?.scrollHeight || 0;
+  appState.chat.historyLoadingOlder = true;
+  renderChatTranscript();
+  try {
+    const payload = await fetchJSON(
+      `/api/sessions/${encodeURIComponent(agentID)}/${encodeURIComponent(sessionID)}/events?limit=${CHAT_HISTORY_PAGE_SIZE}&before=${encodeURIComponent(before)}`,
+    );
+    if (appState.chat.agentID !== agentID || appState.chat.sessionID !== sessionID) return;
+    const older = decorateChatHistoryEntries(payload.events || []);
+    const existing = new Set((appState.chat.history || []).map(chatWindowEntryKey).filter(Boolean));
+    appState.chat.history = [
+      ...older.filter((entry) => {
+        const key = chatWindowEntryKey(entry);
+        return !key || !existing.has(key);
+      }),
+      ...appState.chat.history,
+    ];
+    appState.chat.historyHasMore = Boolean(payload.has_more);
+    appState.chat.historyBefore = payload.next_before || '';
+    appState.chat.historyTotal = Number(payload.total || appState.chat.historyTotal || 0);
+    reconcileChatPendingEntriesWithHistory();
+    renderChatSessionHead();
+    renderChatTranscript();
+    renderChatActivity();
+    renderChatTopStats();
+    updateChatSnippet();
+    requestAnimationFrame(() => {
+      if (!host) return;
+      host.scrollTop = Math.max(0, host.scrollHeight - previousScrollHeight);
+    });
+  } catch (error) {
+    showFlash(error.message || '加载历史失败', true);
+  } finally {
+    appState.chat.historyLoadingOlder = false;
+    renderChatTranscript();
+  }
 }
 
 function renderChatAttachments() {
@@ -1426,8 +1484,12 @@ function reconcileChatPendingEntriesWithHistory() {
   }
 }
 
-function applyChatHistory(history, forceBottom = false) {
+function applyChatHistory(history, forceBottom = false, page = {}) {
   appState.chat.history = decorateChatHistoryEntries(history);
+  appState.chat.historyHasMore = Boolean(page.hasMore);
+  appState.chat.historyBefore = String(page.nextBefore || '');
+  appState.chat.historyLoadingOlder = false;
+  appState.chat.historyTotal = Number(page.total || appState.chat.history.length || 0);
   reconcileChatPendingEntriesWithHistory();
   renderChatSessionHead();
   renderChatTranscript(forceBottom);
@@ -1500,6 +1562,7 @@ function renderChatSessions() {
     clearFlash();
     closeChatSource();
     resetChatRuntimeState('idle');
+    resetChatPendingState();
     appState.chat.sessionID = nextSessionID;
     await loadChatHistory(appState.chat.agentID, appState.chat.sessionID);
     renderChatSessions();
@@ -1797,10 +1860,17 @@ function renderChatTranscript(forceBottom = false) {
     return;
   }
 
+  const olderControl = appState.chat.historyHasMore || appState.chat.historyLoadingOlder
+    ? `<div class="chat-history-control"><button id="chat-load-older" class="ghost" ${appState.chat.historyLoadingOlder ? 'disabled' : ''}>${appState.chat.historyLoadingOlder ? '加载中…' : '加载更早'}</button></div>`
+    : '';
   host.innerHTML = [
+    olderControl,
     ...entries.map(renderTranscriptEntry),
     ...liveEntries.map(renderTranscriptEntry),
   ].filter(Boolean).join('');
+  document.getElementById('chat-load-older')?.addEventListener('click', () => {
+    void loadOlderChatHistory();
+  });
   addCopyButtons(host);
   requestAnimationFrame(() => {
     if (forceBottom || wasNearBottom) {
@@ -1828,10 +1898,14 @@ function scheduleChatHistorySync(agentID, sessionID, immediate = false) {
   const delay = immediate ? 0 : 160;
   appState.chat.historySyncTimer = window.setTimeout(async () => {
     try {
-      const payload = await fetchJSON(`/api/sessions/${encodeURIComponent(agentID)}/${encodeURIComponent(sessionID)}`);
+      const payload = await fetchJSON(`/api/sessions/${encodeURIComponent(agentID)}/${encodeURIComponent(sessionID)}/events?limit=${CHAT_HISTORY_PAGE_SIZE}`);
       if (token !== appState.chat.historySyncToken) return;
       if (appState.chat.agentID !== agentID || appState.chat.sessionID !== sessionID) return;
-      applyChatHistory(payload.session.events || []);
+      applyChatHistory(payload.events || [], false, {
+        hasMore: Boolean(payload.has_more),
+        nextBefore: payload.next_before || '',
+        total: Number(payload.total || 0),
+      });
     } catch (error) {
       if (token !== appState.chat.historySyncToken) return;
       console.warn('chat history sync failed', error);

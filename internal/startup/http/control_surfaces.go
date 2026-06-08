@@ -21,12 +21,15 @@ type inventorySurface interface {
 
 type runtimeSurface interface {
 	RebuildEventProjections() error
+	RebuildEventProjectionsFromEvents() error
 	EventStorageDir() string
 }
 
 type runSurface interface {
 	gateway.IngressFacade
 	gateway.ObserveFacade
+	SubscribeRunLive(runID string) (<-chan gateway.Event, func(), error)
+	SubscribeRunTreeLive(runID string) (<-chan gateway.Event, func(), error)
 	CancelRun(runID string) error
 }
 
@@ -36,6 +39,7 @@ type sessionSurface interface {
 	LoadSession(agentID, sessionID string) (gateway.SessionView, error)
 	DeleteSession(agentID, sessionID string) error
 	ListSessionEvents(agentID, sessionID string) []gateway.Event
+	ListSessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage
 	SubscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error)
 }
 

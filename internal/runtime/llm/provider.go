@@ -90,8 +90,8 @@ type ChatRequest struct {
 	Messages     []Message
 	Tools        []ToolDef
 	MaxTokens    int
-	Temperature  float64
 	SystemPrompt string
+	Options      ModelOptions
 }
 
 // Usage tracks token usage.
@@ -121,6 +121,13 @@ type LLMProvider interface {
 	ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 	Compact(ctx context.Context, req CompactRequest) (CompactResponse, error)
 	Models() []ModelInfo
+
+	// DefaultModelOptions returns the family-specific defaults this provider
+	// applies to a given model name. The agent runtime layers these between
+	// the runtime baseline and any user-supplied YAML overrides; provider
+	// implementations of ChatStream/Compact must read req.Options instead of
+	// branching on the model string themselves.
+	DefaultModelOptions(model string) ModelOptions
 }
 
 var (

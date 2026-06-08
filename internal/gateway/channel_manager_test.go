@@ -149,6 +149,10 @@ func (p *mockProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.Com
 	return llm.CompactResponse{Summary: "gateway compact summary"}, nil
 }
 
+func (p *mockProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 type scriptedProvider struct {
 	mu      sync.Mutex
 	streams [][]llm.ChatEvent
@@ -191,6 +195,10 @@ func (p *scriptedProvider) Models() []llm.ModelInfo {
 
 func (p *scriptedProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "gateway scripted compact summary"}, nil
+}
+
+func (p *scriptedProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 type blockingGroupProvider struct {
@@ -246,6 +254,10 @@ func (p *blockingGroupProvider) Models() []llm.ModelInfo {
 
 func (p *blockingGroupProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "gateway blocking compact summary"}, nil
+}
+
+func (p *blockingGroupProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func TestChannelManagerRouting(t *testing.T) {

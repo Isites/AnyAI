@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -362,6 +363,29 @@ func TestRuntimeDoTaskEventPayloadUsesInputOnly(t *testing.T) {
 	assert.False(t, hasLegacyTreeKey)
 	assert.False(t, hasSessionID)
 	assert.Equal(t, "test-agent", queued.AgentID)
+}
+
+func TestStoreCompletionCompactsLargeSummary(t *testing.T) {
+	var events []runtimeevents.EventRecord
+	store := NewStore(WithEventAppender(func(event runtimeevents.EventRecord) {
+		events = append(events, event)
+	}))
+
+	record := store.CreateSpec(Spec{
+		Kind:      KindTool,
+		AgentID:   "agent",
+		RunID:     "run_large",
+		SessionID: "session",
+		ToolName:  "site_profile",
+	})
+	completed, ok := store.Complete(record.ID, Result{Status: StatusCompleted, Summary: strings.Repeat("x", 12*1024)})
+	require.True(t, ok)
+
+	assert.Contains(t, completed.Summary, "content omitted from durable transcript")
+	require.Len(t, events, 2)
+	summary, _ := events[1].Payload["summary"].(string)
+	assert.Contains(t, summary, "content omitted from durable transcript")
+	assert.Less(t, len(summary), 9*1024)
 }
 
 func TestRuntimeDoTaskHeartbeatExtendsTimeout(t *testing.T) {

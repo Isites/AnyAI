@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestServiceRebuildRestoresTraceTaskAndSessionViews(t *testing.T) {
+func TestServiceRebuildFromEventsRestoresTraceTaskAndSessionViews(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
 
@@ -111,7 +111,7 @@ func TestServiceRebuildRestoresTraceTaskAndSessionViews(t *testing.T) {
 		sessionSvc,
 	)
 
-	require.NoError(t, service.Rebuild())
+	require.NoError(t, service.RebuildFromEvents())
 
 	run, ok := service.Run.GetRun("run_1")
 	require.True(t, ok)
@@ -159,4 +159,49 @@ func TestServiceRebuildRestoresTraceTaskAndSessionViews(t *testing.T) {
 	index, err := service.Session.ReadIndex()
 	require.NoError(t, err)
 	require.Len(t, index.Agents["assistant"], 2)
+}
+
+func TestServiceRebuildDoesNotReplayRunEventsIntoSessions(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.List = []config.AgentConfig{{ID: "assistant"}}
+
+	sessionStore := runtimesessions.NewStore(t.TempDir())
+	recorder, err := runtimeevents.NewPersistentRecorder(t.TempDir())
+	require.NoError(t, err)
+	recorder.StartRun(runtimeevents.RunRecord{
+		ID:        "run_1",
+		AgentID:   "assistant",
+		SessionID: "sess_1",
+		Model:     "test/model",
+		Input:     "Investigate",
+		Status:    runtimeevents.RunStatusRunning,
+		StartedAt: time.Now().UTC(),
+	})
+	recorder.AppendEvent(runtimeevents.EventRecord{
+		RunID:     "run_1",
+		AgentID:   "assistant",
+		SessionID: "sess_1",
+		Name:      "tool.completed",
+		Timestamp: time.Now().UTC(),
+		Payload: map[string]any{
+			"id":     "tool_1",
+			"output": "large historical output",
+		},
+	})
+
+	service := NewService(
+		func() *runtimeevents.Recorder { return recorder },
+		func() *task.Store { return task.NewStore() },
+		runtimesessionops.NewService(
+			func() *config.Config { return cfg },
+			func() *runtimesessions.Store { return sessionStore },
+			func() *runtimeevents.Recorder { return recorder },
+		),
+	)
+
+	require.NoError(t, service.Rebuild())
+
+	sess, err := service.Session.Load("assistant", "sess_1")
+	require.NoError(t, err)
+	assert.Empty(t, sess.History())
 }

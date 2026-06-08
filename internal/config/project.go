@@ -26,8 +26,22 @@ type ProjectConfig struct {
 }
 
 type ProjectModelsConfig struct {
-	Default string            `yaml:"default"`
-	Aliases map[string]string `yaml:"aliases"`
+	Default            string                         `yaml:"default"`
+	Aliases            map[string]string              `yaml:"aliases"`
+	DefaultTemperature *float64                       `yaml:"default_temperature,omitempty"`
+	Options            map[string]ProjectModelOptions `yaml:"options,omitempty"`
+}
+
+// ProjectModelOptions is the per-model override surface exposed in anyai.yaml.
+// The map key is the resolved "provider/model" string (matched exactly against
+// agent.Runtime.Model). Unspecified fields fall through to the provider's
+// family defaults; specified fields replace them at request build time.
+type ProjectModelOptions struct {
+	Temperature      *float64 `yaml:"temperature,omitempty"`
+	MaxTokensField   string   `yaml:"max_tokens_field,omitempty"`
+	EnableThinking   *bool    `yaml:"enable_thinking,omitempty"`
+	Stream           *bool    `yaml:"stream,omitempty"`
+	NativeCompaction *bool    `yaml:"native_compaction,omitempty"`
 }
 
 type ProjectProviderConfig struct {

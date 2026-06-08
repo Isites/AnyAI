@@ -24,6 +24,13 @@ func (s *SessionView) Rebuild() error {
 	if s == nil || s.sessions == nil {
 		return nil
 	}
+	return s.sessions.RebuildIndex()
+}
+
+func (s *SessionView) RebuildFromEvents() error {
+	if s == nil || s.sessions == nil {
+		return nil
+	}
 	if err := s.sessions.RebuildFromEvents(); err != nil {
 		return err
 	}
@@ -77,6 +84,13 @@ func (s *SessionView) Events(agentID, sessionID string) []runtimeevents.EventRec
 		return nil
 	}
 	return s.sessions.EventRecords(agentID, sessionID)
+}
+
+func (s *SessionView) EventPage(agentID, sessionID string, req runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage {
+	if s == nil || s.sessions == nil {
+		return runtimeevents.SessionEventPage{}
+	}
+	return s.sessions.EventPage(agentID, sessionID, req)
 }
 
 func (s *SessionView) Subscribe(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error) {

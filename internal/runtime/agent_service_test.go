@@ -41,6 +41,10 @@ func (p *agentServiceMockProvider) Compact(_ context.Context, _ llm.CompactReque
 	return llm.CompactResponse{Summary: "agent service compact summary"}, nil
 }
 
+func (p *agentServiceMockProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func TestAgentServiceRunSyncExecutesAgentRuntime(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Agents.List = []config.AgentConfig{

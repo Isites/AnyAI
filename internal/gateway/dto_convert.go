@@ -195,6 +195,22 @@ func gatewayEvents(events []runtimeevents.EventRecord) []Event {
 	return out
 }
 
+func runtimeSessionEventPageRequest(req SessionEventPageRequest) runtimeevents.SessionEventPageRequest {
+	return runtimeevents.SessionEventPageRequest{
+		Limit:  req.Limit,
+		Before: strings.TrimSpace(req.Before),
+	}
+}
+
+func gatewaySessionEventPage(page runtimeevents.SessionEventPage) SessionEventPage {
+	return SessionEventPage{
+		Events:     gatewayEvents(page.Events),
+		HasMore:    page.HasMore,
+		NextBefore: strings.TrimSpace(page.NextBefore),
+		Total:      page.Total,
+	}
+}
+
 func gatewaySessionSnapshot(snapshot runtimeport.SessionSnapshot) SessionView {
 	return SessionView{
 		AgentID: snapshot.AgentID,

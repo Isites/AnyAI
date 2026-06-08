@@ -139,6 +139,18 @@ type SessionView struct {
 	Events  []Event          `json:"events,omitempty"`
 }
 
+type SessionEventPageRequest struct {
+	Limit  int
+	Before string
+}
+
+type SessionEventPage struct {
+	Events     []Event `json:"events"`
+	HasMore    bool    `json:"has_more"`
+	NextBefore string  `json:"next_before,omitempty"`
+	Total      int     `json:"total"`
+}
+
 type MemoryLayer string
 
 const (

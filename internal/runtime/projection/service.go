@@ -48,3 +48,25 @@ func (s *Service) Rebuild() error {
 	}
 	return nil
 }
+
+func (s *Service) RebuildFromEvents() error {
+	if s == nil {
+		return nil
+	}
+	if s.Run != nil {
+		if err := s.Run.Rebuild(); err != nil {
+			return err
+		}
+	}
+	if s.Session != nil {
+		if err := s.Session.RebuildFromEvents(); err != nil {
+			return err
+		}
+	}
+	if s.Task != nil {
+		if err := s.Task.Rebuild(); err != nil {
+			return err
+		}
+	}
+	return nil
+}

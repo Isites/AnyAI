@@ -137,13 +137,39 @@ func (w *projectWatcher) shouldIgnore(path string) bool {
 	if path == w.rootDir {
 		return false
 	}
-	if strings.HasSuffix(path, string(filepath.Separator)+".git") || strings.Contains(path, string(filepath.Separator)+".git"+string(filepath.Separator)) {
+	if projectWatcherIgnoredPath(path, w.rootDir) {
 		return true
 	}
 	if w.ignoredDir != "" && (path == w.ignoredDir || strings.HasPrefix(path, w.ignoredDir+string(filepath.Separator))) {
 		return true
 	}
 	return false
+}
+
+func projectWatcherIgnoredPath(path, rootDir string) bool {
+	rel, err := filepath.Rel(rootDir, path)
+	if err != nil || rel == "." {
+		return false
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if projectWatcherIgnoredDirName(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectWatcherIgnoredDirName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	switch name {
+	case ".git", ".hg", ".svn", "node_modules", "vendor", ".cache", ".next", ".astro", "dist", "build", "coverage", "tmp", "temp", "anyai":
+		return true
+	default:
+		return name == "artifacts" || strings.HasPrefix(name, "artifacts-") || strings.HasPrefix(name, "workflow-artifacts")
+	}
 }
 
 func cleanAbsPath(path string) string {

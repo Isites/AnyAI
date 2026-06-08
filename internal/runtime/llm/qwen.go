@@ -56,6 +56,13 @@ func (p *QwenProvider) Capabilities() ProviderCapabilities {
 	}
 }
 
+// DefaultModelOptions returns Qwen-family defaults. Qwen has no model-specific
+// quirks today, so the runtime baseline and any user override flow through
+// untouched.
+func (p *QwenProvider) DefaultModelOptions(model string) ModelOptions {
+	return ModelOptions{}
+}
+
 func (p *QwenProvider) Compact(ctx context.Context, req CompactRequest) (CompactResponse, error) {
 	return compactViaChatStream(ctx, p.ChatStream, req)
 }
@@ -204,8 +211,8 @@ func (p *QwenProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan 
 		openaiReq.Tools = tools
 	}
 
-	if req.Temperature > 0 {
-		openaiReq.Temperature = float32(req.Temperature)
+	if req.Options.Temperature != nil {
+		openaiReq.Temperature = float32(*req.Options.Temperature)
 	}
 
 	stream, err := p.client.CreateChatCompletionStream(ctx, openaiReq)

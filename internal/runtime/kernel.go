@@ -326,6 +326,13 @@ func (r *Runtime) RunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	return nil, false
 }
 
+func (r *Runtime) RunTreeSummary(runID string) ([]runtimeevents.RunNode, bool) {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
+		return r.ProjectionService.Run.RunTreeSummary(runID)
+	}
+	return nil, false
+}
+
 func (r *Runtime) RawRunTree(runID string) ([]runtimeevents.RunNode, bool) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Run != nil {
 		return r.ProjectionService.Run.RawRunTree(runID)
@@ -368,6 +375,13 @@ func (r *Runtime) ListSessionEvents(agentID, sessionID string) []runtimeevents.E
 	return nil
 }
 
+func (r *Runtime) ListSessionEventPage(agentID, sessionID string, req runtimeevents.SessionEventPageRequest) runtimeevents.SessionEventPage {
+	if r != nil && r.ProjectionService != nil && r.ProjectionService.Session != nil {
+		return r.ProjectionService.Session.EventPage(agentID, sessionID, req)
+	}
+	return runtimeevents.SessionEventPage{}
+}
+
 func (r *Runtime) SubscribeSession(agentID, sessionID string) (<-chan runtimeevents.EventRecord, func(), error) {
 	if r != nil && r.ProjectionService != nil && r.ProjectionService.Session != nil {
 		return r.ProjectionService.Session.Subscribe(agentID, sessionID)
@@ -399,6 +413,13 @@ func (r *Runtime) SubscribeTask(taskID string) (<-chan runtimeevents.EventRecord
 func (r *Runtime) RebuildEventProjections() error {
 	if r != nil && r.ControlService != nil {
 		return r.ControlService.RebuildProjections()
+	}
+	return nil
+}
+
+func (r *Runtime) RebuildEventProjectionsFromEvents() error {
+	if r != nil && r.ControlService != nil {
+		return r.ControlService.RebuildProjectionsFromEvents()
 	}
 	return nil
 }

@@ -7,9 +7,10 @@ import (
 	"time"
 
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
+	runtimefactory "github.com/Isites/anyai/internal/runtime/factory"
 	"github.com/Isites/anyai/internal/runtime/input"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
-	"github.com/Isites/anyai/internal/runtime/tool"
+	tools "github.com/Isites/anyai/internal/runtime/tool"
 )
 
 type Decision struct {
@@ -74,6 +75,10 @@ func StartIngressRun(ctx context.Context, deps runtimeport.ExecutionDeps, req ru
 	decision := ResolveAgent(deps, req)
 	if strings.TrimSpace(decision.AgentID) == "" {
 		err := noAgentError(req)
+		recordRouteRejected(deps.Recorder, req, decision, err.Error())
+		return nil, err
+	}
+	if _, err := runtimefactory.ResolveAgentRuntime(deps, decision.AgentID); err != nil {
 		recordRouteRejected(deps.Recorder, req, decision, err.Error())
 		return nil, err
 	}

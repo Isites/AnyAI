@@ -93,11 +93,12 @@ func taskResultFromToolResult(result tools.ToolResult) task.Result {
 	if result.Error != "" {
 		status = task.StatusFailed
 	}
+	durable := tools.SanitizeToolResultForTranscript(result)
 	return task.Result{
 		Status:   status,
-		Summary:  result.Output,
-		Error:    result.Error,
-		Metadata: cloneMetadata(result.Metadata),
+		Summary:  durable.Output,
+		Error:    durable.Error,
+		Metadata: cloneMetadata(durable.Metadata),
 		Images:   append([]llm.ImageContent(nil), result.Images...),
 	}
 }

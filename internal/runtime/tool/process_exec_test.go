@@ -37,6 +37,20 @@ func TestRunBashProcessTimeoutKillsBackgroundProcessGroup(t *testing.T) {
 	assertProcessExited(t, filepath.Join(workDir, "bg.pid"))
 }
 
+func TestReadCaptureFileCapsLargeOutput(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "capture-*")
+	require.NoError(t, err)
+	defer file.Close()
+
+	_, err = file.WriteString(strings.Repeat("x", maxProcessOutputBytes+1024))
+	require.NoError(t, err)
+
+	output := readCaptureFile(file)
+
+	assert.Less(t, len(output), maxProcessOutputBytes+512)
+	assert.Contains(t, output, "process output truncated")
+}
+
 func TestRunBashProcessWaitDelayReapsBackgroundProcessGroup(t *testing.T) {
 	workDir := t.TempDir()
 	startedAt := time.Now()

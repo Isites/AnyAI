@@ -137,24 +137,22 @@ func (r *Runtime) appendToolBatchResults(outcomes []tools.ToolCallOutcome) {
 		if outcome.Error != nil && strings.TrimSpace(outcome.Result.Error) == "" && len(outcome.Result.Metadata) == 0 {
 			continue
 		}
+		persistedResult := tools.SanitizeToolResultForTranscript(outcome.Result)
 		entry := session.ToolResultEntryWithMetadata(
 			outcome.Call.ID,
-			outcome.Result.Output,
-			outcome.Result.Error,
-			outcome.Result.Metadata,
+			persistedResult.Output,
+			persistedResult.Error,
+			persistedResult.Metadata,
 			session.ImagePayloads(outcome.Result.Images),
 		)
-		if len(outcome.Result.Images) > 0 {
-			r.Session.AppendWithPersistedEntry(entry, session.ToolResultEntryWithMetadata(
-				outcome.Call.ID,
-				outcome.Result.Output,
-				outcome.Result.Error,
-				outcome.Result.Metadata,
-				session.ImageRefs(outcome.Result.Images),
-			))
-		} else {
-			r.Session.Append(entry)
-		}
+		persisted := session.ToolResultEntryWithMetadata(
+			outcome.Call.ID,
+			persistedResult.Output,
+			persistedResult.Error,
+			persistedResult.Metadata,
+			session.ImageRefs(outcome.Result.Images),
+		)
+		r.Session.AppendWithPersistedEntry(entry, persisted)
 	}
 }
 
@@ -632,15 +630,20 @@ func synthesizeFailedToolTaskRecord(spec tools.ToolCallSpec, result tools.ToolRe
 	if strings.TrimSpace(message) == "" && err != nil {
 		message = err.Error()
 	}
+	durableResult := tools.SanitizeToolResultForTranscript(result)
+	durableError := strings.TrimSpace(durableResult.Error)
+	if durableError == "" {
+		durableError, _ = tools.SanitizeDurableText(message)
+	}
 	return task.Record{
 		ID:          spec.Call.ID,
 		Kind:        task.KindTool,
 		Status:      task.StatusFailed,
 		Input:       string(tools.SanitizeToolInputForTranscript(spec.Call.Name, spec.Call.Input)),
 		ToolName:    spec.Call.Name,
-		Summary:     strings.TrimSpace(result.Output),
-		Error:       strings.TrimSpace(message),
-		Metadata:    cloneToolMetadata(result.Metadata),
+		Summary:     strings.TrimSpace(durableResult.Output),
+		Error:       durableError,
+		Metadata:    cloneToolMetadata(durableResult.Metadata),
 		CreatedAt:   now,
 		StartedAt:   now,
 		UpdatedAt:   now,
@@ -660,15 +663,20 @@ func workflowToolRecord(spec tools.ToolCallSpec, result tools.ToolResult, execEr
 	} else if errText != "" {
 		status = task.StatusFailed
 	}
+	persistedResult := tools.SanitizeToolResultForTranscript(result)
+	durableError := strings.TrimSpace(persistedResult.Error)
+	if durableError == "" {
+		durableError, _ = tools.SanitizeDurableText(errText)
+	}
 	return task.Record{
 		ID:             firstNonEmpty(spec.Call.ID, tools.NewOpaqueID("workflow_tool")),
 		Kind:           task.KindTool,
 		Status:         status,
 		Input:          string(tools.SanitizeToolInputForTranscript(spec.Call.Name, spec.Call.Input)),
 		ToolName:       spec.Call.Name,
-		Summary:        strings.TrimSpace(result.Output),
-		Error:          errText,
-		Metadata:       cloneToolMetadata(result.Metadata),
+		Summary:        strings.TrimSpace(persistedResult.Output),
+		Error:          durableError,
+		Metadata:       cloneToolMetadata(persistedResult.Metadata),
 		CreatedAt:      now,
 		StartedAt:      now,
 		LastActivityAt: now,

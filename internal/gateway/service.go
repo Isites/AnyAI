@@ -20,6 +20,8 @@ type ChannelPort interface {
 	EvaluateMessagePolicy(channelName, dmPolicy string, msg InboundMessage) MessagePolicyDecision
 	ResolveIngressAgent(req IngressRequest) string
 	StartIngressRun(ctx context.Context, req IngressRequest) (*ManagedRun, error)
+	SubscribeRunLive(runID string) (<-chan Event, func(), error)
+	SubscribeRunTreeLive(runID string) (<-chan Event, func(), error)
 	SubscribeRunTreeReplay(runID string) ([]Event, <-chan Event, func(), error)
 	GetRun(runID string) (Run, bool)
 }
@@ -37,7 +39,10 @@ type ObserveFacade interface {
 	ListRunEvents(runID string) []Event
 	GetRunTree(runID string) (RunTree, bool)
 	RunTree(runID string) ([]RunNode, bool)
+	RunTreeSummary(runID string) ([]RunNode, bool)
+	SubscribeRunLive(runID string) (<-chan Event, func(), error)
 	SubscribeRunReplay(runID string) ([]Event, <-chan Event, func(), error)
+	SubscribeRunTreeLive(runID string) (<-chan Event, func(), error)
 	SubscribeRunTreeReplay(runID string) ([]Event, <-chan Event, func(), error)
 }
 
@@ -48,6 +53,7 @@ type ControlFacade interface {
 	CreateSession(agentID, requestedKey, prefix string) (string, error)
 	DeleteSession(agentID, sessionID string) error
 	RebuildEventProjections() error
+	RebuildEventProjectionsFromEvents() error
 }
 
 // Service is the isolated gateway layer that exposes runtime abilities,

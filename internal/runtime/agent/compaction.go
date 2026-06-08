@@ -27,6 +27,7 @@ Requirements:
 - Preserve concrete technical breadcrumbs that still matter: file paths, commands, error messages, tool outputs, and artifacts.
 - List unresolved issues, risks, and the next recommended steps.
 - The most recent turns will remain in the transcript separately, so avoid repeating them unless they are essential for continuity.
+- You must return a non-empty markdown summary. If the transcript is sparse, state the known goal, known facts, and next step. Never return an empty response.
 - Write short markdown sections with compact bullet points.`
 	defaultCompactionTriggerMode          = "token_estimate"
 	defaultCompactionEntryThreshold       = 96
@@ -158,9 +159,8 @@ func (r *Runtime) shouldCompactSession(history []session.SessionEntry) (compacti
 		threshold = cfg.EntryThreshold
 		shouldCompact = threshold > 0 && len(history) > threshold
 	default:
-		msgs := prepareTranscript(assembleMessages(history), r.transcriptPolicy()).Messages
 		threshold = cfg.TokenThreshold
-		shouldCompact = threshold > 0 && approxTranscriptTokens(msgs, "") > threshold
+		shouldCompact = threshold > 0 && estimateHistoryTokens(history) > threshold
 	}
 	if !shouldCompact {
 		return compactionDecision{}, false
@@ -276,6 +276,20 @@ func approxTranscriptTokens(msgs []llm.Message, systemPrompt string) int {
 	return approx
 }
 
+func estimateHistoryTokens(history []session.SessionEntry) int {
+	totalChars := 0
+	for _, entry := range history {
+		totalChars += len(entry.Type)
+		totalChars += len(entry.Role)
+		totalChars += len(entry.Data)
+	}
+	approx := totalChars / 4
+	if approx <= 0 {
+		return 1
+	}
+	return approx
+}
+
 func (r *Runtime) generateCompactionSummary(ctx context.Context, olderHistory []session.SessionEntry, maxTokens int) (llm.CompactResponse, error) {
 	if len(olderHistory) == 0 {
 		return llm.CompactResponse{}, nil
@@ -285,19 +299,23 @@ func (r *Runtime) generateCompactionSummary(ctx context.Context, olderHistory []
 	if maxTokens <= 0 {
 		maxTokens = defaultCompactionSummaryMaxTokens
 	}
+	baseUserPrompt := compactionUserPrompt
 	req := llm.CompactRequest{
 		Model:        r.Model,
 		Messages:     msgs,
 		MaxTokens:    maxTokens,
-		Temperature:  0.01,
 		SystemPrompt: compactionSystemPrompt,
-		UserPrompt:   compactionUserPrompt,
+		UserPrompt:   baseUserPrompt,
+		Options:      r.ModelOptions,
 	}
 	maxAttempts := defaultCompactionMaxAttempts
 	backoff := r.llmRetryBackoff()
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 && lastErr != nil {
+			req.UserPrompt = baseUserPrompt + "\n\nRetry instruction: the previous compaction attempt failed or returned an empty summary (" + lastErr.Error() + "). Return a non-empty markdown handoff summary now. Do not return an empty response."
+		}
 		resp, err := llm.CompactWithProvider(ctx, r.LLM, req)
 		if err == nil {
 			result := strings.TrimSpace(resp.Summary)

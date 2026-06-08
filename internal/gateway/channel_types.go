@@ -104,6 +104,13 @@ type RunEventAware interface {
 	HandleRunEvent(ctx context.Context, event RunEvent) error
 }
 
+// RunTreeReplayAware lets event-aware channels choose live-only tree events.
+// Long-lived local UIs usually render persisted session history separately and
+// should not replay large historical tool outputs into memory on every run.
+type RunTreeReplayAware interface {
+	WantsRunTreeReplay() bool
+}
+
 // FinalResponseAware lets event-driven channels opt out of the separate
 // terminal Send call when they render conversation state from replay.
 type FinalResponseAware interface {

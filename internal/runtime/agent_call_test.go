@@ -223,6 +223,10 @@ func (p *readThenSummarizeProvider) Compact(_ context.Context, _ llm.CompactRequ
 	return llm.CompactResponse{Summary: "compact summary"}, nil
 }
 
+func (p *readThenSummarizeProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func requestHasToolResult(messages []llm.Message) bool {
 	for _, message := range messages {
 		if strings.TrimSpace(message.ToolCallID) != "" {
@@ -267,6 +271,10 @@ func (p *delayedProvider) Models() []llm.ModelInfo {
 
 func (p *delayedProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "delayed compact summary"}, nil
+}
+
+func (p *delayedProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func newAgentCallTestRuntime(t *testing.T, provider llm.LLMProvider) (*Runtime, *task.Store) {

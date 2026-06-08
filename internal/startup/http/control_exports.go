@@ -19,8 +19,11 @@ func (p *ControlPlane) CatalogPayload() any          { return p.catalog() }
 func (p *ControlPlane) CatalogEndpointsPayload() any { return p.catalog().Endpoints }
 func (p *ControlPlane) OverviewPayload() any         { return p.overview() }
 func (p *ControlPlane) RebuildProjections() error    { return p.rebuildProjections() }
-func (p *ControlPlane) RunList() []gateway.Run       { return p.listRuns() }
-func (p *ControlPlane) EventStorageDir() string      { return p.eventStorageDir() }
+func (p *ControlPlane) RebuildProjectionsFromEvents() error {
+	return p.rebuildProjectionsFromEvents()
+}
+func (p *ControlPlane) RunList() []gateway.Run  { return p.listRuns() }
+func (p *ControlPlane) EventStorageDir() string { return p.eventStorageDir() }
 func (p *ControlPlane) AttachmentBaseDir() string {
 	return runtimeinput.ProjectAssetsDir(p.config())
 }
@@ -117,6 +120,12 @@ func (p *ControlPlane) SubscribeRunReplay(runID string) ([]gateway.Event, <-chan
 	}
 	return p.run.SubscribeRunReplay(runID)
 }
+func (p *ControlPlane) SubscribeRunLive(runID string) (<-chan gateway.Event, func(), error) {
+	if p == nil || p.run == nil {
+		return nil, nil, fmt.Errorf("runtime not available")
+	}
+	return p.run.SubscribeRunLive(runID)
+}
 func (p *ControlPlane) CancelRun(runID string) error {
 	if p == nil || p.run == nil {
 		return fmt.Errorf("runtime not available")
@@ -142,6 +151,9 @@ func (p *ControlPlane) SessionLoad(agentID, sessionID string) (gateway.SessionVi
 func (p *ControlPlane) SessionEvents(agentID, sessionID string) []gateway.Event {
 	return p.listSessionEvents(agentID, sessionID)
 }
+func (p *ControlPlane) SessionEventPage(agentID, sessionID string, req gateway.SessionEventPageRequest) gateway.SessionEventPage {
+	return p.listSessionEventPage(agentID, sessionID, req)
+}
 func (p *ControlPlane) SubscribeSession(agentID, sessionID string) (<-chan gateway.Event, func(), error) {
 	return p.subscribeSession(agentID, sessionID)
 }
@@ -158,11 +170,20 @@ func (p *ControlPlane) RunTreeRecord(runID string) (gateway.RunTree, bool) {
 func (p *ControlPlane) RunTree(runID string) ([]gateway.RunNode, bool) {
 	return p.runTree(runID)
 }
+func (p *ControlPlane) RunTreeSummary(runID string) ([]gateway.RunNode, bool) {
+	return p.runTreeSummary(runID)
+}
 func (p *ControlPlane) SubscribeRunTreeReplay(runID string) ([]gateway.Event, <-chan gateway.Event, func(), error) {
 	if p == nil || p.run == nil {
 		return nil, nil, nil, fmt.Errorf("runtime not available")
 	}
 	return p.run.SubscribeRunTreeReplay(runID)
+}
+func (p *ControlPlane) SubscribeRunTreeLive(runID string) (<-chan gateway.Event, func(), error) {
+	if p == nil || p.run == nil {
+		return nil, nil, fmt.Errorf("runtime not available")
+	}
+	return p.run.SubscribeRunTreeLive(runID)
 }
 
 func (p *ControlPlane) ListJobs() []gateway.Job {

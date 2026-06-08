@@ -11,10 +11,11 @@ import (
 )
 
 type stubChannelPort struct {
-	snapshot     []Event
-	live         <-chan Event
-	runs         map[string]Run
-	cancelCalled bool
+	snapshot                     []Event
+	live                         <-chan Event
+	runs                         map[string]Run
+	cancelCalled                 bool
+	subscribeRunTreeReplayCalled bool
 }
 
 func (*stubChannelPort) channelPort() {}
@@ -32,8 +33,17 @@ func (*stubChannelPort) StartIngressRun(context.Context, IngressRequest) (*Manag
 }
 
 func (s *stubChannelPort) SubscribeRunTreeReplay(string) ([]Event, <-chan Event, func(), error) {
+	s.subscribeRunTreeReplayCalled = true
 	snapshot := append([]Event(nil), s.snapshot...)
 	return snapshot, s.live, func() { s.cancelCalled = true }, nil
+}
+
+func (s *stubChannelPort) SubscribeRunLive(string) (<-chan Event, func(), error) {
+	return s.live, func() { s.cancelCalled = true }, nil
+}
+
+func (s *stubChannelPort) SubscribeRunTreeLive(string) (<-chan Event, func(), error) {
+	return s.live, func() { s.cancelCalled = true }, nil
 }
 
 func (s *stubChannelPort) GetRun(runID string) (Run, bool) {
@@ -116,6 +126,28 @@ func TestDispatcherForwardRunTreeReplaysSnapshotBeforeLiveEvents(t *testing.T) {
 		assert.Equal(t, "run_root::worker", event.RunNodeID)
 		assert.Equal(t, "run_root::lead", event.ParentRunNodeID)
 	}
+}
+
+type runTreeReplayOptOutChannel struct {
+	*mockChannel
+}
+
+func (c *runTreeReplayOptOutChannel) WantsRunTreeReplay() bool {
+	return false
+}
+
+func TestDispatcherForwardRunTreeSkipsReplayWhenChannelOptsOut(t *testing.T) {
+	port := &stubChannelPort{}
+	dispatch := newDispatcher(port, "respond")
+	mock := &runTreeReplayOptOutChannel{mockChannel: newMockChannel("cli")}
+
+	done := dispatch.forwardRunTree(context.Background(), mock, &ManagedRun{
+		RunID:   "run_root",
+		AgentID: "lead",
+	})
+
+	require.Nil(t, done)
+	assert.False(t, port.subscribeRunTreeReplayCalled)
 }
 
 func TestChannelResponseBufferUsesOnlyPostToolAssistantText(t *testing.T) {

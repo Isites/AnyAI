@@ -2,9 +2,13 @@ package contract
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
+
+const DurableTextPreviewLimit = 8 * 1024
 
 var (
 	sensitiveInlinePatterns = []struct {
@@ -66,8 +70,9 @@ func SanitizeText(text string) string {
 	authorizationRE := regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,\n\r"'` + "`" + `}]{4,}`)
 	out = authorizationRE.ReplaceAllString(out, `${1}[REDACTED]`)
 	for _, key := range []string{"api_key", "api-key", "access_token", "auth_token", "refresh_token", "token", "secret", "password"} {
-		re := regexp.MustCompile(`(?i)(` + regexp.QuoteMeta(key) + `\s*[:=]\s*)(?:"[^"]{4,}"|'[^']{4,}'|[^,\s"'` + "`" + `}]{4,})`)
-		out = re.ReplaceAllString(out, `${1}[REDACTED]`)
+		keyPattern := `(?:"|')?` + regexp.QuoteMeta(key) + `(?:"|')?`
+		re := regexp.MustCompile(`(?i)(` + keyPattern + `\s*[:=]\s*)(?:"[^"]{4,}"|'[^']{4,}'|[^,\s"'` + "`" + `}]{4,})`)
+		out = re.ReplaceAllString(out, `${1}"[REDACTED]"`)
 	}
 	for _, pattern := range sensitiveInlinePatterns {
 		out = pattern.re.ReplaceAllString(out, pattern.repl)
@@ -87,6 +92,70 @@ func SanitizeMetadata(metadata map[string]any) map[string]any {
 	return metadata
 }
 
+// SanitizeDurableText redacts secrets and caps text that will be written to
+// durable state such as session history, task records, and event logs.
+func SanitizeDurableText(text string) (string, bool) {
+	if len(text) > DurableTextPreviewLimit {
+		return summarizeLargeDurableText(text)
+	}
+	sanitized := SanitizeText(text)
+	return summarizeDurableText(sanitized, len(text))
+}
+
+// SanitizeDurableMetadata recursively redacts and caps metadata strings before
+// they are retained in durable runtime state.
+func SanitizeDurableMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return metadata
+	}
+	sanitized := SanitizeDurableValue(metadata)
+	if out, ok := sanitized.(map[string]any); ok {
+		return out
+	}
+	return metadata
+}
+
+// SanitizeDurablePayload recursively redacts and caps arbitrary event payloads.
+func SanitizeDurablePayload(payload map[string]any) map[string]any {
+	if len(payload) == 0 {
+		return payload
+	}
+	sanitized := SanitizeDurableValue(payload)
+	if out, ok := sanitized.(map[string]any); ok {
+		return out
+	}
+	return payload
+}
+
+// SanitizeDurableRawJSON redacts and caps strings inside structured JSON. If
+// the input is not valid JSON, it is preserved as a JSON string preview.
+func SanitizeDurableRawJSON(raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return raw
+	}
+
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err == nil {
+		sanitized := SanitizeDurableValue(decoded)
+		if out, err := json.Marshal(sanitized); err == nil {
+			return out
+		}
+	}
+
+	sanitized, _ := SanitizeDurableText(trimmed)
+	out, err := json.Marshal(sanitized)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return json.RawMessage(out)
+}
+
+// SanitizeDurableValue recursively redacts secrets and caps large strings.
+func SanitizeDurableValue(value any) any {
+	return sanitizeDurableAny(value)
+}
+
 // SanitizeRawJSON redacts obvious credentials from structured JSON payloads.
 func SanitizeRawJSON(raw json.RawMessage) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
@@ -103,4 +172,98 @@ func SanitizeRawJSON(raw json.RawMessage) json.RawMessage {
 	}
 
 	return json.RawMessage(SanitizeText(trimmed))
+}
+
+func summarizeDurableAny(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, inner := range v {
+			out[key] = summarizeDurableAny(inner)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = summarizeDurableAny(v[i])
+		}
+		return out
+	case json.RawMessage:
+		return SanitizeDurableRawJSON(v)
+	case []byte:
+		sanitized, _ := SanitizeDurableText(string(v))
+		return sanitized
+	case string:
+		sanitized, _ := summarizeDurableText(v, len(v))
+		return sanitized
+	default:
+		return value
+	}
+}
+
+func sanitizeDurableAny(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, inner := range v {
+			if isSensitiveKey(key) {
+				if s, ok := inner.(string); ok && strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "bearer ") {
+					out[key] = "Bearer [REDACTED]"
+				} else {
+					out[key] = "[REDACTED]"
+				}
+				continue
+			}
+			out[key] = sanitizeDurableAny(inner)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = sanitizeDurableAny(v[i])
+		}
+		return out
+	case json.RawMessage:
+		return SanitizeDurableRawJSON(v)
+	case []byte:
+		sanitized, _ := SanitizeDurableText(string(v))
+		return sanitized
+	case string:
+		sanitized, _ := SanitizeDurableText(v)
+		return sanitized
+	default:
+		return value
+	}
+}
+
+func summarizeDurableText(value string, originalBytes int) (string, bool) {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	if len(value) <= DurableTextPreviewLimit {
+		return value, false
+	}
+	preview := value[:DurableTextPreviewLimit]
+	for len(preview) > 0 && !utf8.ValidString(preview) {
+		preview = preview[:len(preview)-1]
+	}
+	if idx := strings.LastIndex(preview, "\n"); idx > DurableTextPreviewLimit/2 {
+		preview = preview[:idx]
+	}
+	if originalBytes <= 0 {
+		originalBytes = len(value)
+	}
+	return fmt.Sprintf("%s\n[content omitted from durable transcript; %d bytes total]", preview, originalBytes), true
+}
+
+func summarizeLargeDurableText(value string) (string, bool) {
+	originalBytes := len(value)
+	preview := value[:DurableTextPreviewLimit]
+	for len(preview) > 0 && !utf8.ValidString(preview) {
+		preview = preview[:len(preview)-1]
+	}
+	preview = strings.ReplaceAll(preview, "\r\n", "\n")
+	if idx := strings.LastIndex(preview, "\n"); idx > DurableTextPreviewLimit/2 {
+		preview = preview[:idx]
+	}
+	preview = SanitizeText(preview)
+	return fmt.Sprintf("%s\n[content omitted from durable transcript; %d bytes total]", preview, originalBytes), true
 }

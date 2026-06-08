@@ -65,6 +65,10 @@ func (m *mockLLMProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.
 	return llm.CompactResponse{Summary: "mock compact summary"}, nil
 }
 
+func (m *mockLLMProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 type capturingLLMProvider struct {
 	events []llm.ChatEvent
 
@@ -136,6 +140,10 @@ func (m *capturingLLMProvider) Compact(ctx context.Context, req llm.CompactReque
 		Summary:  summary,
 		Strategy: llm.CompactStrategyChatFallback,
 	}, nil
+}
+
+func (m *capturingLLMProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (m *capturingLLMProvider) Requests() []llm.ChatRequest {
@@ -212,6 +220,10 @@ func (m *scriptedLLMProvider) Models() []llm.ModelInfo {
 
 func (m *scriptedLLMProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "scripted compact summary"}, nil
+}
+
+func (m *scriptedLLMProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (m *scriptedLLMProvider) Requests() []llm.ChatRequest {
@@ -382,6 +394,8 @@ func TestBuildDefaultIdentityToolSpecific(t *testing.T) {
 	result := buildCapabilitySection([]string{"read_file", "web_search", "web_fetch"})
 	assert.Contains(t, result, "Available tools in this run:")
 	assert.Contains(t, result, "`read_file`")
+	assert.Contains(t, result, "line_start/line_count")
+	assert.Contains(t, result, "offset/limit/max_bytes")
 	assert.Contains(t, result, "`web_search`")
 	assert.Contains(t, result, "`web_fetch`")
 	assert.NotContains(t, result, "`bash`")
@@ -410,6 +424,8 @@ func TestBuildCapabilitySectionGuidesFailureRecoveryAndPathHandling(t *testing.T
 	assert.Contains(t, contract, "relative paths resolve from your agent workspace")
 	assert.Contains(t, contract, "Python script")
 	assert.Contains(t, result, "not directory listings")
+	assert.Contains(t, result, "query with context_lines")
+	assert.Contains(t, result, "next_offset")
 	assert.Contains(t, result, "If an image is already attached")
 	assert.Contains(t, result, "inspect that image directly")
 	assert.Contains(t, result, "manageable chunks")
@@ -755,6 +771,29 @@ func TestPruneToolResultsNewlineBoundary(t *testing.T) {
 	// The truncated content (before the suffix) should end at a newline boundary
 	suffixIdx := strings.Index(truncated, "\n\n[output truncated")
 	assert.Greater(t, suffixIdx, 0, "should contain truncation suffix")
+}
+
+func TestModelContextHistoryKeepsSummaryAndRecentWindow(t *testing.T) {
+	var history []session.SessionEntry
+	history = append(history, session.CompactionEntry(session.CompactionData{
+		Text:    "important older summary",
+		Trigger: "token_estimate",
+	}))
+	for i := 0; i < 120; i++ {
+		history = append(history, session.UserMessageEntry(fmt.Sprintf("request %03d %s", i, strings.Repeat("x", 4096))))
+		history = append(history, session.AssistantMessageEntry(fmt.Sprintf("answer %03d", i)))
+	}
+
+	window := modelContextHistory(history)
+	require.NotEmpty(t, window)
+	assert.Equal(t, session.EntryTypeCompaction, window[0].Type)
+	assert.LessOrEqual(t, len(window), maxModelContextRecentEntries+1)
+	assert.LessOrEqual(t, entriesByteSize(window), maxModelContextBytes+16*1024)
+
+	joined := strings.Join(historyEntryTexts(t, window), "\n")
+	assert.Contains(t, joined, "important older summary")
+	assert.Contains(t, joined, "request 119")
+	assert.NotContains(t, joined, "request 000")
 }
 
 // --- Runtime tests ---
@@ -3859,6 +3898,10 @@ func TestRuntimeRunCompactionRetriesOnceAfterProviderFailure(t *testing.T) {
 
 	compactRequests := provider.CompactRequests()
 	require.Len(t, compactRequests, 2)
+	assert.Contains(t, compactRequests[0].UserPrompt, "Never return an empty response.")
+	assert.NotContains(t, compactRequests[0].UserPrompt, "Retry instruction:")
+	assert.Contains(t, compactRequests[1].UserPrompt, "Retry instruction:")
+	assert.Contains(t, compactRequests[1].UserPrompt, "Return a non-empty markdown handoff summary now.")
 
 	history := sess.History()
 	require.NotEmpty(t, history)
@@ -4035,6 +4078,10 @@ func (m *statefulMockLLMProvider) Models() []llm.ModelInfo {
 
 func (m *statefulMockLLMProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "stateful compact summary"}, nil
+}
+
+func (m *statefulMockLLMProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (m *statefulMockLLMProvider) Requests() []llm.ChatRequest {
@@ -4351,6 +4398,24 @@ func mustLastToolResultData(t *testing.T, history []session.SessionEntry) sessio
 	}
 	t.Fatalf("expected at least one tool result entry")
 	return session.ToolResultData{}
+}
+
+func historyEntryTexts(t *testing.T, history []session.SessionEntry) []string {
+	t.Helper()
+	out := make([]string, 0, len(history))
+	for _, entry := range history {
+		switch entry.Type {
+		case session.EntryTypeMessage, session.EntryTypeMeta:
+			var data session.MessageData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			out = append(out, data.Text)
+		case session.EntryTypeCompaction:
+			var data session.CompactionData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			out = append(out, data.Text)
+		}
+	}
+	return out
 }
 
 func mustToolResultDataForCall(t *testing.T, history []session.SessionEntry, toolCallID string) session.ToolResultData {

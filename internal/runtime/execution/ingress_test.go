@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/Isites/anyai/internal/config"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	"github.com/Isites/anyai/internal/runtime/input"
+	"github.com/Isites/anyai/internal/runtime/llm"
 	runtimeport "github.com/Isites/anyai/internal/runtime/runtimeport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -118,4 +120,45 @@ func TestRecordRouteDecisionEmitsAcceptedThenRouted(t *testing.T) {
 	run, ok := recorder.GetRun("run_route")
 	require.True(t, ok)
 	assert.Equal(t, runtimeevents.RunStatusQueued, run.Status)
+}
+
+func TestStartIngressRunRejectsMissingRequestedAgentAsFailedRun(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ProjectRoot = t.TempDir()
+	cfg.Agents.List = []config.AgentConfig{
+		{ID: "entry", Name: "Entry", Model: "test/mock-model", Workspace: t.TempDir(), Entry: true},
+	}
+	recorder := runtimeevents.NewRecorder()
+
+	run, err := StartIngressRun(context.Background(), runtimeport.ExecutionDeps{
+		Config: cfg,
+		Providers: map[string]llm.LLMProvider{
+			"test": &capturingProvider{response: "unused"},
+		},
+		Recorder: recorder,
+	}, runtimeport.IngressRequest{
+		RunID:       "run_missing_agent",
+		SessionID:   "sess_missing_agent",
+		Channel:     "http",
+		SenderID:    "http",
+		AccountID:   "http",
+		ChatType:    runtimeport.ChatTypeDirect,
+		RequestedID: "missing-agent",
+		Text:        "hello",
+	})
+	require.Error(t, err)
+	require.Nil(t, run)
+	assert.Contains(t, err.Error(), `agent "missing-agent" not found`)
+
+	record, ok := recorder.GetRun("run_missing_agent")
+	require.True(t, ok)
+	assert.Equal(t, runtimeevents.RunStatusFailed, record.Status)
+	assert.Equal(t, "missing-agent", record.AgentID)
+	assert.Contains(t, record.Error, `agent "missing-agent" not found`)
+
+	events := recorder.ListRunEvents("run_missing_agent")
+	require.Len(t, events, 1)
+	assert.Equal(t, runtimeevents.EventRunRouteRejected, events[0].Name)
+	assert.Equal(t, "missing-agent", events[0].Payload["requested_agent_id"])
+	assert.Equal(t, `agent "missing-agent" not found`, events[0].Payload["error"])
 }

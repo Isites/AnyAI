@@ -46,6 +46,10 @@ func (p *mockProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.Com
 	return llm.CompactResponse{Summary: "runtime compact summary"}, nil
 }
 
+func (p *mockProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
+}
+
 func TestRuntimeStartTextRunUsesGatewayExecutionPath(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.ProjectRoot = t.TempDir()

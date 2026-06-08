@@ -148,6 +148,7 @@ func BuildAgentRuntimeFromDeps(
 		AgentID:            agentCfg.ID,
 		AgentName:          agentCfg.Name,
 		Model:              resolved.ModelName,
+		ModelOptions:       resolveModelOptions(deps.Config, resolved.Provider, resolved.ModelName, agentCfg.Model),
 		Workspace:          agentCfg.Workspace,
 		ProjectRoot:        runtimeProjectRoot(deps.Config),
 		AgentDefinitionDir: runtimeAgentDefinitionDir(deps.Config, agentCfg),
@@ -212,6 +213,45 @@ func BuildAgentRuntimeFromDeps(
 		}
 	}
 	return rt, nil
+}
+
+// defaultRuntimeTemperature is the agent runtime's baseline sampling
+// temperature when neither the project's models.default_temperature nor any
+// per-model override applies. Provider family defaults can still force-omit
+// it on the wire (e.g. OpenAI reasoning models).
+const defaultRuntimeTemperature = 0.2
+
+// resolveModelOptions collapses three layers — runtime baseline, provider
+// family defaults, and user YAML override — into a single ModelOptions value
+// stored on the agent.Runtime. ChatStream / Compact never re-resolves; they
+// just read req.Options.
+func resolveModelOptions(cfg *config.Config, provider llm.LLMProvider, modelName, modelKey string) llm.ModelOptions {
+	temp := defaultRuntimeTemperature
+	if cfg != nil && cfg.Models.DefaultTemperature != nil {
+		temp = *cfg.Models.DefaultTemperature
+	}
+	opts := llm.ModelOptions{Temperature: &temp}
+
+	if provider != nil {
+		opts = llm.MergeModelOptions(opts, provider.DefaultModelOptions(modelName))
+	}
+
+	if cfg != nil {
+		if userOpts, ok := cfg.Models.Options[modelKey]; ok {
+			opts = llm.MergeModelOptions(opts, modelOptionsFromConfig(userOpts))
+		}
+	}
+	return opts
+}
+
+func modelOptionsFromConfig(o config.ModelOptionsConfig) llm.ModelOptions {
+	return llm.ModelOptions{
+		Temperature:      o.Temperature,
+		MaxTokensField:   o.MaxTokensField,
+		EnableThinking:   o.EnableThinking,
+		Stream:           o.Stream,
+		NativeCompaction: o.NativeCompaction,
+	}
 }
 
 func eventAppenderFromRecorder(recorder runtimeport.EventAppender) func(runtimeevents.EventRecord) {

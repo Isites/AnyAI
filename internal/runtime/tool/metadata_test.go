@@ -111,3 +111,12 @@ func TestRecoveryHintsWriteFileMalformedInputSuggestsProcessFallback(t *testing.
 	assert.Contains(t, joined, "expected_offset")
 	assert.Contains(t, joined, "mode=patch")
 }
+
+func TestRecoveryHintsReadFileValidationSuggestsFocusedReads(t *testing.T) {
+	moves := RecoveryHints("read_file", "validation_error", "query cannot be combined with offset/limit")
+	joined := strings.Join(moves, "\n")
+
+	assert.Contains(t, joined, "line_start")
+	assert.Contains(t, joined, "context_lines")
+	assert.Contains(t, joined, "next_offset")
+}

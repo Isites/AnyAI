@@ -180,24 +180,22 @@ func appendRuntimePlanToolResult(sess *session.Session, toolCallID string, resul
 	if sess == nil {
 		return
 	}
+	persistedResult := tools.SanitizeToolResultForTranscript(result)
 	entry := session.ToolResultEntryWithMetadata(
 		toolCallID,
-		result.Output,
-		result.Error,
-		result.Metadata,
+		persistedResult.Output,
+		persistedResult.Error,
+		persistedResult.Metadata,
 		session.ImagePayloads(result.Images),
 	)
-	if len(result.Images) > 0 {
-		sess.AppendWithPersistedEntry(entry, session.ToolResultEntryWithMetadata(
-			toolCallID,
-			result.Output,
-			result.Error,
-			result.Metadata,
-			session.ImageRefs(result.Images),
-		))
-	} else {
-		sess.Append(entry)
-	}
+	persisted := session.ToolResultEntryWithMetadata(
+		toolCallID,
+		persistedResult.Output,
+		persistedResult.Error,
+		persistedResult.Metadata,
+		session.ImageRefs(result.Images),
+	)
+	sess.AppendWithPersistedEntry(entry, persisted)
 }
 
 func planActionAutoExecutable(step *runtimeplan.Step) bool {

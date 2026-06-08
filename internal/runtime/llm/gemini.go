@@ -54,6 +54,13 @@ func (p *GeminiProvider) Capabilities() ProviderCapabilities {
 	}
 }
 
+// DefaultModelOptions returns Gemini-family defaults. Gemini has no
+// model-specific quirks today; the runtime baseline and any user override
+// flow through untouched.
+func (p *GeminiProvider) DefaultModelOptions(model string) ModelOptions {
+	return ModelOptions{}
+}
+
 func (p *GeminiProvider) Compact(ctx context.Context, req CompactRequest) (CompactResponse, error) {
 	return compactViaChatStream(ctx, p.ChatStream, req)
 }
@@ -181,8 +188,8 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req ChatRequest) (<-cha
 		config.MaxOutputTokens = int32(req.MaxTokens)
 	}
 
-	if req.Temperature > 0 {
-		temp := float32(req.Temperature)
+	if req.Options.Temperature != nil {
+		temp := float32(*req.Options.Temperature)
 		config.Temperature = &temp
 	}
 

@@ -39,9 +39,9 @@ type CompactRequest struct {
 	Model        string
 	Messages     []Message
 	MaxTokens    int
-	Temperature  float64
 	SystemPrompt string
 	UserPrompt   string
+	Options      ModelOptions
 }
 
 // CompactResponse contains the provider-authored compaction summary.
@@ -90,8 +90,8 @@ func compactViaChatStream(
 		Model:        req.Model,
 		Messages:     msgs,
 		MaxTokens:    req.MaxTokens,
-		Temperature:  req.Temperature,
 		SystemPrompt: req.SystemPrompt,
+		Options:      req.Options,
 	})
 	if err != nil {
 		return CompactResponse{}, err

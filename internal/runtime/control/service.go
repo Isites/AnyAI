@@ -58,6 +58,19 @@ func (s *Service) RebuildProjections() error {
 	return nil
 }
 
+func (s *Service) RebuildProjectionsFromEvents() error {
+	if s == nil || s.projections == nil {
+		return nil
+	}
+	if err := s.projections.RebuildFromEvents(); err != nil {
+		return err
+	}
+	s.recordSystemEvent("control", "runtime.projections.rebuilt", map[string]any{
+		"mode": "from_events",
+	}, "projections rebuilt from event logs", "")
+	return nil
+}
+
 func (s *Service) CompactSession(agentID, sessionID string, keepEntries int) error {
 	if s != nil && s.compactor != nil {
 		return s.compactor.CompactSession(agentID, sessionID, keepEntries)

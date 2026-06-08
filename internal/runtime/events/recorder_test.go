@@ -2,7 +2,9 @@ package runtimeevents
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +89,61 @@ func TestRecorderLifecycleEventsUpdateRunReadModel(t *testing.T) {
 	assert.Equal(t, completedAt, run.CompletedAt)
 }
 
+func TestPersistentRecorderAbortActiveRunsMarksRestartInterruptedRuns(t *testing.T) {
+	dir := t.TempDir()
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	recorder.StartRun(RunRecord{
+		ID:        "run_queued",
+		AgentID:   "assistant",
+		SessionID: "sess_queued",
+		Status:    RunStatusQueued,
+	})
+	recorder.StartRun(RunRecord{
+		ID:        "run_running",
+		AgentID:   "assistant",
+		SessionID: "sess_running",
+		Status:    RunStatusRunning,
+		StartedAt: time.Now().UTC().Add(-time.Minute),
+	})
+	recorder.StartRun(RunRecord{
+		ID:        "run_completed",
+		AgentID:   "assistant",
+		SessionID: "sess_completed",
+		Status:    RunStatusCompleted,
+	})
+
+	aborted := recorder.AbortActiveRuns("runtime restarted")
+	require.Equal(t, 2, aborted)
+
+	for _, runID := range []string{"run_queued", "run_running"} {
+		run, ok := recorder.GetRun(runID)
+		require.True(t, ok)
+		assert.Equal(t, RunStatusAborted, run.Status)
+		assert.Equal(t, "runtime restarted", run.Error)
+		assert.False(t, run.CompletedAt.IsZero())
+
+		events := recorder.ListRunEvents(runID)
+		require.Len(t, events, 1)
+		assert.Equal(t, EventRunAborted, events[0].Name)
+		assert.Equal(t, "runtime restarted", events[0].Payload["message"])
+		assert.Equal(t, "runtime_restart", events[0].Payload["reason"])
+	}
+
+	run, ok := recorder.GetRun("run_completed")
+	require.True(t, ok)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Empty(t, recorder.ListRunEvents("run_completed"))
+
+	restored, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+	restoredRun, ok := restored.GetRun("run_running")
+	require.True(t, ok)
+	assert.Equal(t, RunStatusAborted, restoredRun.Status)
+	require.Len(t, restored.ListRunEvents("run_running"), 1)
+}
+
 func TestRecorderIgnoresChildTraceLifecycleForParentRunStatus(t *testing.T) {
 	recorder := NewRecorder()
 	recorder.BeginRun(RunRecord{
@@ -157,6 +214,120 @@ func TestMemorySaveToolResultEmitsCapturedEvent(t *testing.T) {
 	assert.Equal(t, EventMemoryCaptured, records[1].Name)
 	assert.Equal(t, "long-term/release-rule", records[1].Payload["id"])
 	assert.Equal(t, "memory_save", records[1].Payload["source"])
+}
+
+func TestEventRecordsForAgentEventCompactsLargeToolResultPayload(t *testing.T) {
+	run := RunRecord{ID: "run_large", AgentID: "agent", SessionID: "session"}
+
+	records := EventRecordsForAgentEvent(run, AgentEvent{
+		Type: AgentEventToolResult,
+		ToolCall: &llm.ToolCall{
+			ID:   "tc_large",
+			Name: "site_profile",
+		},
+		Result: &tools.ToolResult{Output: strings.Repeat("x", 12*1024)},
+	})
+
+	require.Len(t, records, 1)
+	output, _ := records[0].Payload["output"].(string)
+	assert.Contains(t, output, "content omitted from durable transcript")
+	assert.Less(t, len(output), 9*1024)
+}
+
+func TestPersistentRecorderRebuildCompactsLegacyLargePayloads(t *testing.T) {
+	dir := t.TempDir()
+	runsDir := filepath.Join(dir, "runs")
+	require.NoError(t, os.MkdirAll(runsDir, 0o755))
+
+	payload := persistedRecord{
+		Kind: "event",
+		Event: &EventRecord{
+			RunID:     "run_large",
+			AgentID:   "agent",
+			SessionID: "session",
+			Name:      EventToolCompleted,
+			Timestamp: time.Now().UTC(),
+			Payload: map[string]any{
+				"id":     "tc_large",
+				"tool":   "site_profile",
+				"output": strings.Repeat("x", 12*1024),
+			},
+		},
+	}
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(runsDir, "run_large.jsonl"), append(data, '\n'), 0o644))
+
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	events := recorder.ListRunEvents("run_large")
+	require.Len(t, events, 1)
+	output, _ := events[0].Payload["output"].(string)
+	assert.Contains(t, output, "content omitted from durable transcript")
+	assert.Less(t, len(output), 9*1024)
+}
+
+func TestPersistentRecorderRawIndexSkipsHugeEventPayloadBody(t *testing.T) {
+	dir := t.TempDir()
+	runsDir := filepath.Join(dir, "runs")
+	require.NoError(t, os.MkdirAll(runsDir, 0o755))
+
+	payload := persistedRecord{
+		Kind: "event",
+		Event: &EventRecord{
+			RunID:     "run_huge",
+			AgentID:   "lead",
+			SessionID: "sess_parent",
+			Name:      EventAgentCallCompleted,
+			Timestamp: time.Now().UTC(),
+			Payload: map[string]any{
+				"id":         "call_1",
+				"output":     strings.Repeat("x", rawIndexLinePrefixLimit+rawIndexLineSuffixLimit+1024),
+				"session_id": "sess_child",
+			},
+		},
+	}
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(runsDir, "run_huge.jsonl"), append(data, '\n'), 0o644))
+
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+	require.Empty(t, recorder.runEvents["run_huge"])
+
+	sessionEvents := recorder.ListSessionEvents("sess_parent")
+	require.Len(t, sessionEvents, 1)
+	assert.Equal(t, EventAgentCallCompleted, sessionEvents[0].Name)
+}
+
+func TestPersistentRecorderRebuildCompactsLegacyLargeRunOutput(t *testing.T) {
+	dir := t.TempDir()
+	runsDir := filepath.Join(dir, "runs")
+	require.NoError(t, os.MkdirAll(runsDir, 0o755))
+
+	payload := persistedRecord{
+		Kind: "run",
+		Run: &RunRecord{
+			ID:        "run_large",
+			AgentID:   "agent",
+			SessionID: "session",
+			Status:    RunStatusCompleted,
+			CreatedAt: time.Now().UTC(),
+			Output:    strings.Repeat("x", 12*1024),
+		},
+	}
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(runsDir, "run_large.jsonl"), append(data, '\n'), 0o644))
+
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	run, ok := recorder.GetRun("run_large")
+	require.True(t, ok)
+	assert.Contains(t, run.Output, "content omitted from durable transcript")
+	assert.Less(t, len(run.Output), 9*1024)
 }
 
 func TestPersistentRecorderRestoresRunsEventsAndRunTree(t *testing.T) {
@@ -236,6 +407,274 @@ func TestPersistentRecorderRestoresRunsEventsAndRunTree(t *testing.T) {
 	require.Empty(t, tree[0].Children)
 	require.Len(t, tree[0].Events, 4)
 	assert.Equal(t, "worker", tree[0].Events[2].AgentID)
+
+	summary, ok := restored.RunTreeSummary("run_parent")
+	require.True(t, ok)
+	require.Len(t, summary, 1)
+	assert.Equal(t, "run_parent", summary[0].Run.ID)
+	require.Empty(t, summary[0].Events)
+}
+
+func TestPersistentRecorderRebuildKeepsHistoricalEventsLazy(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	writer.StartRun(RunRecord{
+		ID:        "run_lazy",
+		AgentID:   "assistant",
+		SessionID: "sess_lazy",
+		Model:     "test/model",
+		Status:    RunStatusRunning,
+	})
+	for i := 0; i < 5; i++ {
+		writer.AppendEvent(EventRecord{
+			RunID:     "run_lazy",
+			AgentID:   "assistant",
+			SessionID: "sess_lazy",
+			Name:      EventToolCompleted,
+			Timestamp: time.Now().UTC().Add(time.Duration(i) * time.Second),
+			Payload: map[string]any{
+				"id":     "tool_lazy",
+				"output": strings.Repeat("x", 12*1024),
+			},
+		})
+	}
+
+	restored, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	require.Empty(t, restored.runEvents["run_lazy"])
+	assert.Equal(t, 5, restored.runSequences["run_lazy"])
+
+	events := restored.ListRunEvents("run_lazy")
+	require.Len(t, events, 5)
+	output, _ := events[0].Payload["output"].(string)
+	assert.Contains(t, output, "content omitted from durable transcript")
+	assert.Less(t, len(output), 9*1024)
+	require.Empty(t, restored.runEvents["run_lazy"])
+}
+
+func TestPersistentRecorderUsesSidecarIndexForLazyRebuild(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	parentStarted := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	writer.StartRun(RunRecord{
+		ID:        "run_parent",
+		AgentID:   "lead",
+		SessionID: "sess_parent",
+		Model:     "test/model",
+		Status:    RunStatusRunning,
+		StartedAt: parentStarted,
+	})
+	writer.StartRun(RunRecord{
+		ID:        "run_child",
+		AgentID:   "worker",
+		SessionID: "sess_child",
+		Model:     "test/model",
+		Status:    RunStatusRunning,
+		StartedAt: parentStarted.Add(time.Second),
+	})
+	writer.AppendEvent(EventRecord{
+		RunID:     "run_parent",
+		AgentID:   "lead",
+		SessionID: "sess_parent",
+		Name:      EventAgentCallCompleted,
+		Timestamp: parentStarted.Add(2 * time.Second),
+		Payload: map[string]any{
+			"id":           "call_1",
+			"session_id":   "sess_child",
+			"target_agent": "worker",
+			"status":       "success",
+		},
+	})
+	writer.AppendEvent(EventRecord{
+		RunID:     "run_child",
+		AgentID:   "worker",
+		SessionID: "sess_child",
+		Name:      EventToolCompleted,
+		Timestamp: parentStarted.Add(3 * time.Second),
+		Payload:   map[string]any{"id": "tool_1", "output": "ok"},
+	})
+
+	indexInfo, err := os.Stat(filepath.Join(dir, "index.jsonl"))
+	require.NoError(t, err)
+	require.Greater(t, indexInfo.Size(), int64(0))
+
+	restored, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+	require.Empty(t, restored.runEvents["run_parent"])
+	require.Empty(t, restored.runEvents["run_child"])
+	assert.Equal(t, 1, restored.runSequences["run_parent"])
+	assert.Equal(t, 1, restored.runSequences["run_child"])
+
+	parentEvents := restored.ListRunEvents("run_parent")
+	require.Len(t, parentEvents, 1)
+	assert.Equal(t, EventAgentCallCompleted, parentEvents[0].Name)
+
+	sessionEvents := restored.ListSessionEvents("sess_parent")
+	require.Len(t, sessionEvents, 2)
+	assert.Equal(t, EventAgentCallCompleted, sessionEvents[0].Name)
+	assert.Equal(t, EventToolCompleted, sessionEvents[1].Name)
+}
+
+func TestPersistentRecorderRawIndexExtractsLegacyChildSessionPayload(t *testing.T) {
+	dir := t.TempDir()
+	runsDir := filepath.Join(dir, "runs")
+	require.NoError(t, os.MkdirAll(runsDir, 0o755))
+
+	base := time.Now().UTC().Truncate(time.Second)
+	records := []persistedRecord{
+		{
+			Kind: "run",
+			Run: &RunRecord{
+				ID:        "run_parent",
+				AgentID:   "lead",
+				SessionID: "sess_parent",
+				Status:    RunStatusRunning,
+				StartedAt: base,
+			},
+		},
+		{
+			Kind: "event",
+			Event: &EventRecord{
+				RunID:     "run_parent",
+				AgentID:   "lead",
+				SessionID: "sess_parent",
+				Name:      EventAgentCallCompleted,
+				Timestamp: base.Add(time.Second),
+				Payload: map[string]any{
+					"session_id":   "sess_child",
+					"target_agent": "worker",
+					"status":       "success",
+				},
+			},
+		},
+		{
+			Kind: "run",
+			Run: &RunRecord{
+				ID:        "run_child",
+				AgentID:   "worker",
+				SessionID: "sess_child",
+				Status:    RunStatusRunning,
+				StartedAt: base.Add(2 * time.Second),
+			},
+		},
+		{
+			Kind: "event",
+			Event: &EventRecord{
+				RunID:     "run_child",
+				AgentID:   "worker",
+				SessionID: "sess_child",
+				Name:      EventToolCompleted,
+				Timestamp: base.Add(3 * time.Second),
+				Payload:   map[string]any{"id": "tool_1"},
+			},
+		},
+	}
+	file, err := os.Create(filepath.Join(runsDir, "legacy.jsonl"))
+	require.NoError(t, err)
+	encoder := json.NewEncoder(file)
+	for _, record := range records {
+		require.NoError(t, encoder.Encode(record))
+	}
+	require.NoError(t, file.Close())
+
+	restored, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(dir, "index.jsonl"))
+
+	sessionEvents := restored.ListSessionEvents("sess_parent")
+	require.Len(t, sessionEvents, 2)
+	assert.Equal(t, EventAgentCallCompleted, sessionEvents[0].Name)
+	assert.Equal(t, EventToolCompleted, sessionEvents[1].Name)
+
+	restoredAgain, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+	sessionEvents = restoredAgain.ListSessionEvents("sess_parent")
+	require.Len(t, sessionEvents, 2)
+	assert.Equal(t, EventAgentCallCompleted, sessionEvents[0].Name)
+	assert.Equal(t, EventToolCompleted, sessionEvents[1].Name)
+}
+
+func TestPersistentRecorderCapsLiveEventsButReturnsPersistedHistory(t *testing.T) {
+	dir := t.TempDir()
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	recorder.StartRun(RunRecord{
+		ID:        "run_tail",
+		AgentID:   "assistant",
+		SessionID: "sess_tail",
+		Model:     "test/model",
+		Status:    RunStatusRunning,
+	})
+	total := maxPersistentLiveRunEventsPerRun + 25
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < total; i++ {
+		recorder.AppendEvent(EventRecord{
+			RunID:     "run_tail",
+			AgentID:   "assistant",
+			SessionID: "sess_tail",
+			Name:      EventToolCompleted,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Payload: map[string]any{
+				"id":     "tool_tail",
+				"output": i,
+			},
+		})
+	}
+
+	require.Len(t, recorder.runEvents["run_tail"], maxPersistentLiveRunEventsPerRun)
+
+	events := recorder.ListRunEvents("run_tail")
+	require.Len(t, events, total)
+	assert.Equal(t, 1, events[0].Sequence)
+	assert.Equal(t, total, events[len(events)-1].Sequence)
+}
+
+func TestListRunEventsByNamePrefixSkipsUnmatchedLargePayloads(t *testing.T) {
+	dir := t.TempDir()
+	recorder, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	recorder.StartRun(RunRecord{
+		ID:        "run_large_filter",
+		AgentID:   "assistant",
+		SessionID: "sess_large_filter",
+		Model:     "test/model",
+		Status:    RunStatusRunning,
+	})
+	recorder.AppendEvent(EventRecord{
+		RunID:     "run_large_filter",
+		AgentID:   "assistant",
+		SessionID: "sess_large_filter",
+		Name:      EventToolCompleted,
+		Payload: map[string]any{
+			"output": strings.Repeat("x", 2*1024*1024),
+		},
+	})
+	recorder.AppendEvent(EventRecord{
+		RunID:     "run_large_filter",
+		AgentID:   "assistant",
+		SessionID: "sess_large_filter",
+		Name:      EventTaskCompleted,
+		Payload: map[string]any{
+			"task_id": "task_1",
+			"summary": "done",
+		},
+	})
+
+	restored, err := NewPersistentRecorder(dir)
+	require.NoError(t, err)
+
+	events := restored.ListRunEventsByNamePrefix("run_large_filter", "task.")
+	require.Len(t, events, 1)
+	assert.Equal(t, EventTaskCompleted, events[0].Name)
+	assert.Equal(t, "task_1", events[0].Payload["task_id"])
+	assert.NotContains(t, events[0].Payload, "output")
 }
 
 func TestRecorderRebuildFromStorageRehydratesFreshInstanceState(t *testing.T) {

@@ -153,9 +153,13 @@ func (s *Session) AppendWithPersistedEntry(entry, persisted SessionEntry) {
 }
 
 func (s *Session) append(entry SessionEntry, persisted *SessionEntry, persist bool) {
+	if s == nil {
+		return
+	}
 	if entry.ID == "" {
 		entry.ID = generateID("e")
 	}
+	entry.ID = s.uniqueEntryID(entry.ID)
 	if entry.Timestamp == 0 {
 		entry.Timestamp = time.Now().Unix()
 	}
@@ -190,6 +194,9 @@ func (s *Session) append(entry SessionEntry, persisted *SessionEntry, persist bo
 
 // History walks the DAG from root to current leaf and returns the path.
 func (s *Session) History() []SessionEntry {
+	if s == nil {
+		return nil
+	}
 	if len(s.entries) == 0 {
 		return nil
 	}
@@ -197,7 +204,12 @@ func (s *Session) History() []SessionEntry {
 	// Build path from leaf back to root
 	var path []SessionEntry
 	current := s.leafID
+	seen := make(map[string]struct{}, len(s.entries))
 	for current != "" {
+		if _, ok := seen[current]; ok {
+			break
+		}
+		seen[current] = struct{}{}
 		entry, ok := s.entryMap[current]
 		if !ok {
 			break
@@ -212,6 +224,18 @@ func (s *Session) History() []SessionEntry {
 	}
 
 	return path
+}
+
+func (s *Session) Entry(id string) (SessionEntry, bool) {
+	id = strings.TrimSpace(id)
+	if s == nil || id == "" {
+		return SessionEntry{}, false
+	}
+	entry, ok := s.entryMap[id]
+	if !ok || entry == nil {
+		return SessionEntry{}, false
+	}
+	return *entry, true
 }
 
 // Entries returns all entries in append order.
@@ -276,6 +300,7 @@ func (s *Session) ReplaceHistory(entries []SessionEntry) {
 		if entry.ID == "" {
 			entry.ID = generateID("e")
 		}
+		entry.ID = s.uniqueEntryID(entry.ID)
 		if entry.Timestamp == 0 {
 			entry.Timestamp = time.Now().Unix()
 		}
@@ -287,6 +312,38 @@ func (s *Session) ReplaceHistory(entries []SessionEntry) {
 	}
 	if s.store != nil {
 		s.store.Rewrite(s)
+	}
+}
+
+func (s *Session) addLoadedEntry(entry SessionEntry) {
+	if s == nil {
+		return
+	}
+	if entry.ID == "" {
+		entry.ID = generateID("e")
+	}
+	entry.ID = s.uniqueEntryID(entry.ID)
+	s.entries = append(s.entries, entry)
+	s.entryMap[entry.ID] = &s.entries[len(s.entries)-1]
+	s.leafID = entry.ID
+}
+
+func (s *Session) uniqueEntryID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = generateID("e")
+	}
+	if s == nil || s.entryMap == nil {
+		return id
+	}
+	if _, exists := s.entryMap[id]; !exists {
+		return id
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s_dup%d", id, i)
+		if _, exists := s.entryMap[candidate]; !exists {
+			return candidate
+		}
 	}
 }
 
@@ -393,6 +450,39 @@ func ToolResultEntryWithMetadata(toolCallID, output, errMsg string, metadata map
 		Type: EntryTypeToolResult,
 		Data: data,
 	}
+}
+
+// CompactDurableEntry returns a transcript entry suitable for durable storage
+// and future model context. Execution paths can still retain a richer in-memory
+// entry for the active turn.
+func CompactDurableEntry(entry SessionEntry) SessionEntry {
+	switch entry.Type {
+	case EntryTypeToolCall:
+		var data ToolCallData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			return entry
+		}
+		data.Input = contract.SanitizeDurableRawJSON(data.Input)
+		out, err := json.Marshal(data)
+		if err != nil {
+			return entry
+		}
+		entry.Data = out
+	case EntryTypeToolResult:
+		var data ToolResultData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			return entry
+		}
+		data.Output, _ = contract.SanitizeDurableText(data.Output)
+		data.Error, _ = contract.SanitizeDurableText(data.Error)
+		data.Metadata = contract.SanitizeDurableMetadata(data.Metadata)
+		out, err := json.Marshal(data)
+		if err != nil {
+			return entry
+		}
+		entry.Data = out
+	}
+	return entry
 }
 
 // PlanEntry creates a plan state entry.

@@ -11,7 +11,11 @@ import (
 	"github.com/Isites/anyai/internal/runtime/session"
 )
 
-const maxToolResultLen = 10000 // truncate tool results longer than this
+const (
+	maxToolResultLen             = 10000 // truncate tool results longer than this
+	maxModelContextRecentEntries = 80
+	maxModelContextBytes         = 256 * 1024
+)
 
 type transcriptBuilder struct {
 	history          []session.SessionEntry
@@ -21,7 +25,7 @@ type transcriptBuilder struct {
 
 func newTranscriptBuilder(history []session.SessionEntry, policy transcriptPolicy) transcriptBuilder {
 	return transcriptBuilder{
-		history: append([]session.SessionEntry(nil), history...),
+		history: modelContextHistory(history),
 		policy:  policy,
 	}
 }
@@ -40,6 +44,69 @@ func (b transcriptBuilder) Build() preparedTranscript {
 		})
 	}
 	return prepared
+}
+
+func modelContextHistory(history []session.SessionEntry) []session.SessionEntry {
+	history = session.RepairLeadingFragment(session.ModelVisibleEntries(history))
+	if len(history) == 0 {
+		return nil
+	}
+	if len(history) <= maxModelContextRecentEntries && entriesByteSize(history) <= maxModelContextBytes {
+		return append([]session.SessionEntry(nil), history...)
+	}
+
+	prefix := preservedContextPrefix(history)
+	blocks := session.BuildHistoryBlocks(history[len(prefix):])
+	if len(blocks) == 0 {
+		return append([]session.SessionEntry(nil), prefix...)
+	}
+
+	selected := make([]session.HistoryBlock, 0, len(blocks))
+	totalEntries := len(prefix)
+	totalBytes := entriesByteSize(prefix)
+	for i := len(blocks) - 1; i >= 0; i-- {
+		blockBytes := entriesByteSize(blocks[i].Entries)
+		if len(selected) > 0 &&
+			(totalEntries+len(blocks[i].Entries) > maxModelContextRecentEntries ||
+				totalBytes+blockBytes > maxModelContextBytes) {
+			break
+		}
+		selected = append(selected, blocks[i])
+		totalEntries += len(blocks[i].Entries)
+		totalBytes += blockBytes
+	}
+	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
+		selected[left], selected[right] = selected[right], selected[left]
+	}
+
+	out := append([]session.SessionEntry(nil), prefix...)
+	out = append(out, session.FlattenHistoryBlocks(selected)...)
+	return session.RepairLeadingFragment(out)
+}
+
+func preservedContextPrefix(history []session.SessionEntry) []session.SessionEntry {
+	prefix := make([]session.SessionEntry, 0, 4)
+	for _, entry := range history {
+		switch entry.Type {
+		case session.EntryTypeCompaction, session.EntryTypeMeta:
+			prefix = append(prefix, entry)
+		default:
+			return prefix
+		}
+	}
+	return prefix
+}
+
+func entriesByteSize(entries []session.SessionEntry) int {
+	total := 0
+	for _, entry := range entries {
+		total += len(entry.ID)
+		total += len(entry.ParentID)
+		total += len(entry.Type)
+		total += len(entry.Role)
+		total += len(entry.Data)
+	}
+	return total
 }
 
 // detectImageMIME returns the actual MIME type based on magic bytes.
