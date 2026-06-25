@@ -18,17 +18,33 @@ const (
 	compactionSummaryPrefix = compactionSummaryTag + "\n" +
 		"Earlier session context was compacted into the handoff summary below. " +
 		"Use it as authoritative prior context while relying on the remaining transcript for recent turns.\n\n"
-	compactionSystemPrompt = `You are producing a checkpoint handoff summary for a long-running AnyAI agent session. The summary will replace older transcript history while the most recent turns remain verbatim in the session. Preserve only facts you can establish from the transcript. Keep the summary concise but information-dense.`
+	compactionSystemPrompt = `You are producing a checkpoint handoff summary for a long-running AnyAI agent session. The summary will replace older transcript history while the most recent turns remain verbatim in the session. Preserve only facts you can establish from the transcript. Keep the summary concise but information-dense, and make the user's current direction hard to lose.`
 	compactionUserPrompt   = `Create a handoff summary for the older session context above.
 
-Requirements:
-- State the overall goal or task thread if it is clear.
-- Capture established facts, constraints, and important decisions.
-- Preserve concrete technical breadcrumbs that still matter: file paths, commands, error messages, tool outputs, and artifacts.
-- List unresolved issues, risks, and the next recommended steps.
-- The most recent turns will remain in the transcript separately, so avoid repeating them unless they are essential for continuity.
-- You must return a non-empty markdown summary. If the transcript is sparse, state the known goal, known facts, and next step. Never return an empty response.
-- Write short markdown sections with compact bullet points.`
+Return exactly these markdown sections:
+
+## Objective
+- The user's current goal or task thread.
+
+## Direction And Constraints
+- Decisions, explicit constraints, preferences, and things that must not change.
+
+## Important State
+- Durable facts, file paths, commands, errors, artifacts, IDs, and outputs that still matter.
+
+## Recent Progress
+- What was completed or learned before the recent verbatim transcript begins.
+
+## Open Issues
+- Unresolved risks, blockers, or unknowns.
+
+## Next Action
+- The most likely next step.
+
+Rules:
+- Preserve only facts established by the transcript.
+- The most recent turns remain separately, so avoid repeating them unless needed for continuity.
+- Return a non-empty markdown summary. If sparse, fill the sections with known facts and an explicit next step.`
 	defaultCompactionTriggerMode          = "token_estimate"
 	defaultCompactionEntryThreshold       = 96
 	defaultCompactionTokenThreshold       = 12000
@@ -38,6 +54,8 @@ Requirements:
 	defaultCompactionMaxAttempts          = 2
 	defaultManualCompactionKeepEntries    = 24
 	manualCompactionTrigger               = "manual"
+	defaultCompactionArchiveCompression   = session.ArchiveCompressionGzip
+	defaultCompactionContextProjection    = "state_aware"
 )
 
 type compactionDecision struct {
@@ -62,6 +80,10 @@ type CompactionResult struct {
 	SummarySource string
 	KeepEntries   int
 	Threshold     int
+	CompactID     string
+	ArchiveRef    string
+	ArchiveSHA256 string
+	SourceSHA256  string
 }
 
 func defaultCompactionConfig() CompactionConfig {
@@ -73,6 +95,10 @@ func defaultCompactionConfig() CompactionConfig {
 		KeepRecentUserTurns:  defaultCompactionKeepRecentUserTurns,
 		KeepRecentUserTokens: defaultCompactionKeepRecentUserTokens,
 		SummaryMaxTokens:     defaultCompactionSummaryMaxTokens,
+		ArchiveEnabled:       true,
+		ArchiveCompression:   defaultCompactionArchiveCompression,
+		FocusEnabled:         true,
+		ContextProjection:    defaultCompactionContextProjection,
 	}
 }
 
@@ -100,6 +126,12 @@ func (r *Runtime) effectiveCompactionConfig() CompactionConfig {
 		}
 		if cfg.SummaryMaxTokens <= 0 {
 			cfg.SummaryMaxTokens = defaultCompactionSummaryMaxTokens
+		}
+		if strings.TrimSpace(cfg.ArchiveCompression) == "" {
+			cfg.ArchiveCompression = defaultCompactionArchiveCompression
+		}
+		if strings.TrimSpace(cfg.ContextProjection) == "" {
+			cfg.ContextProjection = defaultCompactionContextProjection
 		}
 	}
 	if r.SessionCompactThreshold > 0 {
@@ -359,25 +391,67 @@ func (r *Runtime) generateCompactionSummary(ctx context.Context, olderHistory []
 	return llm.CompactResponse{}, lastErr
 }
 
-func (r *Runtime) rewriteSessionForCompaction(summary string, decision compactionDecision, scope compactionScope) error {
+func (r *Runtime) rewriteSessionForCompaction(data session.CompactionData, decision compactionDecision, scope compactionScope, cfg CompactionConfig) (session.RewriteResult, error) {
 	if r == nil || r.Session == nil {
-		return nil
+		return session.RewriteResult{}, nil
 	}
-	rewritten := session.RewriteHistoryWithCompaction(
+	rewritten := session.RewriteHistoryWithCompactionData(
 		scope.Compactable,
-		summary,
+		data,
 		decision.KeepEntries,
-		decision.TriggerMode,
-		false,
 	)
-	finalHistory := make([]session.SessionEntry, 0, len(scope.ProtectedPrefix)+len(rewritten))
-	finalHistory = append(finalHistory, scope.ProtectedPrefix...)
+	prefix := append([]session.SessionEntry(nil), scope.ProtectedPrefix...)
+	if cfg.FocusEnabled {
+		prefix = withSessionFocus(prefix, data.Text, scope.Compactable)
+	}
+	finalHistory := make([]session.SessionEntry, 0, len(prefix)+len(rewritten))
+	finalHistory = append(finalHistory, prefix...)
 	finalHistory = append(finalHistory, rewritten...)
-	r.Session.ReplaceHistory(finalHistory)
-	return nil
+	finalHistory = stampCompactionAfterCount(finalHistory, data, len(finalHistory))
+	result, err := r.Session.ReplaceHistoryWithOptions(finalHistory, session.RewriteOptions{
+		Archive:            cfg.ArchiveEnabled,
+		CompactID:          data.CompactID,
+		ArchiveCompression: cfg.ArchiveCompression,
+	})
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func withSessionFocus(prefix []session.SessionEntry, summary string, history []session.SessionEntry) []session.SessionEntry {
+	focus := session.BuildSessionFocus(summary, history)
+	if strings.TrimSpace(focus) == "" {
+		return prefix
+	}
+	out := make([]session.SessionEntry, 0, len(prefix)+1)
+	for _, entry := range prefix {
+		if session.IsSessionFocusEntry(entry) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out, session.SessionFocusEntry(focus))
+	return out
+}
+
+func stampCompactionAfterCount(history []session.SessionEntry, data session.CompactionData, afterCount int) []session.SessionEntry {
+	if len(history) == 0 {
+		return history
+	}
+	data.AfterEntryCount = afterCount
+	for i := range history {
+		if history[i].Type != session.EntryTypeCompaction {
+			continue
+		}
+		history[i] = session.CompactionEntry(data)
+		return history
+	}
+	return history
 }
 
 func (r *Runtime) executeCompaction(ctx context.Context, history []session.SessionEntry, scope compactionScope, decision compactionDecision) (CompactionResult, error) {
+	cfg := r.effectiveCompactionConfig()
 	state, err := r.applyBeforeCompactionHooks(ctx, CompactionState{
 		History:     append([]session.SessionEntry(nil), scope.Compactable...),
 		Threshold:   decision.Threshold,
@@ -401,7 +475,20 @@ func (r *Runtime) executeCompaction(ctx context.Context, history []session.Sessi
 		return CompactionResult{}, nil
 	}
 	caps := llm.DescribeProviderCapabilities(r.LLM)
+	compactID := session.NewCompactionID()
+	previousCompactID := ""
+	if previous, ok := session.LatestCompactionData(history); ok {
+		previousCompactID = strings.TrimSpace(previous.CompactID)
+	}
+	archiveRef := ""
+	if cfg.ArchiveEnabled && r.Session != nil && strings.TrimSpace(r.Session.ID) != "" {
+		archiveAgentID := firstNonEmpty(r.Session.AgentID, r.AgentID)
+		archiveRef = session.CompactionArchiveRef(archiveAgentID, r.Session.ID, compactID, cfg.ArchiveCompression)
+	}
 	requestedPayload := map[string]any{
+		"compact_id":               compactID,
+		"previous_compact_id":      previousCompactID,
+		"archive_ref":              archiveRef,
 		"trigger":                  decision.TriggerMode,
 		"threshold":                decision.Threshold,
 		"history_len":              len(scope.Compactable),
@@ -430,15 +517,48 @@ func (r *Runtime) executeCompaction(ctx context.Context, history []session.Sessi
 		strategy = resp.Strategy
 		summarySource = "provider_model"
 	}
-	if err := r.rewriteSessionForCompaction(summary, decision, scope); err != nil {
+	if strings.TrimSpace(string(strategy)) == "" {
+		strategy = llm.CompactStrategyUnknown
+	}
+	beforeLeafID := ""
+	if len(history) > 0 {
+		beforeLeafID = history[len(history)-1].ID
+	}
+	compactionData := session.CompactionData{
+		Text:              summary,
+		Trigger:           decision.TriggerMode,
+		CompactID:         compactID,
+		PreviousCompactID: previousCompactID,
+		ArchiveRef:        archiveRef,
+		BeforeEntryCount:  len(history),
+		BeforeLeafID:      beforeLeafID,
+		SummarySource:     summarySource,
+		CompactStrategy:   string(strategy),
+		CreatedAt:         time.Now().Unix(),
+	}
+	rewriteResult, err := r.rewriteSessionForCompaction(compactionData, decision, scope, cfg)
+	if err != nil {
 		return CompactionResult{}, err
 	}
 	currentHistory := session.RepairLeadingFragment(r.Session.History())
 	currentScope := buildCompactionScope(currentHistory)
-	if strings.TrimSpace(string(strategy)) == "" {
-		strategy = llm.CompactStrategyUnknown
+	afterLeafID := ""
+	if len(currentHistory) > 0 {
+		afterLeafID = currentHistory[len(currentHistory)-1].ID
+	}
+	if archiveRef == "" {
+		archiveRef = rewriteResult.ArchiveRef
 	}
 	completedPayload := map[string]any{
+		"compact_id":               compactID,
+		"previous_compact_id":      previousCompactID,
+		"archive_ref":              archiveRef,
+		"archive_sha256":           rewriteResult.ArchiveSHA256,
+		"source_sha256":            rewriteResult.SourceSHA256,
+		"before_entry_count":       len(history),
+		"after_entry_count":        len(currentHistory),
+		"before_leaf_id":           beforeLeafID,
+		"after_leaf_id":            afterLeafID,
 		"trigger":                  decision.TriggerMode,
 		"threshold":                decision.Threshold,
 		"history_len":              len(currentScope.Compactable),
@@ -473,6 +593,10 @@ func (r *Runtime) executeCompaction(ctx context.Context, history []session.Sessi
 		"compact_capability", string(caps.Compact),
 		"compact_strategy", string(strategy),
 		"summary_source", summarySource,
+		"compact_id", compactID,
+		"archive_ref", archiveRef,
+		"archive_sha256", rewriteResult.ArchiveSHA256,
+		"source_sha256", rewriteResult.SourceSHA256,
 	)
 	if err := r.applyAfterCompactionHooks(ctx, CompactionState{
 		History:     append([]session.SessionEntry(nil), r.Session.History()...),
@@ -491,6 +615,10 @@ func (r *Runtime) executeCompaction(ctx context.Context, history []session.Sessi
 		SummarySource: summarySource,
 		KeepEntries:   decision.KeepEntries,
 		Threshold:     decision.Threshold,
+		CompactID:     compactID,
+		ArchiveRef:    archiveRef,
+		ArchiveSHA256: rewriteResult.ArchiveSHA256,
+		SourceSHA256:  rewriteResult.SourceSHA256,
 	}, nil
 }
 

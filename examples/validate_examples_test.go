@@ -217,6 +217,22 @@ func validationCases() map[string]exampleValidationCase {
 			},
 			Isolation: "不要调用工具。请只回复：这是新的审核会话。",
 		},
+		"h5-online": {
+			Name: "h5-online",
+			Turns: []string{
+				"不要调用工具。请用两句话说明 h5-online 如何组织 H5 上线。",
+				"基于你上一条回答，用一句话说明为什么唯一退出条件是审核无问题。",
+			},
+			Isolation: "不要调用工具。请只回复：这是新的 H5 上线会话。",
+			TurnChecks: map[int]exampleTurnCheck{
+				1: {
+					ExpectNoDelegation: true,
+				},
+				2: {
+					ExpectNoDelegation: true,
+				},
+			},
+		},
 	}
 }
 

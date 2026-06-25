@@ -784,7 +784,7 @@ func TestModelContextHistoryKeepsSummaryAndRecentWindow(t *testing.T) {
 		history = append(history, session.AssistantMessageEntry(fmt.Sprintf("answer %03d", i)))
 	}
 
-	window := modelContextHistory(history)
+	window := modelContextHistory(history, "recent")
 	require.NotEmpty(t, window)
 	assert.Equal(t, session.EntryTypeCompaction, window[0].Type)
 	assert.LessOrEqual(t, len(window), maxModelContextRecentEntries+1)
@@ -3074,7 +3074,8 @@ func TestRuntimeRunAppliesCompactionHooks(t *testing.T) {
 
 	history := sess.History()
 	require.NotEmpty(t, history)
-	assert.Equal(t, session.EntryTypeCompaction, history[0].Type)
+	assert.True(t, session.IsSessionFocusEntry(history[0]))
+	assert.Equal(t, session.EntryTypeCompaction, history[1].Type)
 	var compact session.CompactionData
 	require.NoError(t, json.Unmarshal(history[0].Data, &compact))
 	assert.Contains(t, compact.Text, "HOOK SUMMARY")
@@ -3769,20 +3770,29 @@ func TestRuntimeRunCompactsLongSessionIntoRollingSummary(t *testing.T) {
 		}
 		return strings.Join(contents, "\n")
 	}()
-	assert.NotContains(t, requests[0].SystemPrompt, "Session summary context:")
 	assert.Contains(t, joined, compactionSummaryTag)
 	assert.Contains(t, joined, "Provider compact summary")
 	assert.NotContains(t, joined, "user turn 0")
 	assert.Contains(t, joined, "latest question")
+	assert.Contains(t, requests[0].SystemPrompt, "Session summary context:")
+	assert.Contains(t, requests[0].SystemPrompt, "Session Focus")
 
 	history := sess.History()
 	require.NotEmpty(t, history)
-	assert.Equal(t, session.EntryTypeCompaction, history[0].Type)
+	assert.True(t, session.IsSessionFocusEntry(history[0]))
+	assert.Equal(t, session.EntryTypeCompaction, history[1].Type)
+	var compact session.CompactionData
+	require.NoError(t, json.Unmarshal(history[1].Data, &compact))
+	require.NotEmpty(t, compact.CompactID)
+	assert.Contains(t, compact.ArchiveRef, compact.CompactID)
 
 	runEvents := recorder.ListRunEvents("run_compact")
 	require.Len(t, runEvents, 2)
 	assert.Equal(t, runtimeevents.EventSessionCompactRequested, runEvents[0].Name)
 	assert.Equal(t, runtimeevents.EventSessionCompactCompleted, runEvents[1].Name)
+	assert.Equal(t, compact.CompactID, runEvents[0].Payload["compact_id"])
+	assert.Equal(t, compact.CompactID, runEvents[1].Payload["compact_id"])
+	assert.Equal(t, compact.ArchiveRef, runEvents[1].Payload["archive_ref"])
 	assert.Equal(t, "mock", runEvents[1].Payload["provider"])
 	assert.Equal(t, string(llm.CompactCapabilityChatFallbackOnly), runEvents[1].Payload["compact_capability"])
 	assert.Equal(t, string(llm.CompactStrategyChatFallback), runEvents[1].Payload["compact_strategy"])
@@ -3842,7 +3852,8 @@ func TestRuntimeRunCompactionPreservesProtectedSystemPrefix(t *testing.T) {
 	var meta session.MessageData
 	require.NoError(t, json.Unmarshal(history[0].Data, &meta))
 	assert.Equal(t, "Pinned system session context", meta.Text)
-	assert.Equal(t, session.EntryTypeCompaction, history[1].Type)
+	assert.True(t, session.IsSessionFocusEntry(history[1]))
+	assert.Equal(t, session.EntryTypeCompaction, history[2].Type)
 }
 
 func TestRuntimeRunCompactionRetriesOnceAfterProviderFailure(t *testing.T) {
@@ -3898,20 +3909,64 @@ func TestRuntimeRunCompactionRetriesOnceAfterProviderFailure(t *testing.T) {
 
 	compactRequests := provider.CompactRequests()
 	require.Len(t, compactRequests, 2)
-	assert.Contains(t, compactRequests[0].UserPrompt, "Never return an empty response.")
+	assert.Contains(t, compactRequests[0].UserPrompt, "Return a non-empty markdown summary")
 	assert.NotContains(t, compactRequests[0].UserPrompt, "Retry instruction:")
 	assert.Contains(t, compactRequests[1].UserPrompt, "Retry instruction:")
 	assert.Contains(t, compactRequests[1].UserPrompt, "Return a non-empty markdown handoff summary now.")
 
 	history := sess.History()
 	require.NotEmpty(t, history)
-	assert.Equal(t, session.EntryTypeCompaction, history[0].Type)
+	assert.True(t, session.IsSessionFocusEntry(history[0]))
+	assert.Equal(t, session.EntryTypeCompaction, history[1].Type)
 
 	runEvents := recorder.ListRunEvents("run_compact_retry")
 	require.Len(t, runEvents, 2)
 	assert.Equal(t, runtimeevents.EventSessionCompactRequested, runEvents[0].Name)
 	assert.Equal(t, runtimeevents.EventSessionCompactCompleted, runEvents[1].Name)
 	assert.Equal(t, "Recovered compact summary", runEvents[1].Payload["summary"])
+}
+
+func TestModelContextHistoryStateAwarePinsFocusAndState(t *testing.T) {
+	var history []session.SessionEntry
+	history = append(history, session.CompactionEntry(session.CompactionData{
+		Text:      "original objective: keep the deployment direction stable",
+		CompactID: "compact_old",
+	}))
+	history = append(history, session.SessionFocusEntry("objective: ship the h5-online session compaction fix"))
+	history = append(history, session.PlanEntry("1. Preserve archive\n2. Keep latest direction"))
+	history = append(history, session.TodoEntry(session.TodoData{
+		ID:        "todo_focus",
+		Content:   "Verify context projection keeps latest state",
+		Status:    "open",
+		CreatedAt: 1,
+	}))
+	for i := 0; i < 140; i++ {
+		history = append(history, session.UserMessageEntry(fmt.Sprintf("noisy user turn %03d", i)))
+		history = append(history, session.ToolResultEntry(fmt.Sprintf("tool_%03d", i), strings.Repeat("noise", 1200), "", nil))
+	}
+
+	projected := modelContextHistory(history, "state_aware")
+	require.NotEmpty(t, projected)
+	texts := strings.Join(historyEntryTexts(t, projected), "\n")
+	assert.Contains(t, texts, "deployment direction stable")
+	assert.Contains(t, texts, "h5-online session compaction fix")
+	assert.Contains(t, texts, "noisy user turn 139")
+	var sawPlan, sawTodo bool
+	for _, entry := range projected {
+		switch entry.Type {
+		case session.EntryTypePlan:
+			var data session.PlanData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			sawPlan = strings.Contains(data.Plan, "Preserve archive")
+		case session.EntryTypeTodo:
+			var data session.TodoData
+			require.NoError(t, json.Unmarshal(entry.Data, &data))
+			sawTodo = strings.Contains(data.Content, "context projection keeps latest state")
+		}
+	}
+	assert.True(t, sawPlan)
+	assert.True(t, sawTodo)
+	assert.LessOrEqual(t, len(projected), maxModelContextRecentEntries)
 }
 
 func TestRuntimeRunRefreshesMemoryRecallQueryFromLatestContext(t *testing.T) {

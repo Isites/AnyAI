@@ -3,6 +3,9 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	runtimelogging "github.com/Isites/anyai/internal/runtime/logging"
@@ -63,6 +66,40 @@ type entryOffsetIndex struct {
 
 const entryOffsetIndexPrefixLimit = 64 * 1024
 
+const (
+	ArchiveCompressionNone = "none"
+	ArchiveCompressionGzip = "gzip"
+)
+
+type RewriteOptions struct {
+	Archive            bool
+	CompactID          string
+	ArchiveCompression string
+}
+
+type RewriteResult struct {
+	ArchiveRef       string `json:"archive_ref,omitempty"`
+	ArchiveSHA256    string `json:"archive_sha256,omitempty"`
+	SourceSHA256     string `json:"source_sha256,omitempty"`
+	BeforeEntryCount int    `json:"before_entry_count,omitempty"`
+	AfterEntryCount  int    `json:"after_entry_count,omitempty"`
+}
+
+type CompactionArchiveMeta struct {
+	AgentID           string `json:"agent_id"`
+	SessionID         string `json:"session_id"`
+	CompactID         string `json:"compact_id"`
+	ArchiveRef        string `json:"archive_ref"`
+	Compression       string `json:"compression"`
+	ArchiveSHA256     string `json:"archive_sha256"`
+	SourceSHA256      string `json:"source_sha256"`
+	BeforeEntryCount  int    `json:"before_entry_count"`
+	AfterEntryCount   int    `json:"after_entry_count,omitempty"`
+	CreatedAt         int64  `json:"created_at"`
+	OriginalPath      string `json:"original_path,omitempty"`
+	CurrentSessionRef string `json:"current_session_ref,omitempty"`
+}
+
 // Store handles JSONL file I/O for sessions.
 type Store struct {
 	baseDir string
@@ -109,6 +146,22 @@ func (s *Store) sessionDir(agentID string) string {
 // sessionPath returns the file path for a session.
 func (s *Store) sessionPath(agentID, sessionID string) string {
 	return filepath.Join(s.sessionDir(agentID), sessionID+".jsonl")
+}
+
+func (s *Store) CompactionArchiveRef(agentID, sessionID, compactID string, compression string) string {
+	return CompactionArchiveRef(agentID, sessionID, compactID, compression)
+}
+
+func CompactionArchiveRef(agentID, sessionID, compactID string, compression string) string {
+	compactID = sanitizeArchiveComponent(compactID)
+	if compactID == "" {
+		return ""
+	}
+	ext := ".jsonl"
+	if normalizeArchiveCompression(compression) == ArchiveCompressionGzip {
+		ext += ".gz"
+	}
+	return filepath.ToSlash(filepath.Join(agentID, ".compactions", sanitizeArchiveComponent(sessionID), compactID+ext))
 }
 
 // Load reads a session from its JSONL file.
@@ -678,39 +731,86 @@ func (s *Store) Delete(agentID, sessionID string) error {
 // Rewrite replaces the entire session JSONL file with the current entries.
 // Used after compaction to replace the old file.
 func (s *Store) Rewrite(sess *Session) {
+	if _, err := s.RewriteWithOptions(sess, RewriteOptions{}); err != nil {
+		runtimelogging.Error("failed to rewrite session file", "error", err)
+	}
+}
+
+func (s *Store) RewriteWithOptions(sess *Session, opts RewriteOptions) (RewriteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var result RewriteResult
 	dir := s.sessionDir(sess.AgentID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		runtimelogging.Error("failed to create session dir", "error", err)
-		return
+		return result, fmt.Errorf("create session dir: %w", err)
 	}
 
 	path := s.sessionPath(sess.AgentID, sess.ID)
-
-	f, err := os.Create(path)
-	if err != nil {
-		runtimelogging.Error("failed to create session file for rewrite", "error", err)
-		return
+	opts.ArchiveCompression = normalizeArchiveCompression(opts.ArchiveCompression)
+	var archiveMeta *CompactionArchiveMeta
+	if opts.Archive && strings.TrimSpace(opts.CompactID) != "" {
+		meta, err := s.archiveSessionBeforeRewriteLocked(sess, path, opts)
+		if err != nil {
+			return result, err
+		}
+		archiveMeta = &meta
+		result.ArchiveRef = meta.ArchiveRef
+		result.ArchiveSHA256 = meta.ArchiveSHA256
+		result.SourceSHA256 = meta.SourceSHA256
+		result.BeforeEntryCount = meta.BeforeEntryCount
 	}
-	defer f.Close()
 
-	w := bufio.NewWriter(f)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".rewrite-*")
+	if err != nil {
+		return result, fmt.Errorf("create temp session file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	w := bufio.NewWriter(tmp)
+	afterCount := 0
 	for _, entry := range sess.Entries() {
 		entry = CompactDurableEntry(entry)
 		data, err := json.Marshal(entry)
 		if err != nil {
-			runtimelogging.Error("failed to marshal session entry", "error", err)
-			continue
+			_ = tmp.Close()
+			return result, fmt.Errorf("marshal session entry: %w", err)
 		}
-		w.Write(data)
-		w.WriteByte('\n')
+		if _, err := w.Write(data); err != nil {
+			_ = tmp.Close()
+			return result, fmt.Errorf("write session entry: %w", err)
+		}
+		if err := w.WriteByte('\n'); err != nil {
+			_ = tmp.Close()
+			return result, fmt.Errorf("write session newline: %w", err)
+		}
+		afterCount++
 	}
 
 	if err := w.Flush(); err != nil {
-		runtimelogging.Error("failed to flush session file", "error", err)
-		return
+		_ = tmp.Close()
+		return result, fmt.Errorf("flush session file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return result, fmt.Errorf("close temp session file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return result, fmt.Errorf("replace session file: %w", err)
+	}
+	cleanupTmp = false
+	result.AfterEntryCount = afterCount
+	if archiveMeta != nil && archiveMeta.ArchiveRef != "" {
+		archiveMeta.AfterEntryCount = afterCount
+		metaPath := filepath.Join(s.baseDir, filepath.FromSlash(archiveMeta.ArchiveRef)) + ".meta.json"
+		if err := writeCompactionArchiveMeta(metaPath, *archiveMeta); err != nil {
+			runtimelogging.Warn("failed to update compaction archive metadata", "error", err)
+		}
 	}
 	s.invalidateEntryOffsetIndexPath(path)
 
@@ -720,6 +820,183 @@ func (s *Store) Rewrite(sess *Session) {
 		Kind:      ChangeRewrite,
 		Snapshot:  append([]SessionEntry(nil), sess.History()...),
 	})
+	return result, nil
+}
+
+func (s *Store) archiveSessionBeforeRewriteLocked(sess *Session, sourcePath string, opts RewriteOptions) (CompactionArchiveMeta, error) {
+	var meta CompactionArchiveMeta
+	if sess == nil {
+		return meta, fmt.Errorf("archive session: nil session")
+	}
+	if _, err := os.Stat(sourcePath); err != nil {
+		if os.IsNotExist(err) {
+			return meta, nil
+		}
+		return meta, fmt.Errorf("stat session before archive: %w", err)
+	}
+	compression := normalizeArchiveCompression(opts.ArchiveCompression)
+	compactID := sanitizeArchiveComponent(opts.CompactID)
+	if compactID == "" {
+		return meta, fmt.Errorf("archive session: compact id is required")
+	}
+	archiveRef := s.CompactionArchiveRef(sess.AgentID, sess.ID, compactID, compression)
+	if archiveRef == "" {
+		return meta, fmt.Errorf("archive session: invalid archive ref")
+	}
+	archivePath := filepath.Join(s.baseDir, filepath.FromSlash(archiveRef))
+	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
+		return meta, fmt.Errorf("create compaction archive dir: %w", err)
+	}
+
+	in, err := os.Open(sourcePath)
+	if err != nil {
+		return meta, fmt.Errorf("open session for archive: %w", err)
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(archivePath), "."+filepath.Base(archivePath)+".tmp-*")
+	if err != nil {
+		return meta, fmt.Errorf("create temp compaction archive: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	sourceHash := sha256.New()
+	archiveHash := sha256.New()
+	hashingOut := io.MultiWriter(tmp, archiveHash)
+	beforeCount := 0
+	if compression == ArchiveCompressionGzip {
+		gz := gzip.NewWriter(hashingOut)
+		beforeCount, err = copyAndHashSessionArchive(gz, in, sourceHash)
+		if closeErr := gz.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	} else {
+		beforeCount, err = copyAndHashSessionArchive(hashingOut, in, sourceHash)
+	}
+	if err != nil {
+		_ = tmp.Close()
+		return meta, fmt.Errorf("write compaction archive: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return meta, fmt.Errorf("close compaction archive: %w", err)
+	}
+	if err := os.Rename(tmpPath, archivePath); err != nil {
+		return meta, fmt.Errorf("replace compaction archive: %w", err)
+	}
+	cleanupTmp = false
+
+	meta = CompactionArchiveMeta{
+		AgentID:           sess.AgentID,
+		SessionID:         sess.ID,
+		CompactID:         compactID,
+		ArchiveRef:        archiveRef,
+		Compression:       compression,
+		ArchiveSHA256:     hex.EncodeToString(archiveHash.Sum(nil)),
+		SourceSHA256:      hex.EncodeToString(sourceHash.Sum(nil)),
+		BeforeEntryCount:  beforeCount,
+		CreatedAt:         time.Now().Unix(),
+		OriginalPath:      filepath.ToSlash(filepath.Join(sess.AgentID, sess.ID+".jsonl")),
+		CurrentSessionRef: filepath.ToSlash(filepath.Join(sess.AgentID, sess.ID+".jsonl")),
+	}
+	if err := writeCompactionArchiveMeta(archivePath+".meta.json", meta); err != nil {
+		return meta, err
+	}
+	return meta, nil
+}
+
+func copyAndHashSessionArchive(dst io.Writer, src io.Reader, sourceHash io.Writer) (int, error) {
+	buf := make([]byte, 64*1024)
+	count := 0
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if _, err := sourceHash.Write(chunk); err != nil {
+				return count, err
+			}
+			count += bytes.Count(chunk, []byte{'\n'})
+			if _, err := dst.Write(chunk); err != nil {
+				return count, err
+			}
+		}
+		if readErr == io.EOF {
+			return count, nil
+		}
+		if readErr != nil {
+			return count, readErr
+		}
+	}
+}
+
+func writeCompactionArchiveMeta(path string, meta CompactionArchiveMeta) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal compaction archive meta: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp compaction archive meta: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write compaction archive meta: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close compaction archive meta: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace compaction archive meta: %w", err)
+	}
+	cleanupTmp = false
+	return nil
+}
+
+func normalizeArchiveCompression(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", ArchiveCompressionGzip:
+		return ArchiveCompressionGzip
+	case ArchiveCompressionNone:
+		return ArchiveCompressionNone
+	default:
+		return ArchiveCompressionGzip
+	}
+}
+
+func sanitizeArchiveComponent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), ".")
 }
 
 func (s *Store) Subscribe(agentID, sessionID string) (<-chan Change, func()) {

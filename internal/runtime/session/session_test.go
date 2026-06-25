@@ -1,7 +1,9 @@
 package session
 
 import (
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -307,6 +309,10 @@ func TestSessionCompact(t *testing.T) {
 	assert.Contains(t, compact.Text, "discussed topics 0-7")
 	assert.Equal(t, "legacy_entry_count", compact.Trigger)
 	assert.True(t, compact.LegacyHeuristic)
+	assert.NotEmpty(t, compact.CompactID)
+	assert.Empty(t, compact.ArchiveRef)
+	assert.Equal(t, 20, compact.BeforeEntryCount)
+	assert.Equal(t, "legacy_session_compact", compact.SummarySource)
 }
 
 func TestSessionCompactNoOp(t *testing.T) {
@@ -362,6 +368,73 @@ func TestSessionCompactWithStore(t *testing.T) {
 	history := sess2.History()
 	assert.Len(t, history, 5) // 1 summary + 4 kept
 	assert.Equal(t, EntryTypeCompaction, history[0].Type)
+	var compact CompactionData
+	require.NoError(t, json.Unmarshal(history[0].Data, &compact))
+	require.NotEmpty(t, compact.CompactID)
+	require.NotEmpty(t, compact.ArchiveRef)
+	assert.Equal(t, 20, compact.BeforeEntryCount)
+	assert.FileExists(t, filepath.Join(dir, filepath.FromSlash(compact.ArchiveRef)))
+	assert.FileExists(t, filepath.Join(dir, filepath.FromSlash(compact.ArchiveRef))+".meta.json")
+}
+
+func TestStoreRewriteWithOptionsArchivesPreviousSession(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	sess, err := store.Load("agent1", "archive_test")
+	require.NoError(t, err)
+	for i := 0; i < 6; i++ {
+		sess.Append(UserMessageEntry("question " + string(rune('0'+i))))
+		sess.Append(AssistantMessageEntry("answer " + string(rune('0'+i))))
+	}
+	beforeData, err := os.ReadFile(filepath.Join(dir, "agent1", "archive_test.jsonl"))
+	require.NoError(t, err)
+
+	compactID := "compact_test"
+	data := CompactionData{
+		Text:             "archived summary",
+		Trigger:          "entry_count",
+		CompactID:        compactID,
+		ArchiveRef:       CompactionArchiveRef("agent1", "archive_test", compactID, ArchiveCompressionGzip),
+		BeforeEntryCount: len(sess.History()),
+	}
+	rewritten := RewriteHistoryWithCompactionData(sess.History(), data, 4)
+	result, err := sess.ReplaceHistoryWithOptions(rewritten, RewriteOptions{
+		Archive:            true,
+		CompactID:          compactID,
+		ArchiveCompression: ArchiveCompressionGzip,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result.ArchiveRef)
+	require.NotEmpty(t, result.ArchiveSHA256)
+	require.NotEmpty(t, result.SourceSHA256)
+	assert.Equal(t, 12, result.BeforeEntryCount)
+	assert.Equal(t, len(sess.History()), result.AfterEntryCount)
+
+	archivePath := filepath.Join(dir, filepath.FromSlash(result.ArchiveRef))
+	f, err := os.Open(archivePath)
+	require.NoError(t, err)
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	require.NoError(t, err)
+	archiveData, err := io.ReadAll(gz)
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	assert.Equal(t, string(beforeData), string(archiveData))
+
+	metaData, err := os.ReadFile(archivePath + ".meta.json")
+	require.NoError(t, err)
+	var meta CompactionArchiveMeta
+	require.NoError(t, json.Unmarshal(metaData, &meta))
+	assert.Equal(t, compactID, meta.CompactID)
+	assert.Equal(t, result.ArchiveRef, meta.ArchiveRef)
+	assert.Equal(t, result.AfterEntryCount, meta.AfterEntryCount)
+
+	items, err := store.List("agent1")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "archive_test", items[0].ID)
+	assert.Equal(t, len(sess.History()), items[0].EntryCount)
 }
 
 func TestSessionCompactPreservesLatestPlanAndTodoState(t *testing.T) {

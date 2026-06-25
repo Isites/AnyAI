@@ -85,9 +85,21 @@ type ToolResultData struct {
 // CompactionData stores a model-authored handoff summary used to replace older
 // transcript history while preserving recent turns.
 type CompactionData struct {
-	Text            string `json:"text"`
-	Trigger         string `json:"trigger,omitempty"`
-	LegacyHeuristic bool   `json:"legacy_heuristic,omitempty"`
+	Text              string `json:"text"`
+	Trigger           string `json:"trigger,omitempty"`
+	LegacyHeuristic   bool   `json:"legacy_heuristic,omitempty"`
+	CompactID         string `json:"compact_id,omitempty"`
+	PreviousCompactID string `json:"previous_compact_id,omitempty"`
+	ArchiveRef        string `json:"archive_ref,omitempty"`
+	ArchiveSHA256     string `json:"archive_sha256,omitempty"`
+	SourceSHA256      string `json:"source_sha256,omitempty"`
+	BeforeEntryCount  int    `json:"before_entry_count,omitempty"`
+	AfterEntryCount   int    `json:"after_entry_count,omitempty"`
+	BeforeLeafID      string `json:"before_leaf_id,omitempty"`
+	AfterLeafID       string `json:"after_leaf_id,omitempty"`
+	CreatedAt         int64  `json:"created_at,omitempty"`
+	SummarySource     string `json:"summary_source,omitempty"`
+	CompactStrategy   string `json:"compact_strategy,omitempty"`
 }
 
 // RuntimeControlData stores runtime-authored control text for audit without
@@ -280,18 +292,51 @@ func (s *Session) Compact(summary string, keepEntries int) {
 	if len(history) <= keepEntries {
 		return // nothing to compact
 	}
-	s.ReplaceHistory(RewriteHistoryWithCompaction(
+	compactID := NewCompactionID()
+	archiveRef := ""
+	archive := s.store != nil
+	if archive {
+		archiveRef = CompactionArchiveRef(s.AgentID, s.ID, compactID, ArchiveCompressionGzip)
+	}
+	beforeLeafID := ""
+	if len(history) > 0 {
+		beforeLeafID = history[len(history)-1].ID
+	}
+	data := CompactionData{
+		Text:             summary,
+		Trigger:          "legacy_entry_count",
+		LegacyHeuristic:  true,
+		CompactID:        compactID,
+		ArchiveRef:       archiveRef,
+		BeforeEntryCount: len(history),
+		BeforeLeafID:     beforeLeafID,
+		SummarySource:    "legacy_session_compact",
+		CompactStrategy:  "legacy_entry_count",
+		CreatedAt:        time.Now().Unix(),
+	}
+	_, _ = s.ReplaceHistoryWithOptions(RewriteHistoryWithCompactionData(
 		history,
-		summary,
+		data,
 		keepEntries,
-		"legacy_entry_count",
-		true,
-	))
+	), RewriteOptions{
+		Archive:            archive,
+		CompactID:          compactID,
+		ArchiveCompression: ArchiveCompressionGzip,
+	})
 }
 
 // ReplaceHistory rewrites the session as a single linear history rooted at the
 // provided entries in order.
 func (s *Session) ReplaceHistory(entries []SessionEntry) {
+	_, _ = s.ReplaceHistoryWithOptions(entries, RewriteOptions{})
+}
+
+// ReplaceHistoryWithOptions rewrites the session as a single linear history
+// and persists it with optional Store rewrite behavior such as compaction
+// archival.
+func (s *Session) ReplaceHistoryWithOptions(entries []SessionEntry, opts RewriteOptions) (RewriteResult, error) {
+	oldEntries := append([]SessionEntry(nil), s.entries...)
+	oldLeafID := s.leafID
 	s.entries = nil
 	s.entryMap = make(map[string]*SessionEntry)
 	s.leafID = ""
@@ -311,8 +356,25 @@ func (s *Session) ReplaceHistory(entries []SessionEntry) {
 		prevID = entry.ID
 	}
 	if s.store != nil {
-		s.store.Rewrite(s)
+		result, err := s.store.RewriteWithOptions(s, opts)
+		if err != nil {
+			s.restoreEntries(oldEntries, oldLeafID)
+		}
+		return result, err
 	}
+	return RewriteResult{}, nil
+}
+
+func (s *Session) restoreEntries(entries []SessionEntry, leafID string) {
+	if s == nil {
+		return
+	}
+	s.entries = append([]SessionEntry(nil), entries...)
+	s.entryMap = make(map[string]*SessionEntry, len(s.entries))
+	for i := range s.entries {
+		s.entryMap[s.entries[i].ID] = &s.entries[i]
+	}
+	s.leafID = leafID
 }
 
 func (s *Session) addLoadedEntry(entry SessionEntry) {
@@ -372,6 +434,10 @@ func ApplyEntryRefs(entry SessionEntry, refs EntryRefs) SessionEntry {
 
 func NewEntryID() string {
 	return generateID("e")
+}
+
+func NewCompactionID() string {
+	return generateID("compact")
 }
 
 // Helper constructors for common entry types
@@ -523,14 +589,188 @@ func MetaEntry(text string) SessionEntry {
 	}
 }
 
+const sessionFocusMarker = "[Session Focus]"
+
+// SessionFocusEntry creates a compact direction anchor that is preserved across
+// compaction and shown to future model turns as meta context.
+func SessionFocusEntry(text string) SessionEntry {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "No explicit focus is available yet."
+	}
+	if !strings.HasPrefix(text, sessionFocusMarker) {
+		text = sessionFocusMarker + "\n" + text
+	}
+	return MetaEntry(text)
+}
+
+func IsSessionFocusEntry(entry SessionEntry) bool {
+	if entry.Type != EntryTypeMeta {
+		return false
+	}
+	var data MessageData
+	if err := json.Unmarshal(entry.Data, &data); err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(data.Text), sessionFocusMarker)
+}
+
+func LatestSessionFocusText(history []SessionEntry) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if !IsSessionFocusEntry(history[i]) {
+			continue
+		}
+		var data MessageData
+		if err := json.Unmarshal(history[i].Data, &data); err != nil {
+			continue
+		}
+		text := strings.TrimSpace(data.Text)
+		text = strings.TrimSpace(strings.TrimPrefix(text, sessionFocusMarker))
+		if text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func BuildSessionFocus(summary string, history []SessionEntry) string {
+	summary = strings.TrimSpace(summary)
+	var parts []string
+	if summary != "" {
+		parts = append(parts, "Current durable summary:\n"+limitText(summary, 1800))
+	}
+	if plan := latestPlanFocus(history); plan != "" {
+		parts = append(parts, "Latest plan:\n"+limitText(plan, 900))
+	}
+	if todos := latestTodoFocus(history); todos != "" {
+		parts = append(parts, "Latest todos:\n"+todos)
+	}
+	if users := latestUserFocus(history, 3); users != "" {
+		parts = append(parts, "Recent user direction:\n"+users)
+	}
+	if len(parts) == 0 {
+		return "No explicit focus is available yet."
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func latestPlanFocus(history []SessionEntry) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Type != EntryTypePlan {
+			continue
+		}
+		var data PlanData
+		if err := json.Unmarshal(history[i].Data, &data); err != nil {
+			continue
+		}
+		if data.Structured != nil {
+			text := strings.TrimSpace(runtimeplan.Render(*data.Structured))
+			if text != "" {
+				return text
+			}
+		}
+		if text := strings.TrimSpace(data.Plan); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func latestTodoFocus(history []SessionEntry) string {
+	entries := LatestStateEntries(history, nil)
+	if len(entries) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, entry := range entries {
+		if entry.Type != EntryTypeTodo {
+			continue
+		}
+		var data TodoData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			continue
+		}
+		content := strings.TrimSpace(data.Content)
+		if content == "" {
+			continue
+		}
+		status := strings.TrimSpace(data.Status)
+		if status == "" {
+			status = "unknown"
+		}
+		lines = append(lines, "- ["+status+"] "+limitText(content, 220))
+	}
+	if len(lines) > 8 {
+		lines = lines[len(lines)-8:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func latestUserFocus(history []SessionEntry, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, max)
+	for i := len(history) - 1; i >= 0 && len(lines) < max; i-- {
+		entry := history[i]
+		if entry.Type != EntryTypeMessage || strings.TrimSpace(entry.Role) != "user" || IsRuntimeControlEntry(entry) {
+			continue
+		}
+		var data MessageData
+		if err := json.Unmarshal(entry.Data, &data); err != nil {
+			continue
+		}
+		text := strings.TrimSpace(data.Text)
+		if text == "" {
+			continue
+		}
+		lines = append(lines, "- "+limitText(text, 360))
+	}
+	for left, right := 0, len(lines)-1; left < right; left, right = left+1, right-1 {
+		lines[left], lines[right] = lines[right], lines[left]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func limitText(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	if max <= 3 {
+		return text[:max]
+	}
+	return strings.TrimSpace(text[:max-3]) + "..."
+}
+
 // CompactionEntry creates a model-authored session compaction entry.
 func CompactionEntry(data CompactionData) SessionEntry {
+	if data.CreatedAt == 0 {
+		data.CreatedAt = time.Now().Unix()
+	}
 	payload, _ := json.Marshal(data)
 	return SessionEntry{
 		Type: EntryTypeCompaction,
 		Role: "user",
 		Data: payload,
 	}
+}
+
+func LatestCompactionData(history []SessionEntry) (CompactionData, bool) {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Type != EntryTypeCompaction {
+			continue
+		}
+		var data CompactionData
+		if err := json.Unmarshal(history[i].Data, &data); err != nil {
+			continue
+		}
+		if strings.TrimSpace(data.Text) == "" && strings.TrimSpace(data.CompactID) == "" {
+			continue
+		}
+		return data, true
+	}
+	return CompactionData{}, false
 }
 
 // RuntimeControlEntry creates a runtime-authored control entry.

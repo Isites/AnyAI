@@ -56,6 +56,7 @@ anyai start --project ./examples/ecommerce-cs
 - `harness-analytics`：分析工作流、共享技能和多角色结论校验。
 - `harness-coding`：编码、测试、审查协作流。
 - `harness-google-review`：审核闭环和共享规则库。
+- `h5-online`：H5 上线主控，通过 HTTP 调用审核与编码两个独立工作流。
 
 ## 每个示例值得试什么
 
@@ -135,6 +136,17 @@ anyai start --project ./examples/harness-coding
 ```bash
 anyai chat --project ./examples/harness-google-review
 anyai start --project ./examples/harness-google-review
+```
+
+### `h5-online`
+
+- 安利：把审核和修复两个独立 harness 组合成上线闭环。
+- 看点：单 Agent 主控、两个 HTTP skill、审核发现问题后调用编码修复，再复审直到无问题。
+- 入口 Agent：`h5-online`
+
+```bash
+anyai chat --project ./examples/h5-online
+anyai start --project ./examples/h5-online
 ```
 
 ## 会话续接和会话隔离

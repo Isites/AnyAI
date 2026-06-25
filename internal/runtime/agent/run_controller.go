@@ -166,7 +166,7 @@ func (c *runController) buildChatRequest(
 
 	history = c.rt.Session.History()
 	runtimeDirective := c.takePendingRuntimeControlText(history)
-	prepared := newTranscriptBuilder(history, c.rt.transcriptPolicy()).
+	prepared := newTranscriptBuilder(history, c.rt.transcriptPolicy(), c.rt.effectiveCompactionConfig().ContextProjection).
 		WithRuntimeDirective(runtimeDirective).
 		Build()
 	msgs := prepared.Messages

@@ -76,6 +76,10 @@ type CompactionConfig struct {
 	KeepRecentUserTurns  int
 	KeepRecentUserTokens int
 	SummaryMaxTokens     int
+	ArchiveEnabled       bool
+	ArchiveCompression   string
+	FocusEnabled         bool
+	ContextProjection    string
 }
 
 type TranscriptHygieneConfig struct {

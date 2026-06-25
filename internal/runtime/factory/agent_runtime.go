@@ -186,6 +186,10 @@ func BuildAgentRuntimeFromDeps(
 			KeepRecentUserTurns:  deps.Config.Runtime.Sessions.Compaction.KeepRecentUserTurns,
 			KeepRecentUserTokens: deps.Config.Runtime.Sessions.Compaction.KeepRecentUserTokens,
 			SummaryMaxTokens:     deps.Config.Runtime.Sessions.Compaction.SummaryMaxTokens,
+			ArchiveEnabled:       deps.Config.Runtime.Sessions.Compaction.ArchiveEnabledValue(),
+			ArchiveCompression:   deps.Config.Runtime.Sessions.Compaction.ArchiveCompression,
+			FocusEnabled:         deps.Config.Runtime.Sessions.Compaction.FocusEnabledValue(),
+			ContextProjection:    deps.Config.Runtime.Sessions.Compaction.ContextProjection,
 		},
 		ToolPreflight: agent.ToolPreflightConfig{
 			Enabled: deps.Config.Runtime.Tools.Preflight.EnabledValue(),

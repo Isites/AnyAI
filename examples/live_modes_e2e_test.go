@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Isites/anyai/internal/channel"
 	"github.com/Isites/anyai/internal/gateway"
 	"github.com/Isites/anyai/internal/registry"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
@@ -174,6 +175,24 @@ func TestExampleLiveCapabilitiesE2E(t *testing.T) {
 
 		assert.Contains(t, outcome.Run.Output, "会话")
 		assert.Contains(t, outcome.Run.Output, "记忆")
+	})
+
+	t.Run("single-agent-cli-image-reference", func(t *testing.T) {
+		if opts.only != "" && opts.only != "single-agent" {
+			t.Skip("filtered by ANYAI_EXAMPLE_ONLY")
+		}
+
+		harness := newLiveStartHarness(t, filepath.Join(opts.root, "single-agent"), opts)
+		imagePath := filepath.Join(t.TempDir(), "diagram.png")
+		require.NoError(t, os.WriteFile(imagePath, []byte{0x89, 'P', 'N', 'G'}, 0o644))
+		cleanText, blocks := channel.ParseCLIInput("请用一句话说明图里有什么1@" + imagePath)
+		require.Len(t, blocks, 1)
+		outcome := harness.runHTTPAllowEmptyOutput(t, "single-agent", "live-cli-image-reference", inputpkg.InputEnvelope{
+			SessionID: "live-cli-image-reference",
+			Blocks:    append([]inputpkg.InputBlock{{Type: "text", Text: cleanText}}, gatewayBlocksToRuntimeInput(blocks)...),
+		})
+		assert.NotContains(t, calledToolNames(outcome.Events), "read_file")
+		assertContainsInputBlock(t, outcome.Events, "image", "diagram.png")
 	})
 
 	t.Run("harness-analytics-shared-skills", func(t *testing.T) {

@@ -1,7 +1,6 @@
 package examples
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	httpchannel "github.com/Isites/anyai/internal/startup/http"
 	"github.com/Isites/anyai/internal/gateway"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
 	inputpkg "github.com/Isites/anyai/internal/runtime/input"
 	"github.com/Isites/anyai/internal/runtime/llm"
 	"github.com/Isites/anyai/internal/runtime/tool"
+	httpchannel "github.com/Isites/anyai/internal/startup/http"
 )
 
 type channelWorkflowTurn struct {
@@ -183,62 +182,25 @@ func createHTTPRunWithEnvelope(baseURL, agentID, sessionID string, env inputpkg.
 		return runtimeevents.RunRecord{}, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/api/chat?stream=1", bytes.NewReader(body))
-	if err != nil {
-		return runtimeevents.RunRecord{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	resp, err := http.Post(strings.TrimRight(baseURL, "/")+"/api/runs", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return runtimeevents.RunRecord{}, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return runtimeevents.RunRecord{}, err
-		}
-		var parsed runCreateResponse
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			return runtimeevents.RunRecord{}, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-		}
-		return runtimeevents.RunRecord{}, fmt.Errorf("http %d: %s", resp.StatusCode, firstNonEmpty(parsed.Error, string(data)))
-	}
-
-	return parseAcceptedRunFromSSE(resp.Body)
-}
-
-func parseAcceptedRunFromSSE(r io.Reader) (runtimeevents.RunRecord, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	var currentEvent string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:") && currentEvent == "run.accepted":
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			var accepted struct {
-				Run runtimeevents.RunRecord `json:"run"`
-			}
-			if err := json.Unmarshal([]byte(payload), &accepted); err != nil {
-				return runtimeevents.RunRecord{}, fmt.Errorf("decode accepted run from sse: %w", err)
-			}
-			if strings.TrimSpace(accepted.Run.ID) == "" {
-				return runtimeevents.RunRecord{}, fmt.Errorf("accepted run payload missing run id")
-			}
-			return accepted.Run, nil
-		}
-	}
-	if err := scanner.Err(); err != nil {
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return runtimeevents.RunRecord{}, err
 	}
-	return runtimeevents.RunRecord{}, fmt.Errorf("run.accepted event not found in sse stream")
+
+	var parsed runCreateResponse
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return runtimeevents.RunRecord{}, fmt.Errorf("decode create run response: %w", err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return runtimeevents.RunRecord{}, fmt.Errorf("http %d: %s", resp.StatusCode, firstNonEmpty(parsed.Error, string(data)))
+	}
+	return runtimeevents.RunRecord{ID: parsed.Run.ID}, nil
 }
 
 func waitForRecordedRun(t *testing.T, recorder *runtimeevents.Recorder, runID string) runtimeevents.RunRecord {
@@ -513,17 +475,20 @@ func channelWorkflowScenarios() []channelWorkflowScenario {
 						{Mode: "single", Agents: []string{"context-analyst"}},
 						{Mode: "single", Agents: []string{"architect"}},
 						{Mode: "single", Agents: []string{"plan-reviewer"}},
-						{Mode: "parallel", Agents: []string{"coder", "test-engineer"}},
-						{Mode: "parallel", Agents: []string{"reviewer", "reviewer-security"}},
-						{Mode: "parallel", Agents: []string{"global-reviewer", "alignment-reviewer"}},
+						{Mode: "single", Agents: []string{"coder"}},
+						{Mode: "single", Agents: []string{"ui-test-engineer"}},
 						{Mode: "single", Agents: []string{"test-engineer"}},
+						{Mode: "parallel", Agents: []string{"reviewer", "reviewer-security"}},
+						{Mode: "single", Agents: []string{"global-reviewer"}},
+						{Mode: "single", Agents: []string{"alignment-reviewer"}},
 					},
 					ChildCounts: map[string]int{
 						"context-analyst":    1,
 						"architect":          1,
 						"plan-reviewer":      1,
 						"coder":              1,
-						"test-engineer":      2,
+						"ui-test-engineer":   1,
+						"test-engineer":      1,
 						"reviewer":           1,
 						"reviewer-security":  1,
 						"global-reviewer":    1,
@@ -550,37 +515,54 @@ func channelWorkflowScenarios() []channelWorkflowScenario {
 			Project: "harness-google-review",
 			Turns: []channelWorkflowTurn{
 				{
-					Prompt: "请基于 E-E-A-T 和常见拒审原因，做一次完整 Google 审核闭环。",
+					Prompt: "请审核 https://example.com，按标准 AdSense 串行产物流程推进。",
 					Steps: []agentCallStepExpectation{
-						{Mode: "parallel", Agents: []string{"quality-auditor", "seo-auditor", "ux-auditor", "policy-auditor"}},
-						{Mode: "single", Agents: []string{"requirement-generator"}},
-						{Mode: "single", Agents: []string{"qa-verifier"}},
-						{Mode: "parallel", Agents: []string{"quality-auditor", "seo-auditor", "ux-auditor", "policy-auditor"}},
+						{Mode: "single", Agents: []string{"intake-triager"}},
+						{Mode: "single", Agents: []string{"site-crawler"}},
+						{Mode: "parallel", Agents: []string{"content-analyzer", "duplication-auditor", "seo-analyzer"}},
+						{Mode: "parallel", Agents: []string{"ux-analyzer", "policy-analyzer", "ad-inventory-analyzer"}},
+						{Mode: "single", Agents: []string{"rejection-mapper"}},
+						{Mode: "single", Agents: []string{"report-generator"}},
 					},
 					ChildCounts: map[string]int{
-						"quality-auditor":       2,
-						"seo-auditor":           2,
-						"ux-auditor":            2,
-						"policy-auditor":        2,
-						"requirement-generator": 1,
-						"qa-verifier":           1,
+						"intake-triager":        1,
+						"site-crawler":          1,
+						"content-analyzer":      1,
+						"duplication-auditor":   1,
+						"seo-analyzer":          1,
+						"ux-analyzer":           1,
+						"policy-analyzer":       1,
+						"ad-inventory-analyzer": 1,
+						"rejection-mapper":      1,
+						"report-generator":      1,
 					},
 				},
 				{Prompt: "基于你刚才的审核，用一句话概括当前最大风险。"},
 				{Prompt: "如果现在只修一个问题，你会优先修什么？"},
 				{
-					Prompt: "请再做一次轻量回归，只让 quality-auditor 和 policy-auditor 各给一句判断。",
+					Prompt: "请基于已有站点画像再做一次轻量回归，只让 content-analyzer 和 policy-analyzer 各给一句判断。",
 					Steps: []agentCallStepExpectation{
-						{Mode: "parallel", Agents: []string{"quality-auditor", "policy-auditor"}},
+						{Mode: "parallel", Agents: []string{"content-analyzer", "policy-analyzer"}},
 					},
 					ChildCounts: map[string]int{
-						"quality-auditor": 1,
-						"policy-auditor":  1,
+						"content-analyzer": 1,
+						"policy-analyzer":  1,
 					},
 				},
 				{Prompt: "把整个审核闭环压缩成两句结论。"},
 			},
 			IsolatedPrompt: "这是新的审核会话，请一句话说明你会重新开始。",
+		},
+		{
+			Project: "h5-online",
+			Turns: []channelWorkflowTurn{
+				{Prompt: "不要调用工具。请用两句话说明 h5-online 这个示例如何组织上线流程。"},
+				{Prompt: "基于你上一条回答，用一句话说明为什么用户只需要自然语言描述上线目标。"},
+				{Prompt: "如果审核发现问题，下一步应该发生什么？"},
+				{Prompt: "如果复审没有发现问题，工作流如何退出？"},
+				{Prompt: "把整个上线闭环压缩成两句结论。"},
+			},
+			IsolatedPrompt: "这是新的 H5 上线会话，请一句话说明你会重新开始。",
 		},
 	}
 }
@@ -602,6 +584,8 @@ func channelWorkflowScenarioHandler(root string, scenario channelWorkflowScenari
 			return handleCodingChannelScenario(root, scenario, agentID, req)
 		case "harness-google-review":
 			return handleGoogleReviewChannelScenario(root, scenario, agentID, req)
+		case "h5-online":
+			return handleH5OnlineChannelScenario(root, scenario, agentID, req)
 		default:
 			return nil, fmt.Errorf("unsupported scenario %q", scenario.Project)
 		}
@@ -964,24 +948,34 @@ func handleCodingChannelScenario(root string, scenario channelWorkflowScenario, 
 					Task:  "请审核健康检查接口方案并给出通过或封驳结论。",
 				}), nil
 			case 3:
-				return parallelAgentCallEvents("tc_coding_build", []tools.AgentCallRequest{
-					{Agent: "coder", Task: "请按审批通过的方案实现健康检查接口。"},
-					{Agent: "test-engineer", Task: "请按审批通过的方案编写并运行健康检查接口测试。"},
+				return singleAgentCallEvents("tc_coding_build", tools.AgentCallRequest{
+					Agent: "coder",
+					Task:  "请按审批通过的方案实现健康检查接口。",
 				}), nil
 			case 4:
+				return singleAgentCallEvents("tc_coding_ui_test", tools.AgentCallRequest{
+					Agent: "ui-test-engineer",
+					Task:  "本轮涉及接口响应但没有浏览器界面变更；请确认是否需要 UI 测试并写入 UI 测试报告。",
+				}), nil
+			case 5:
+				return singleAgentCallEvents("tc_coding_test", tools.AgentCallRequest{
+					Agent: "test-engineer",
+					Task:  "UI 测试门禁已处理；请按审批通过的方案编写并运行健康检查接口测试。",
+				}), nil
+			case 6:
 				return parallelAgentCallEvents("tc_coding_review", []tools.AgentCallRequest{
 					{Agent: "reviewer", Task: "请审查健康检查接口实现。"},
 					{Agent: "reviewer-security", Task: "请从安全角度审查健康检查接口实现。"},
 				}), nil
-			case 5:
-				return parallelAgentCallEvents("tc_coding_global_alignment", []tools.AgentCallRequest{
-					{Agent: "global-reviewer", Task: "请检查健康检查接口变更的全局影响。"},
-					{Agent: "alignment-reviewer", Task: "请检查实现与审批通过方案是否对齐。"},
+			case 7:
+				return singleAgentCallEvents("tc_coding_global", tools.AgentCallRequest{
+					Agent: "global-reviewer",
+					Task:  "请检查健康检查接口变更的全局影响。",
 				}), nil
-			case 6:
-				return singleAgentCallEvents("tc_coding_acceptance", tools.AgentCallRequest{
-					Agent: "test-engineer",
-					Task:  "请执行最终验收测试并给出结论。",
+			case 8:
+				return singleAgentCallEvents("tc_coding_alignment", tools.AgentCallRequest{
+					Agent: "alignment-reviewer",
+					Task:  "请检查实现、UI 测试证据、普通测试证据与审批通过方案是否对齐。",
 				}), nil
 			default:
 				return textEvents("流程完成：方案、实现、测试、审查和验收都已闭环。"), nil
@@ -1026,6 +1020,8 @@ func handleCodingChannelScenario(root string, scenario channelWorkflowScenario, 
 		return textEvents("方案审批通过。"), nil
 	case "coder":
 		return textEvents("实现完成：新增健康检查处理器。"), nil
+	case "ui-test-engineer":
+		return textEvents("UI 测试门禁完成：本轮无需浏览器界面测试。"), nil
 	case "test-engineer":
 		return textEvents("测试完成：新增健康检查接口测试并给出验收结论。"), nil
 	case "reviewer":
@@ -1049,37 +1045,51 @@ func handleGoogleReviewChannelScenario(root string, scenario channelWorkflowScen
 		case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[0], projectDir)):
 			switch ctx.ToolCallsThisTurn {
 			case 0:
-				return parallelAgentCallEvents("tc_review_audit_round1", []tools.AgentCallRequest{
-					{Agent: "quality-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "seo-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "ux-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "policy-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-				}), nil
+				return singleAgentCallEvents("tc_review_intake", googleReviewTask("intake-triager", "Phase 0: normalize URL and write the site brief.", nil, []string{"artifacts-1/01-site-brief.md"})), nil
 			case 1:
-				return singleAgentCallEvents("tc_review_requirements", tools.AgentCallRequest{
-					Agent: "requirement-generator",
-					Task:  "请把四位审计师的问题整理成修复需求。",
-				}), nil
+				return singleAgentCallEvents("tc_review_crawl", googleReviewTask("site-crawler", "Phase 1: crawl the site using the intake brief.", []string{"artifacts-1/01-site-brief.md"}, []string{"artifacts-1/02-site-profile.json"})), nil
 			case 2:
-				return singleAgentCallEvents("tc_review_qa", tools.AgentCallRequest{
-					Agent: "qa-verifier",
-					Task:  "请验证修复是否到位。",
+				return parallelAgentCallEvents("tc_review_analysis_batch1", []tools.AgentCallRequest{
+					googleReviewTask("content-analyzer", "Phase 2A: analyze content value from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/03-content-analysis.md"}),
+					googleReviewTask("duplication-auditor", "Phase 2A: audit duplication from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/04-duplication-analysis.md"}),
+					googleReviewTask("seo-analyzer", "Phase 2A: analyze technical SEO from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/05-seo-analysis.md"}),
 				}), nil
 			case 3:
-				return parallelAgentCallEvents("tc_review_audit_round2", []tools.AgentCallRequest{
-					{Agent: "quality-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "seo-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "ux-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "policy-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
+				return parallelAgentCallEvents("tc_review_analysis_batch2", []tools.AgentCallRequest{
+					googleReviewTask("ux-analyzer", "Phase 3: analyze mobile UX from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/06-ux-analysis.md"}),
+					googleReviewTask("policy-analyzer", "Phase 3: analyze trust and policy pages from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/07-policy-analysis.md"}),
+					googleReviewTask("ad-inventory-analyzer", "Phase 3: analyze AdSense inventory from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/08-ad-inventory-analysis.md"}),
 				}), nil
+			case 4:
+				return singleAgentCallEvents("tc_review_mapping", googleReviewTask("rejection-mapper", "Phase 4: map analysis results to rejection types.", []string{
+					"artifacts-1/01-site-brief.md",
+					"artifacts-1/03-content-analysis.md",
+					"artifacts-1/04-duplication-analysis.md",
+					"artifacts-1/05-seo-analysis.md",
+					"artifacts-1/06-ux-analysis.md",
+					"artifacts-1/07-policy-analysis.md",
+					"artifacts-1/08-ad-inventory-analysis.md",
+				}, []string{"artifacts-1/09-rejection-mapping.md"})), nil
+			case 5:
+				return singleAgentCallEvents("tc_review_report", googleReviewTask("report-generator", "Phase 5: generate the final review report.", []string{
+					"artifacts-1/01-site-brief.md",
+					"artifacts-1/02-site-profile.json",
+					"artifacts-1/03-content-analysis.md",
+					"artifacts-1/04-duplication-analysis.md",
+					"artifacts-1/05-seo-analysis.md",
+					"artifacts-1/06-ux-analysis.md",
+					"artifacts-1/07-policy-analysis.md",
+					"artifacts-1/08-ad-inventory-analysis.md",
+					"artifacts-1/09-rejection-mapping.md",
+				}, []string{"artifacts-1/10-final-report.md"})), nil
 			default:
-				return textEvents("审核闭环完成：主要阻塞项已清理，剩余风险可控。"), nil
+				return textEvents("审核完成：最终报告已生成，关键风险和 submit_ready 结论已写入正式产物。"), nil
 			}
 		case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[1], projectDir)):
 			if len(ctx.PriorUserTurns) < 1 {
 				return nil, fmt.Errorf("google review turn 2 did not receive prior history")
 			}
-			return textEvents("当前最大风险仍然是站点信任信号不足。"), nil
+			return textEvents("当前最大风险来自内容价值和信任页证据不足。"), nil
 		case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[2], projectDir)):
 			if len(ctx.PriorUserTurns) < 2 {
 				return nil, fmt.Errorf("google review turn 3 did not receive prior history")
@@ -1091,8 +1101,8 @@ func handleGoogleReviewChannelScenario(root string, scenario channelWorkflowScen
 			}
 			if ctx.ToolCallsThisTurn == 0 {
 				return parallelAgentCallEvents("tc_review_light_regression", []tools.AgentCallRequest{
-					{Agent: "quality-auditor", Task: "请做一次轻量质量回归，只给一句判断。"},
-					{Agent: "policy-auditor", Task: "请做一次轻量政策回归，只给一句判断。"},
+					googleReviewTask("content-analyzer", "请基于已有站点画像做一次轻量内容回归，只给一句判断。", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/03-content-analysis.md"}),
+					googleReviewTask("policy-analyzer", "请基于已有站点画像做一次轻量政策回归，只给一句判断。", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/07-policy-analysis.md"}),
 				}), nil
 			}
 			return textEvents("轻量回归显示主要问题已缓解，但还需继续增强信任信号。"), nil
@@ -1107,18 +1117,66 @@ func handleGoogleReviewChannelScenario(root string, scenario channelWorkflowScen
 			}
 			return textEvents("这是新的审核会话，我会重新开始。"), nil
 		}
-	case "quality-auditor":
-		return textEvents("内容质量审计：存在薄内容和信任信号不足。"), nil
-	case "seo-auditor":
-		return textEvents("SEO 审计：结构化数据需要补齐。"), nil
-	case "ux-auditor":
-		return textEvents("UX 审计：移动端信任信号不足。"), nil
-	case "policy-auditor":
-		return textEvents("政策审计：暂无硬性违规，但需补充政策页。"), nil
-	case "requirement-generator":
-		return textEvents("修复需求：补信任页、补结构化数据、补内容深度。"), nil
-	case "qa-verifier":
-		return textEvents("QA 验证：修复项基本通过。"), nil
+	case "intake-triager":
+		return googleReviewArtifactEvents(req, "artifacts-1/01-site-brief.md", googleReviewArtifactContent("01-site-brief.md"), "已写入 artifacts-1/01-site-brief.md。"), nil
+	case "site-crawler":
+		return googleReviewArtifactEvents(req, "artifacts-1/02-site-profile.json", googleReviewArtifactContent("02-site-profile.json"), "已写入 artifacts-1/02-site-profile.json。"), nil
+	case "content-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/03-content-analysis.md", googleReviewArtifactContent("03-content-analysis.md"), "已写入 artifacts-1/03-content-analysis.md。"), nil
+	case "duplication-auditor":
+		return googleReviewArtifactEvents(req, "artifacts-1/04-duplication-analysis.md", googleReviewArtifactContent("04-duplication-analysis.md"), "已写入 artifacts-1/04-duplication-analysis.md。"), nil
+	case "seo-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/05-seo-analysis.md", googleReviewArtifactContent("05-seo-analysis.md"), "已写入 artifacts-1/05-seo-analysis.md。"), nil
+	case "ux-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/06-ux-analysis.md", googleReviewArtifactContent("06-ux-analysis.md"), "已写入 artifacts-1/06-ux-analysis.md。"), nil
+	case "policy-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/07-policy-analysis.md", googleReviewArtifactContent("07-policy-analysis.md"), "已写入 artifacts-1/07-policy-analysis.md。"), nil
+	case "ad-inventory-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/08-ad-inventory-analysis.md", googleReviewArtifactContent("08-ad-inventory-analysis.md"), "已写入 artifacts-1/08-ad-inventory-analysis.md。"), nil
+	case "rejection-mapper":
+		return googleReviewArtifactEvents(req, "artifacts-1/09-rejection-mapping.md", googleReviewArtifactContent("09-rejection-mapping.md"), "已写入 artifacts-1/09-rejection-mapping.md。"), nil
+	case "report-generator":
+		return googleReviewArtifactEvents(req, "artifacts-1/10-final-report.md", googleReviewArtifactContent("10-final-report.md"), "已写入 artifacts-1/10-final-report.md。"), nil
 	}
 	return nil, fmt.Errorf("unexpected agent %q for scenario %q", agentID, scenario.Project)
+}
+
+func handleH5OnlineChannelScenario(root string, scenario channelWorkflowScenario, agentID string, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+	ctx := currentTurnContext(req.Messages)
+	projectDir := filepath.Join(root, scenario.Project)
+	if agentID != "h5-online" {
+		return nil, fmt.Errorf("unexpected agent %q for scenario %q", agentID, scenario.Project)
+	}
+
+	switch ctx.Prompt {
+	case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[0], projectDir)):
+		return textEvents("h5-online 是单 Agent 上线主控，通过 HTTP 调用审核和编码两个独立项目。它会循环审核、修复、复审，直到审核没有问题。"), nil
+	case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[1], projectDir)):
+		if len(ctx.PriorUserTurns) < 1 {
+			return nil, fmt.Errorf("h5-online turn 2 did not receive prior history")
+		}
+		return textEvents("用户只要描述上线目标，主控会自己调度审核与修复闭环。"), nil
+	case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[2], projectDir)):
+		if len(ctx.PriorUserTurns) < 2 {
+			return nil, fmt.Errorf("h5-online turn 3 did not receive prior history")
+		}
+		return textEvents("审核发现问题后，必须把问题清单交给 coding 服务修复。"), nil
+	case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[3], projectDir)):
+		if len(ctx.PriorUserTurns) < 3 {
+			return nil, fmt.Errorf("h5-online turn 4 did not receive prior history")
+		}
+		return textEvents("复审没有发现问题时，工作流才能退出并给出上线结论。"), nil
+	case resolvedEnvelopeText(buildChannelTurnEnvelope(scenario.Turns[4], projectDir)):
+		if len(ctx.PriorUserTurns) < 4 {
+			return nil, fmt.Errorf("h5-online turn 5 did not receive prior history")
+		}
+		return textEvents("先审核，再修复，再复审；唯一退出条件是审核无问题。"), nil
+	case scenario.IsolatedPrompt:
+		if len(ctx.PriorUserTurns) != 0 {
+			return nil, fmt.Errorf("h5-online isolated session leaked prior history")
+		}
+		return textEvents("这是新的 H5 上线会话，我会重新开始。"), nil
+	default:
+		return nil, fmt.Errorf("unexpected prompt %q", ctx.Prompt)
+	}
 }

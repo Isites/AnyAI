@@ -34,12 +34,30 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 24, cfg.Runtime.Tools.LoopDetection.HistorySize)
 	assert.Equal(t, 4, cfg.Runtime.Tools.LoopDetection.WarningThreshold)
 	assert.Equal(t, 6, cfg.Runtime.Tools.LoopDetection.BlockThreshold)
+	assert.True(t, cfg.Runtime.Sessions.Compaction.ArchiveEnabledValue())
+	assert.Equal(t, "gzip", cfg.Runtime.Sessions.Compaction.ArchiveCompression)
+	assert.True(t, cfg.Runtime.Sessions.Compaction.FocusEnabledValue())
+	assert.Equal(t, "state_aware", cfg.Runtime.Sessions.Compaction.ContextProjection)
 	assert.Equal(t, "debug", cfg.Logging.FileLevel)
 	assert.Equal(t, "info", cfg.Logging.StderrLevel)
 	assert.Equal(t, "warn", cfg.Logging.WhatsMeowLevel)
 	assert.Equal(t, "runtime.log", cfg.Logging.Rotation.Filename)
 	assert.EqualValues(t, 10<<20, cfg.Logging.Rotation.MaxBytes)
 	assert.Equal(t, 20, cfg.Logging.Rotation.MaxBackups)
+}
+
+func TestValidateRejectsInvalidSessionCompactionOptions(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Runtime.Sessions.Compaction.ArchiveCompression = "zip"
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "archiveCompression")
+
+	cfg = DefaultConfig()
+	cfg.Runtime.Sessions.Compaction.ContextProjection = "random"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "contextProjection")
 }
 
 func TestDefaultGatewayHostPortDerivedFromListen(t *testing.T) {

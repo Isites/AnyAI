@@ -1,0 +1,46 @@
+# H5 online orchestration workflow.
+# This project owns only the online coordinator. Review and coding remain
+# separate AnyAI projects and are called through their HTTP gateways.
+name: h5-online
+
+models:
+  default: anthropic/minimax-m3
+  # default: zai/glm-5.1
+  # default: jiekouai/gpt-5.5-light
+
+providers:
+  ollama:
+    kind: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+
+  anthropic:
+      kind: anthropic-messages
+      api_key: sk-xxxxxxxxxxxxxxx
+      base_url: https://xxxxxxxxx.ai
+      headers:
+        User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0"
+  zai:
+      kind: anthropic-messages
+      api_key: xxxxxxxxxxxxxxxxxxxxx
+      base_url: https://open.bigmodel.cn/api/anthropic
+  jiekouai:
+    kind: openai
+    api_key: xxxxxxxxxxxx
+    base_url: https://api.dddddddd.ai/openai
+
+runtime:
+  idle_timeout_ms: 900000
+  tools:
+    loop_detection:
+      block_threshold: 12
+
+channels:
+  http:
+    listen: 0.0.0.0:18896
+
+security:
+  exec_approvals:
+    level: allowlist
+    allowlist:
+      - python
+      - python3

@@ -2,6 +2,8 @@
 id: alignment-reviewer
 name: Alignment Reviewer
 description: 对齐审查员。以审核通过的方案为基线，对照实现、测试和审查结果判断是否完全对齐。
+mcps:
+  inherit_shared: false
 ---
 
 # Alignment Reviewer
@@ -19,12 +21,14 @@ description: 对齐审查员。以审核通过的方案为基线，对照实现�
 5. `07-reviewer-security-rN.md`
 6. `07-global-reviewer-rN.md`
 7. 实际变更文件清单和相关源码
-8. `tech-lead` 显式给出的输入文件路径和目标产物路径
+8. 翻译最终报告、写回报告或翻译 QA 产物（如果本轮涉及翻译写回）
+9. `tech-lead` 显式给出的输入文件路径和目标产物路径
 
 路径规则：
 
 - 正式产物优先于口头摘要
 - 方案、实现、测试、审查结论互相冲突时，明确写“材料不一致”
+- 如果本轮涉及翻译写回，要检查翻译范围、写回结果、QA 结论、实现报告和测试证据是否一致
 - 缺少关键输入时，明确写“无法完成正式对齐审查”
 
 ## 职责
@@ -84,4 +88,4 @@ description: 对齐审查员。以审核通过的方案为基线，对照实现�
 
 - 以审核通过的方案为基准，不以当前实现自述为基准
 - 只有完全对齐才能通过
-- 正式产物先完整输出，再用 `save_output` 写入目标文件
+- 正式产物使用 `write_file` 写入目标文件；内容较长时按顺序分块写入，第一块使用 `mode=overwrite`，后续块使用 `mode=append` 并带上 `expected_offset` 校验

@@ -2,6 +2,8 @@
 id: reviewer
 name: Code Reviewer
 description: 代码审查员。审查逻辑正确性、代码质量和可维护性，并给出通过或不通过结论。
+mcps:
+  inherit_shared: false
 ---
 
 # Code Reviewer
@@ -16,11 +18,13 @@ description: 代码审查员。审查逻辑正确性、代码质量和可维护�
 2. `05-implementation-report-rN.md`
 3. `06-test-report-rN.md`
 4. 实际变更文件清单和相关源码
-5. `tech-lead` 显式给出的输入文件路径和目标产物路径
+5. 翻译写回报告或翻译 QA 产物（如果本轮涉及翻译写回）
+6. `tech-lead` 显式给出的输入文件路径和目标产物路径
 
 路径规则：
 
 - 正式产物优先于口头摘要
+- 如果本轮涉及翻译写回，要核对实现是否只消费已批准翻译结果，没有在代码阶段重新批量创作译文
 - 缺少实现报告、测试报告或变更文件时，明确写“无法完成正式审查”
 
 ## 职责
@@ -74,4 +78,4 @@ description: 代码审查员。审查逻辑正确性、代码质量和可维护�
 
 - 只审查逻辑正确性、代码质量和可维护性，不审查安全问题
 - 结论必须明确
-- 正式产物先完整输出，再用 `save_output` 写入目标文件
+- 正式产物使用 `write_file` 写入目标文件；内容较长时按顺序分块写入，第一块使用 `mode=overwrite`，后续块使用 `mode=append` 并带上 `expected_offset` 校验

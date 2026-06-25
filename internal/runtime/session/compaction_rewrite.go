@@ -1,6 +1,9 @@
 package session
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 const defaultCompactionReplayKeepEntries = 24
 
@@ -14,10 +17,25 @@ func RewriteHistoryWithCompaction(
 	trigger string,
 	legacyHeuristic bool,
 ) []SessionEntry {
+	return RewriteHistoryWithCompactionData(history, CompactionData{
+		Text:            summary,
+		Trigger:         trigger,
+		LegacyHeuristic: legacyHeuristic,
+	}, keepEntries)
+}
+
+func RewriteHistoryWithCompactionData(
+	history []SessionEntry,
+	data CompactionData,
+	keepEntries int,
+) []SessionEntry {
 	history = RepairLeadingFragment(history)
-	summary = strings.TrimSpace(summary)
-	if len(history) == 0 || summary == "" {
+	data.Text = strings.TrimSpace(data.Text)
+	if len(history) == 0 || data.Text == "" {
 		return append([]SessionEntry(nil), history...)
+	}
+	if data.CreatedAt == 0 {
+		data.CreatedAt = time.Now().Unix()
 	}
 
 	if keepEntries <= 0 {
@@ -26,12 +44,9 @@ func RewriteHistoryWithCompaction(
 
 	blocks := BuildHistoryBlocks(history)
 	if len(blocks) == 0 {
+		data.AfterEntryCount = 1
 		return []SessionEntry{
-			CompactionEntry(CompactionData{
-				Text:            summary,
-				Trigger:         trigger,
-				LegacyHeuristic: legacyHeuristic,
-			}),
+			CompactionEntry(data),
 		}
 	}
 
@@ -48,11 +63,8 @@ func RewriteHistoryWithCompaction(
 
 	stateEntries := LatestStateEntries(history, recentIDs)
 	finalEntries := make([]SessionEntry, 0, 1+len(stateEntries)+len(recentEntries))
-	finalEntries = append(finalEntries, CompactionEntry(CompactionData{
-		Text:            summary,
-		Trigger:         trigger,
-		LegacyHeuristic: legacyHeuristic,
-	}))
+	data.AfterEntryCount = 1 + len(stateEntries) + len(recentEntries)
+	finalEntries = append(finalEntries, CompactionEntry(data))
 	finalEntries = append(finalEntries, stateEntries...)
 	finalEntries = append(finalEntries, recentEntries...)
 	return RepairLeadingFragment(finalEntries)

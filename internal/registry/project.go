@@ -397,6 +397,10 @@ func (p *Project) buildRuntimeConfig() (*config.Config, error) {
 			KeepRecentUserTurns:  p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTurns,
 			KeepRecentUserTokens: p.ProjectConfig.Runtime.Sessions.Compaction.KeepRecentUserTokens,
 			SummaryMaxTokens:     p.ProjectConfig.Runtime.Sessions.Compaction.SummaryMaxTokens,
+			ArchiveEnabled:       config.CloneBoolPtr(p.ProjectConfig.Runtime.Sessions.Compaction.ArchiveEnabled),
+			ArchiveCompression:   p.ProjectConfig.Runtime.Sessions.Compaction.ArchiveCompression,
+			FocusEnabled:         config.CloneBoolPtr(p.ProjectConfig.Runtime.Sessions.Compaction.FocusEnabled),
+			ContextProjection:    p.ProjectConfig.Runtime.Sessions.Compaction.ContextProjection,
 		}
 		cfg.Logging = config.LoggingConfig{
 			FileLevel:      p.ProjectConfig.Logging.FileLevel,

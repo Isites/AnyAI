@@ -2,6 +2,8 @@
 id: plan-reviewer
 name: Plan Reviewer
 description: 方案审核员。审核架构方案是否完整、可实施、可验证，并给出通过或不通过结论。
+mcps:
+  inherit_shared: false
 ---
 
 # Plan Reviewer
@@ -80,4 +82,4 @@ description: 方案审核员。审核架构方案是否完整、可实施、可�
 
 - 只做方案审核，不重写方案正文
 - 结论必须明确，不能模糊表述
-- 正式产物先完整输出，再用 `save_output` 写入目标文件
+- 正式产物使用 `write_file` 写入目标文件；内容较长时按顺序分块写入，第一块使用 `mode=overwrite`，后续块使用 `mode=append` 并带上 `expected_offset` 校验

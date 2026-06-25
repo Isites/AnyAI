@@ -98,6 +98,10 @@ type ProjectSessionCompactionConfig struct {
 	KeepRecentUserTurns  int    `yaml:"keep_recent_user_turns"`
 	KeepRecentUserTokens int    `yaml:"keep_recent_user_tokens"`
 	SummaryMaxTokens     int    `yaml:"summary_max_tokens"`
+	ArchiveEnabled       *bool  `yaml:"archive_enabled,omitempty"`
+	ArchiveCompression   string `yaml:"archive_compression"`
+	FocusEnabled         *bool  `yaml:"focus_enabled,omitempty"`
+	ContextProjection    string `yaml:"context_projection"`
 }
 
 type ProjectToolLoopDetectionConfig struct {
@@ -258,6 +262,18 @@ func (c *ProjectConfig) applyDefaults() {
 	if c.Runtime.Sessions.Compaction.SummaryMaxTokens == 0 {
 		c.Runtime.Sessions.Compaction.SummaryMaxTokens = defaultSessionCompactionSummaryTokens
 	}
+	if c.Runtime.Sessions.Compaction.ArchiveEnabled == nil {
+		c.Runtime.Sessions.Compaction.ArchiveEnabled = boolPtr(true)
+	}
+	if strings.TrimSpace(c.Runtime.Sessions.Compaction.ArchiveCompression) == "" {
+		c.Runtime.Sessions.Compaction.ArchiveCompression = defaultSessionCompactionArchiveCompression
+	}
+	if c.Runtime.Sessions.Compaction.FocusEnabled == nil {
+		c.Runtime.Sessions.Compaction.FocusEnabled = boolPtr(true)
+	}
+	if strings.TrimSpace(c.Runtime.Sessions.Compaction.ContextProjection) == "" {
+		c.Runtime.Sessions.Compaction.ContextProjection = defaultSessionCompactionContextProjection
+	}
 	if c.Memory.Enabled == nil {
 		enabled := true
 		c.Memory.Enabled = &enabled
@@ -334,6 +350,16 @@ func (c *ProjectConfig) Validate() error {
 	}
 	if c.Runtime.Sessions.Compaction.SummaryMaxTokens < 0 {
 		return fmt.Errorf("runtime.sessions.compaction.summary_max_tokens must be >= 0")
+	}
+	switch strings.TrimSpace(c.Runtime.Sessions.Compaction.ArchiveCompression) {
+	case "", "gzip", "none":
+	default:
+		return fmt.Errorf("runtime.sessions.compaction.archive_compression must be one of gzip, none")
+	}
+	switch strings.TrimSpace(c.Runtime.Sessions.Compaction.ContextProjection) {
+	case "", "state_aware", "recent":
+	default:
+		return fmt.Errorf("runtime.sessions.compaction.context_projection must be one of state_aware, recent")
 	}
 	if !isSupportedLogLevel(c.Logging.FileLevel) {
 		return fmt.Errorf("logging.file_level must be one of debug, info, warn, error")

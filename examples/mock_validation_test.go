@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -16,7 +17,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Isites/anyai/internal/channel"
 	"github.com/Isites/anyai/internal/config"
+	"github.com/Isites/anyai/internal/gateway"
 	"github.com/Isites/anyai/internal/registry"
 	airuntime "github.com/Isites/anyai/internal/runtime"
 	runtimeevents "github.com/Isites/anyai/internal/runtime/events"
@@ -32,6 +35,88 @@ import (
 )
 
 var legacySystemPromptAgentIDPattern = regexp.MustCompile(`\((?:id: )([^)]+)\)`)
+
+func gatewayBlocksToRuntimeInput(blocks []gateway.InputBlock) []inputpkg.InputBlock {
+	if len(blocks) == 0 {
+		return nil
+	}
+	out := make([]inputpkg.InputBlock, len(blocks))
+	for i, block := range blocks {
+		out[i] = inputpkg.InputBlock{
+			ID:           block.ID,
+			Type:         block.Type,
+			Name:         block.Name,
+			Text:         block.Text,
+			Path:         block.Path,
+			AttachmentID: block.AttachmentID,
+			URL:          block.URL,
+			MimeType:     block.MimeType,
+			Data:         append([]byte(nil), block.Data...),
+			Meta:         cloneExampleMap(block.Meta),
+		}
+	}
+	return out
+}
+
+func cloneExampleMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func assertContainsInputBlock(t *testing.T, events []runtimeevents.EventRecord, blockType, name string) {
+	t.Helper()
+	for _, event := range events {
+		switch event.Name {
+		case runtimeevents.EventInputNormalized, runtimeevents.EventInputReceived:
+			blocks, _ := event.Payload["blocks"].([]map[string]any)
+			if len(blocks) == 0 {
+				rawBlocks, _ := event.Payload["blocks"].([]any)
+				for _, raw := range rawBlocks {
+					item, _ := raw.(map[string]any)
+					if item == nil {
+						continue
+					}
+					if item["type"] == blockType && item["name"] == name {
+						return
+					}
+				}
+				continue
+			}
+			for _, block := range blocks {
+				if block["type"] == blockType && block["name"] == name {
+					return
+				}
+			}
+		case runtimeevents.EventSessionInputStored:
+			if blockType != "image" {
+				continue
+			}
+			images, _ := event.Payload["images"].([]map[string]any)
+			if len(images) == 0 {
+				rawImages, _ := event.Payload["images"].([]any)
+				for _, raw := range rawImages {
+					item, _ := raw.(map[string]any)
+					if item != nil && item["name"] == name {
+						return
+					}
+				}
+				continue
+			}
+			for _, image := range images {
+				if image["name"] == name {
+					return
+				}
+			}
+		}
+	}
+	t.Fatalf("input lifecycle events missing %s block %q", blockType, name)
+}
 
 type scriptedProvider struct {
 	handler            func(agentID string, req llm.ChatRequest) ([]llm.ChatEvent, error)
@@ -73,6 +158,10 @@ func (p *scriptedProvider) Models() []llm.ModelInfo {
 
 func (p *scriptedProvider) Compact(_ context.Context, _ llm.CompactRequest) (llm.CompactResponse, error) {
 	return llm.CompactResponse{Summary: "example compact summary"}, nil
+}
+
+func (p *scriptedProvider) DefaultModelOptions(_ string) llm.ModelOptions {
+	return llm.ModelOptions{}
 }
 
 func (p *scriptedProvider) Requests() []llm.ChatRequest {
@@ -327,6 +416,157 @@ func TestExampleSkillScopesWithMockProvider(t *testing.T) {
 	})
 }
 
+func TestSingleAgentImageInputUsesMultimodalBlockAndCompactSessionRefs(t *testing.T) {
+	root := examplesRoot(t)
+	prompt := "请识别这张图，并说明它是什么文件。"
+	imageBytes := []byte{0x89, 'P', 'N', 'G'}
+
+	provider := &scriptedProvider{
+		handler: func(agentID string, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+			if agentID != "single-agent" {
+				return nil, fmt.Errorf("unexpected agent %q", agentID)
+			}
+			require.NotEmpty(t, req.Messages)
+			current := req.Messages[len(req.Messages)-1]
+			if strings.TrimSpace(current.Content) != prompt+"\n[Image: diagram.png]" {
+				return nil, fmt.Errorf("unexpected current content %q", current.Content)
+			}
+			if len(current.Images) != 1 {
+				return nil, fmt.Errorf("expected one image block, got %d", len(current.Images))
+			}
+			if current.Images[0].MimeType != "image/png" {
+				return nil, fmt.Errorf("unexpected image MIME %q", current.Images[0].MimeType)
+			}
+			if string(current.Images[0].Data) != string(imageBytes) {
+				return nil, fmt.Errorf("unexpected image bytes %v", current.Images[0].Data)
+			}
+			return textEvents("这是 PNG 图片。"), nil
+		},
+	}
+	harness := newExampleHarness(t, filepath.Join(root, "single-agent"), provider, nil)
+	sourcePath := filepath.Join(t.TempDir(), "diagram.png")
+	require.NoError(t, os.WriteFile(sourcePath, imageBytes, 0o644))
+	sessionID := "single-agent-image-input"
+
+	outcome := harness.runForAgentEnvelope(t, "single-agent", sessionID, inputpkg.InputEnvelope{
+		SessionID: sessionID,
+		Blocks: []inputpkg.InputBlock{
+			{Type: "text", Text: prompt},
+			{Type: "image", Name: "diagram.png", MimeType: "image/png", Path: sourcePath},
+		},
+	})
+	if err := validateNoDelegation(outcome.Events, outcome.RunTree, outcome.Run.ID); err != nil {
+		t.Fatalf("single-agent image input should not delegate: %v", err)
+	}
+
+	assetsPath := filepath.Join(harness.cfg.ProjectRoot, "anyai", "assets", outcome.Run.ID, "input_2", "diagram.png")
+	assert.FileExists(t, assetsPath)
+	data, err := os.ReadFile(assetsPath)
+	require.NoError(t, err)
+	assert.Equal(t, imageBytes, data)
+
+	sessionPath := filepath.Join(harness.store.BaseDir(), "single-agent", sessionID+".jsonl")
+	rawSession, err := os.ReadFile(sessionPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(rawSession), `"path"`)
+	assert.Contains(t, string(rawSession), `"diagram.png"`)
+	assert.NotContains(t, string(rawSession), "iVBOR")
+	for _, line := range strings.Split(strings.TrimSpace(string(rawSession)), "\n") {
+		var entry session.SessionEntry
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry.Type != session.EntryTypeMessage || entry.Role != "user" {
+			continue
+		}
+		var msg session.MessageData
+		require.NoError(t, json.Unmarshal(entry.Data, &msg))
+		require.Len(t, msg.Images, 1)
+		assert.Empty(t, msg.Images[0].Data)
+		assert.Equal(t, "diagram.png", msg.Images[0].Name)
+	}
+
+	var sawSessionInput bool
+	for _, event := range outcome.Events {
+		if event.Name != runtimeevents.EventSessionInputStored {
+			continue
+		}
+		images, ok := event.Payload["images"].([]map[string]any)
+		if !ok {
+			rawImages, _ := event.Payload["images"].([]any)
+			require.NotEmpty(t, rawImages)
+			first, _ := rawImages[0].(map[string]any)
+			require.NotNil(t, first)
+			assert.Equal(t, "diagram.png", first["name"])
+			assert.Contains(t, fmt.Sprint(first["path"]), filepath.Join("anyai", "assets", outcome.Run.ID, "input_2", "diagram.png"))
+			assert.NotContains(t, first, "data")
+			sawSessionInput = true
+			continue
+		}
+		require.NotEmpty(t, images)
+		assert.Equal(t, "diagram.png", images[0]["name"])
+		assert.Contains(t, fmt.Sprint(images[0]["path"]), filepath.Join("anyai", "assets", outcome.Run.ID, "input_2", "diagram.png"))
+		assert.NotContains(t, images[0], "data")
+		sawSessionInput = true
+	}
+	assert.True(t, sawSessionInput, "session input event should keep compact image refs")
+}
+
+func TestSingleAgentCLIStyleImageReferenceUsesMultimodalBlock(t *testing.T) {
+	root := examplesRoot(t)
+	imageBytes := []byte{0x89, 'P', 'N', 'G'}
+	sourcePath := filepath.Join(t.TempDir(), "diagram.png")
+	require.NoError(t, os.WriteFile(sourcePath, imageBytes, 0o644))
+	userText := "游戏无法玩，对应最新截图1@" + sourcePath
+	cleanText, blocks := channel.ParseCLIInput(userText)
+	require.Len(t, blocks, 1)
+
+	provider := &scriptedProvider{
+		handler: func(agentID string, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+			if agentID != "single-agent" {
+				return nil, fmt.Errorf("unexpected agent %q", agentID)
+			}
+			require.NotEmpty(t, req.Messages)
+			current := req.Messages[len(req.Messages)-1]
+			if strings.Contains(current.Content, sourcePath) || strings.Contains(current.Content, "@") {
+				return nil, fmt.Errorf("current content leaked CLI image path: %q", current.Content)
+			}
+			if strings.TrimSpace(current.Content) != cleanText+"\n[Image: diagram.png]" {
+				return nil, fmt.Errorf("unexpected current content %q", current.Content)
+			}
+			if len(current.Images) != 1 {
+				return nil, fmt.Errorf("expected one image block, got %d", len(current.Images))
+			}
+			if current.Images[0].MimeType != "image/png" {
+				return nil, fmt.Errorf("unexpected image MIME %q", current.Images[0].MimeType)
+			}
+			if string(current.Images[0].Data) != string(imageBytes) {
+				return nil, fmt.Errorf("unexpected image bytes %v", current.Images[0].Data)
+			}
+			return textEvents("我已直接看到这张图片。"), nil
+		},
+	}
+	harness := newExampleHarness(t, filepath.Join(root, "single-agent"), provider, nil)
+	sessionID := "single-agent-cli-image-input"
+	outcome := harness.runForAgentEnvelope(t, "single-agent", sessionID, inputpkg.InputEnvelope{
+		SessionID: sessionID,
+		Blocks:    append([]inputpkg.InputBlock{{Type: "text", Text: cleanText}}, gatewayBlocksToRuntimeInput(blocks)...),
+	})
+	if err := validateNoDelegation(outcome.Events, outcome.RunTree, outcome.Run.ID); err != nil {
+		t.Fatalf("single-agent CLI-style image input should not delegate: %v", err)
+	}
+	assertContainsInputBlock(t, outcome.Events, "image", "diagram.png")
+
+	var sawReadFile bool
+	for _, event := range outcome.Events {
+		if !isToolStartEvent(event.Name) {
+			continue
+		}
+		if toolName, _ := event.Payload["tool"].(string); toolName == "read_file" {
+			sawReadFile = true
+		}
+	}
+	assert.False(t, sawReadFile, "CLI-style image attachment should be sent as multimodal input, not read_file")
+}
+
 func TestExampleStaticMemoryAndSessionBoundaries(t *testing.T) {
 	root := examplesRoot(t)
 	staticPrompt := "AnyAI 当前这组 single-agent 示例主要用来验证以下链路 是什么？ 小智长期保持以下回答风格 是什么？"
@@ -558,17 +798,20 @@ func workflowScenarios() []workflowScenario {
 						{Mode: "single", Agents: []string{"context-analyst"}},
 						{Mode: "single", Agents: []string{"architect"}},
 						{Mode: "single", Agents: []string{"plan-reviewer"}},
-						{Mode: "parallel", Agents: []string{"coder", "test-engineer"}},
-						{Mode: "parallel", Agents: []string{"reviewer", "reviewer-security"}},
-						{Mode: "parallel", Agents: []string{"global-reviewer", "alignment-reviewer"}},
+						{Mode: "single", Agents: []string{"coder"}},
+						{Mode: "single", Agents: []string{"ui-test-engineer"}},
 						{Mode: "single", Agents: []string{"test-engineer"}},
+						{Mode: "parallel", Agents: []string{"reviewer", "reviewer-security"}},
+						{Mode: "single", Agents: []string{"global-reviewer"}},
+						{Mode: "single", Agents: []string{"alignment-reviewer"}},
 					},
 					ChildCounts: map[string]int{
 						"context-analyst":    1,
 						"architect":          1,
 						"plan-reviewer":      1,
 						"coder":              1,
-						"test-engineer":      2,
+						"ui-test-engineer":   1,
+						"test-engineer":      1,
 						"reviewer":           1,
 						"reviewer-security":  1,
 						"global-reviewer":    1,
@@ -586,20 +829,26 @@ func workflowScenarios() []workflowScenario {
 			Project: "harness-google-review",
 			Turns: []workflowTurnExpectation{
 				{
-					Prompt: "请基于 E-E-A-T 和常见拒审原因，做一次完整 Google 审核闭环。",
+					Prompt: "请审核 https://example.com，按标准 AdSense 串行产物流程推进。",
 					Steps: []agentCallStepExpectation{
-						{Mode: "parallel", Agents: []string{"quality-auditor", "seo-auditor", "ux-auditor", "policy-auditor"}},
-						{Mode: "single", Agents: []string{"requirement-generator"}},
-						{Mode: "single", Agents: []string{"qa-verifier"}},
-						{Mode: "parallel", Agents: []string{"quality-auditor", "seo-auditor", "ux-auditor", "policy-auditor"}},
+						{Mode: "single", Agents: []string{"intake-triager"}},
+						{Mode: "single", Agents: []string{"site-crawler"}},
+						{Mode: "parallel", Agents: []string{"content-analyzer", "duplication-auditor", "seo-analyzer"}},
+						{Mode: "parallel", Agents: []string{"ux-analyzer", "policy-analyzer", "ad-inventory-analyzer"}},
+						{Mode: "single", Agents: []string{"rejection-mapper"}},
+						{Mode: "single", Agents: []string{"report-generator"}},
 					},
 					ChildCounts: map[string]int{
-						"quality-auditor":       2,
-						"seo-auditor":           2,
-						"ux-auditor":            2,
-						"policy-auditor":        2,
-						"requirement-generator": 1,
-						"qa-verifier":           1,
+						"intake-triager":        1,
+						"site-crawler":          1,
+						"content-analyzer":      1,
+						"duplication-auditor":   1,
+						"seo-analyzer":          1,
+						"ux-analyzer":           1,
+						"policy-analyzer":       1,
+						"ad-inventory-analyzer": 1,
+						"rejection-mapper":      1,
+						"report-generator":      1,
 					},
 				},
 				{
@@ -608,6 +857,19 @@ func workflowScenarios() []workflowScenario {
 				},
 			},
 			IsolatedPrompt: "这是新的审核会话，请一句话说明你会重新开始。",
+		},
+		{
+			Project: "h5-online",
+			Turns: []workflowTurnExpectation{
+				{
+					Prompt: "不要调用工具。请用两句话说明 h5-online 这个示例如何组织上线流程。",
+				},
+				{
+					Prompt:            "基于你上一条回答，用一句话说明为什么用户只需要自然语言描述上线目标。",
+					RequirePriorTurns: true,
+				},
+			},
+			IsolatedPrompt: "这是新的 H5 上线会话，请一句话说明你会重新开始。",
 		},
 	}
 }
@@ -629,6 +891,8 @@ func workflowScenarioHandler(scenario workflowScenario) func(agentID string, req
 			return handleCodingScenario(scenario, agentID, req)
 		case "harness-google-review":
 			return handleGoogleReviewScenario(scenario, agentID, req)
+		case "h5-online":
+			return handleH5OnlineScenario(scenario, agentID, req)
 		default:
 			return nil, fmt.Errorf("unsupported scenario %q", scenario.Project)
 		}
@@ -855,24 +1119,34 @@ func handleCodingScenario(scenario workflowScenario, agentID string, req llm.Cha
 					Task:  "请审核健康检查接口方案并给出通过或封驳结论。",
 				}), nil
 			case 3:
-				return parallelAgentCallEvents("tc_coding_build", []tools.AgentCallRequest{
-					{Agent: "coder", Task: "请按审批通过的方案实现健康检查接口。"},
-					{Agent: "test-engineer", Task: "请按审批通过的方案编写并运行健康检查接口测试。"},
+				return singleAgentCallEvents("tc_coding_build", tools.AgentCallRequest{
+					Agent: "coder",
+					Task:  "请按审批通过的方案实现健康检查接口。",
 				}), nil
 			case 4:
+				return singleAgentCallEvents("tc_coding_ui_test", tools.AgentCallRequest{
+					Agent: "ui-test-engineer",
+					Task:  "本轮涉及接口响应但没有浏览器界面变更；请确认是否需要 UI 测试并写入 UI 测试报告。",
+				}), nil
+			case 5:
+				return singleAgentCallEvents("tc_coding_test", tools.AgentCallRequest{
+					Agent: "test-engineer",
+					Task:  "UI 测试门禁已处理；请按审批通过的方案编写并运行健康检查接口测试。",
+				}), nil
+			case 6:
 				return parallelAgentCallEvents("tc_coding_review", []tools.AgentCallRequest{
 					{Agent: "reviewer", Task: "请审查健康检查接口实现。"},
 					{Agent: "reviewer-security", Task: "请从安全角度审查健康检查接口实现。"},
 				}), nil
-			case 5:
-				return parallelAgentCallEvents("tc_coding_global_alignment", []tools.AgentCallRequest{
-					{Agent: "global-reviewer", Task: "请检查健康检查接口变更的全局影响。"},
-					{Agent: "alignment-reviewer", Task: "请检查实现与审批通过方案是否对齐。"},
+			case 7:
+				return singleAgentCallEvents("tc_coding_global", tools.AgentCallRequest{
+					Agent: "global-reviewer",
+					Task:  "请检查健康检查接口变更的全局影响。",
 				}), nil
-			case 6:
-				return singleAgentCallEvents("tc_coding_acceptance", tools.AgentCallRequest{
-					Agent: "test-engineer",
-					Task:  "请执行最终验收测试并给出结论。",
+			case 8:
+				return singleAgentCallEvents("tc_coding_alignment", tools.AgentCallRequest{
+					Agent: "alignment-reviewer",
+					Task:  "请检查实现、UI 测试证据、普通测试证据与审批通过方案是否对齐。",
 				}), nil
 			default:
 				return textEvents("流程完成：方案、实现、测试、审查和验收都已闭环。"), nil
@@ -896,6 +1170,8 @@ func handleCodingScenario(scenario workflowScenario, agentID string, req llm.Cha
 		return textEvents("方案审批通过。"), nil
 	case "coder":
 		return textEvents("实现完成：新增健康检查处理器。"), nil
+	case "ui-test-engineer":
+		return textEvents("UI 测试门禁完成：本轮无需浏览器界面测试。"), nil
 	case "test-engineer":
 		return textEvents("测试完成：新增健康检查接口测试并给出验收结论。"), nil
 	case "reviewer":
@@ -918,57 +1194,103 @@ func handleGoogleReviewScenario(scenario workflowScenario, agentID string, req l
 		case scenario.Turns[0].Prompt:
 			switch ctx.ToolCallsThisTurn {
 			case 0:
-				return parallelAgentCallEvents("tc_review_audit_round1", []tools.AgentCallRequest{
-					{Agent: "quality-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "seo-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "ux-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "policy-auditor", Task: "首次审计：请基于 E-E-A-T 和常见拒审原因审查站点。"},
-				}), nil
+				return singleAgentCallEvents("tc_review_intake", googleReviewTask("intake-triager", "Phase 0: normalize URL and write the site brief.", nil, []string{"artifacts-1/01-site-brief.md"})), nil
 			case 1:
-				return singleAgentCallEvents("tc_review_requirements", tools.AgentCallRequest{
-					Agent: "requirement-generator",
-					Task:  "请把四位审计师的问题整理成修复需求。",
-				}), nil
+				return singleAgentCallEvents("tc_review_crawl", googleReviewTask("site-crawler", "Phase 1: crawl the site using the intake brief.", []string{"artifacts-1/01-site-brief.md"}, []string{"artifacts-1/02-site-profile.json"})), nil
 			case 2:
-				return singleAgentCallEvents("tc_review_qa", tools.AgentCallRequest{
-					Agent: "qa-verifier",
-					Task:  "请验证修复是否到位。",
+				return parallelAgentCallEvents("tc_review_analysis_batch1", []tools.AgentCallRequest{
+					googleReviewTask("content-analyzer", "Phase 2A: analyze content value from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/03-content-analysis.md"}),
+					googleReviewTask("duplication-auditor", "Phase 2A: audit duplication from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/04-duplication-analysis.md"}),
+					googleReviewTask("seo-analyzer", "Phase 2A: analyze technical SEO from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/05-seo-analysis.md"}),
 				}), nil
 			case 3:
-				return parallelAgentCallEvents("tc_review_audit_round2", []tools.AgentCallRequest{
-					{Agent: "quality-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "seo-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "ux-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
-					{Agent: "policy-auditor", Task: "回归后重新审计：请再次基于 E-E-A-T 和常见拒审原因审查站点。"},
+				return parallelAgentCallEvents("tc_review_analysis_batch2", []tools.AgentCallRequest{
+					googleReviewTask("ux-analyzer", "Phase 3: analyze mobile UX from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/06-ux-analysis.md"}),
+					googleReviewTask("policy-analyzer", "Phase 3: analyze trust and policy pages from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/07-policy-analysis.md"}),
+					googleReviewTask("ad-inventory-analyzer", "Phase 3: analyze AdSense inventory from the site profile.", []string{"artifacts-1/02-site-profile.json"}, []string{"artifacts-1/08-ad-inventory-analysis.md"}),
 				}), nil
+			case 4:
+				return singleAgentCallEvents("tc_review_mapping", googleReviewTask("rejection-mapper", "Phase 4: map analysis results to rejection types.", []string{
+					"artifacts-1/01-site-brief.md",
+					"artifacts-1/03-content-analysis.md",
+					"artifacts-1/04-duplication-analysis.md",
+					"artifacts-1/05-seo-analysis.md",
+					"artifacts-1/06-ux-analysis.md",
+					"artifacts-1/07-policy-analysis.md",
+					"artifacts-1/08-ad-inventory-analysis.md",
+				}, []string{"artifacts-1/09-rejection-mapping.md"})), nil
+			case 5:
+				return singleAgentCallEvents("tc_review_report", googleReviewTask("report-generator", "Phase 5: generate the final review report.", []string{
+					"artifacts-1/01-site-brief.md",
+					"artifacts-1/02-site-profile.json",
+					"artifacts-1/03-content-analysis.md",
+					"artifacts-1/04-duplication-analysis.md",
+					"artifacts-1/05-seo-analysis.md",
+					"artifacts-1/06-ux-analysis.md",
+					"artifacts-1/07-policy-analysis.md",
+					"artifacts-1/08-ad-inventory-analysis.md",
+					"artifacts-1/09-rejection-mapping.md",
+				}, []string{"artifacts-1/10-final-report.md"})), nil
 			default:
-				return textEvents("审核闭环完成：主要阻塞项已清理，剩余风险可控。"), nil
+				return textEvents("审核完成：最终报告已生成，关键风险和 submit_ready 结论已写入正式产物。"), nil
 			}
 		case scenario.Turns[1].Prompt:
 			if len(ctx.PriorUserTurns) == 0 {
 				return nil, fmt.Errorf("google review follow-up turn did not receive prior history")
 			}
-			return textEvents("当前最大风险仍然是站点信任信号不足。"), nil
+			return textEvents("当前最大风险来自内容价值和信任页证据不足。"), nil
 		case scenario.IsolatedPrompt:
 			if len(ctx.PriorUserTurns) != 0 {
 				return nil, fmt.Errorf("google review isolated session leaked prior history")
 			}
 			return textEvents("这是新的审核会话，我会重新开始。"), nil
 		}
-	case "quality-auditor":
-		return textEvents("内容质量审计：存在薄内容和信任信号不足。"), nil
-	case "seo-auditor":
-		return textEvents("SEO 审计：结构化数据需要补齐。"), nil
-	case "ux-auditor":
-		return textEvents("UX 审计：移动端信任信号不足。"), nil
-	case "policy-auditor":
-		return textEvents("政策审计：暂无硬性违规，但需补充政策页。"), nil
-	case "requirement-generator":
-		return textEvents("修复需求：补信任页、补结构化数据、补内容深度。"), nil
-	case "qa-verifier":
-		return textEvents("QA 验证：修复项基本通过。"), nil
+	case "intake-triager":
+		return googleReviewArtifactEvents(req, "artifacts-1/01-site-brief.md", googleReviewArtifactContent("01-site-brief.md"), "已写入 artifacts-1/01-site-brief.md。"), nil
+	case "site-crawler":
+		return googleReviewArtifactEvents(req, "artifacts-1/02-site-profile.json", googleReviewArtifactContent("02-site-profile.json"), "已写入 artifacts-1/02-site-profile.json。"), nil
+	case "content-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/03-content-analysis.md", googleReviewArtifactContent("03-content-analysis.md"), "已写入 artifacts-1/03-content-analysis.md。"), nil
+	case "duplication-auditor":
+		return googleReviewArtifactEvents(req, "artifacts-1/04-duplication-analysis.md", googleReviewArtifactContent("04-duplication-analysis.md"), "已写入 artifacts-1/04-duplication-analysis.md。"), nil
+	case "seo-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/05-seo-analysis.md", googleReviewArtifactContent("05-seo-analysis.md"), "已写入 artifacts-1/05-seo-analysis.md。"), nil
+	case "ux-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/06-ux-analysis.md", googleReviewArtifactContent("06-ux-analysis.md"), "已写入 artifacts-1/06-ux-analysis.md。"), nil
+	case "policy-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/07-policy-analysis.md", googleReviewArtifactContent("07-policy-analysis.md"), "已写入 artifacts-1/07-policy-analysis.md。"), nil
+	case "ad-inventory-analyzer":
+		return googleReviewArtifactEvents(req, "artifacts-1/08-ad-inventory-analysis.md", googleReviewArtifactContent("08-ad-inventory-analysis.md"), "已写入 artifacts-1/08-ad-inventory-analysis.md。"), nil
+	case "rejection-mapper":
+		return googleReviewArtifactEvents(req, "artifacts-1/09-rejection-mapping.md", googleReviewArtifactContent("09-rejection-mapping.md"), "已写入 artifacts-1/09-rejection-mapping.md。"), nil
+	case "report-generator":
+		return googleReviewArtifactEvents(req, "artifacts-1/10-final-report.md", googleReviewArtifactContent("10-final-report.md"), "已写入 artifacts-1/10-final-report.md。"), nil
 	}
 	return nil, fmt.Errorf("unexpected agent %q for scenario %q", agentID, scenario.Project)
+}
+
+func handleH5OnlineScenario(scenario workflowScenario, agentID string, req llm.ChatRequest) ([]llm.ChatEvent, error) {
+	ctx := currentTurnContext(req.Messages)
+	if agentID != "h5-online" {
+		return nil, fmt.Errorf("unexpected agent %q for scenario %q", agentID, scenario.Project)
+	}
+
+	switch ctx.Prompt {
+	case scenario.Turns[0].Prompt:
+		return textEvents("h5-online 是单 Agent 上线主控，通过 HTTP 调用审核和编码两个独立项目。它会循环审核、修复、复审，直到审核没有问题。"), nil
+	case scenario.Turns[1].Prompt:
+		if len(ctx.PriorUserTurns) == 0 {
+			return nil, fmt.Errorf("h5-online follow-up turn did not receive prior history")
+		}
+		return textEvents("用户只要描述上线目标，主控会自己调度审核与修复闭环。"), nil
+	case scenario.IsolatedPrompt:
+		if len(ctx.PriorUserTurns) != 0 {
+			return nil, fmt.Errorf("h5-online isolated session leaked prior history")
+		}
+		return textEvents("这是新的 H5 上线会话，我会重新开始。"), nil
+	default:
+		return nil, fmt.Errorf("unexpected prompt %q", ctx.Prompt)
+	}
 }
 
 func newExampleHarness(t *testing.T, projectDir string, provider llm.LLMProvider, mutate func(project *registry.Project)) *exampleHarness {
@@ -980,6 +1302,13 @@ func newExampleHarness(t *testing.T, projectDir string, provider llm.LLMProvider
 	}
 	if mutate != nil {
 		mutate(project)
+	}
+
+	if filepath.Base(projectDir) == "harness-google-review" {
+		workspace := t.TempDir()
+		for i := range project.Config.Agents.List {
+			project.Config.Agents.List[i].Workspace = workspace
+		}
 	}
 
 	for i := range project.Config.Agents.List {
@@ -1034,6 +1363,14 @@ func (h *exampleHarness) run(t *testing.T, sessionID, input string) exampleRunOu
 
 func (h *exampleHarness) runForAgent(t *testing.T, agentID, sessionID, input string) exampleRunOutcome {
 	t.Helper()
+	return h.runForAgentEnvelope(t, agentID, sessionID, inputpkg.NewEnvelopeFromText(sessionID, input))
+}
+
+func (h *exampleHarness) runForAgentEnvelope(t *testing.T, agentID, sessionID string, env inputpkg.InputEnvelope) exampleRunOutcome {
+	t.Helper()
+	if strings.TrimSpace(env.SessionID) == "" {
+		env.SessionID = sessionID
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1050,7 +1387,7 @@ func (h *exampleHarness) runForAgent(t *testing.T, agentID, sessionID, input str
 	}, runtimeport.RunRequest{
 		AgentID:   agentID,
 		SessionID: sessionID,
-		Envelope:  inputpkg.NewEnvelopeFromText(sessionID, input),
+		Envelope:  env,
 	})
 	if err != nil {
 		t.Fatalf("start run for %s: %v", agentID, err)
@@ -1150,9 +1487,17 @@ func (h *exampleHarness) sessionHistory(t *testing.T, sessionID string) []exampl
 func currentTurnContext(messages []llm.Message) turnContext {
 	idx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && messages[i].ToolCallID == "" {
+		if llm.IsUserRole(messages[i].Role) && messages[i].ToolCallID == "" {
 			idx = i
 			break
+		}
+	}
+	if idx == -1 {
+		for i := len(messages) - 1; i >= 0; i-- {
+			if strings.TrimSpace(messages[i].Role) == llm.MessageRoleRuntime && messages[i].ToolCallID == "" {
+				idx = i
+				break
+			}
 		}
 	}
 	if idx == -1 {
@@ -1163,15 +1508,15 @@ func currentTurnContext(messages []llm.Message) turnContext {
 		Prompt: strings.TrimSpace(messages[idx].Content),
 	}
 	for _, msg := range messages[:idx] {
-		if msg.Role == "user" && msg.ToolCallID == "" {
+		if llm.IsUserRole(msg.Role) && msg.ToolCallID == "" {
 			ctx.PriorUserTurns = append(ctx.PriorUserTurns, strings.TrimSpace(msg.Content))
 		}
-		if msg.Role == "assistant" && strings.TrimSpace(msg.Content) != "" {
+		if llm.IsAssistantRole(msg.Role) && strings.TrimSpace(msg.Content) != "" {
 			ctx.PriorAssistantText = append(ctx.PriorAssistantText, strings.TrimSpace(msg.Content))
 		}
 	}
 	for _, msg := range messages[idx+1:] {
-		if msg.Role == "assistant" {
+		if llm.IsAssistantRole(msg.Role) {
 			ctx.ToolCallsThisTurn += len(msg.ToolCalls)
 		}
 	}
@@ -1226,12 +1571,69 @@ func textEvents(text string) []llm.ChatEvent {
 	}
 }
 
+func googleReviewArtifactEvents(req llm.ChatRequest, path, content, doneText string) []llm.ChatEvent {
+	if chatRequestHasToolResult(req.Messages) {
+		return textEvents(doneText)
+	}
+	input, _ := json.Marshal(map[string]any{
+		"path":    path,
+		"content": content,
+	})
+	call := llm.ToolCall{
+		ID:    "tc_write_" + strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Name:  "write_file",
+		Input: input,
+	}
+	return []llm.ChatEvent{
+		{Type: llm.EventToolCallStart, ToolCall: &call},
+		{Type: llm.EventToolCallDone, ToolCall: &call},
+		{Type: llm.EventDone},
+	}
+}
+
+func chatRequestHasToolResult(messages []llm.Message) bool {
+	for _, message := range messages {
+		if strings.TrimSpace(message.ToolCallID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func googleReviewArtifactContent(name string) string {
+	switch name {
+	case "01-site-brief.md":
+		return "---\nagent: intake-triager\n---\n# Site Brief\n\n## Scope\n- primary_url: https://example.com\n"
+	case "02-site-profile.json":
+		return `{"crawl_metadata":{"total_urls_attempted":1,"successful_crawls":1,"failed_crawls":0,"failed_urls":[]},"sites":[{"url":"https://example.com","domain":"example.com","pages":[{"full_url":"https://example.com/","type":"core","title":"Example","content_length":320,"has_ads":false}],"statistics":{"total_pages":1,"core_pages":1,"thin_pages":0,"trust_pages_found":true,"pages_with_ads":0}}]}`
+	case "03-content-analysis.md":
+		return "---\nagent: content-analyzer\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# Content Value Analysis\n\n## Summary\n- status: risky\n"
+	case "04-duplication-analysis.md":
+		return "---\nagent: duplication-auditor\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# Duplication And Scaled Content Analysis\n\n## Summary\n- status: pass\n"
+	case "05-seo-analysis.md":
+		return "---\nagent: seo-analyzer\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# Technical SEO Analysis\n\n## Summary\n- status: pass\n"
+	case "06-ux-analysis.md":
+		return "---\nagent: ux-analyzer\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# UX And Mobile Analysis\n\n## Summary\n- status: risky\n"
+	case "07-policy-analysis.md":
+		return "---\nagent: policy-analyzer\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# Trust And Policy Analysis\n\n## Summary\n- status: risky\n"
+	case "08-ad-inventory-analysis.md":
+		return "---\nagent: ad-inventory-analyzer\ninput_files:\n  - artifacts-1/02-site-profile.json\n---\n# AdSense Inventory Analysis\n\n## Summary\n- status: pass\n"
+	case "09-rejection-mapping.md":
+		return "---\nagent: rejection-mapper\n---\n# Rejection Mapping\n\n## Most Likely Rejection Type\n- type: low_value_content\n"
+	case "10-final-report.md":
+		return "---\nagent: report-generator\n---\n# Google AdSense Review Report\n\n## Executive Summary\n\n### Verdict\n- **submit_ready**: false\n"
+	default:
+		return "# Artifact\n"
+	}
+}
+
 func singleAgentCallEvents(callID string, req tools.AgentCallRequest) []llm.ChatEvent {
-	return agentCallEvents(callID, map[string]any{
+	payload := map[string]any{
 		"target_agent":    req.Agent,
 		"task":            req.Task,
 		"idle_timeout_ms": req.IdleTimeoutMS,
-	})
+	}
+	return agentCallEvents(callID, payload)
 }
 
 func parallelAgentCallEvents(callID string, tasks []tools.AgentCallRequest) []llm.ChatEvent {
@@ -1251,6 +1653,35 @@ func parallelAgentCallEvents(callID string, tasks []tools.AgentCallRequest) []ll
 	}
 	payload["tasks"] = taskPayload
 	return agentCallEvents(callID, payload)
+}
+
+func googleReviewTask(agentID, task string, inputArtifacts, expectedOutputs []string) tools.AgentCallRequest {
+	task = googleReviewTaskText(task, inputArtifacts, expectedOutputs)
+	return tools.AgentCallRequest{
+		Agent: agentID,
+		Task:  task,
+	}
+}
+
+func googleReviewTaskText(task string, inputArtifacts, expectedOutputs []string) string {
+	var b strings.Builder
+	b.WriteString(task)
+	if len(inputArtifacts) > 0 {
+		b.WriteString("\n\n输入文件：")
+		for _, artifact := range inputArtifacts {
+			b.WriteString("\n- ")
+			b.WriteString(artifact)
+		}
+	}
+	if len(expectedOutputs) > 0 {
+		b.WriteString("\n\n目标产物：")
+		for _, output := range expectedOutputs {
+			b.WriteString("\n- ")
+			b.WriteString(output)
+		}
+	}
+	b.WriteString("\n\n请先按你的输入完整性契约读取并校验输入；缺失或无效时返回 INPUT_VALIDATION_ERROR，成功时返回 artifact_path_and_status。")
+	return b.String()
 }
 
 func agentCallEvents(callID string, payload map[string]any) []llm.ChatEvent {

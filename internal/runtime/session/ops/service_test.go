@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,23 @@ func TestServiceCreateListIndexAndCompact(t *testing.T) {
 	assert.Equal(t, runtimeevents.EventRunStarted, compactEvents[0].Name)
 	assert.Equal(t, "session.compact.requested", compactEvents[1].Name)
 	assert.Equal(t, "session.compact.completed", compactEvents[2].Name)
+	compactID := strings.TrimSpace(fmt.Sprint(compactEvents[2].Payload["compact_id"]))
+	archiveRef := strings.TrimSpace(fmt.Sprint(compactEvents[2].Payload["archive_ref"]))
+	require.NotEmpty(t, compactID)
+	require.NotEmpty(t, archiveRef)
+	assert.Equal(t, compactID, compactEvents[1].Payload["compact_id"])
+	assert.NotEmpty(t, compactEvents[2].Payload["archive_sha256"])
+	assert.NotEmpty(t, compactEvents[2].Payload["source_sha256"])
+	assert.FileExists(t, filepath.Join(store.BaseDir(), filepath.FromSlash(archiveRef)))
+	assert.FileExists(t, filepath.Join(store.BaseDir(), filepath.FromSlash(archiveRef))+".meta.json")
+
+	history := compacted.History()
+	require.NotEmpty(t, history)
+	require.Equal(t, session.EntryTypeCompaction, history[0].Type)
+	var compactData session.CompactionData
+	require.NoError(t, json.Unmarshal(history[0].Data, &compactData))
+	assert.Equal(t, compactID, compactData.CompactID)
+	assert.Equal(t, archiveRef, compactData.ArchiveRef)
 }
 
 func TestServiceListUsesFreshIndexWithoutScanningSessionFiles(t *testing.T) {
@@ -445,9 +463,15 @@ func TestServiceRebuildFromEventsReplaysCompactionAsHistoryRewrite(t *testing.T)
 		SessionID: "sess_compact",
 		Name:      "session.compact.completed",
 		Payload: map[string]any{
-			"keep_entries": 4,
-			"trigger":      "entry_count",
-			"summary":      "compacted summary",
+			"compact_id":       "compact_replay_1",
+			"archive_ref":      "assistant/.compactions/sess_compact/compact_replay_1.jsonl.gz",
+			"archive_sha256":   "archivehash",
+			"source_sha256":    "sourcehash",
+			"keep_entries":     4,
+			"trigger":          "entry_count",
+			"summary":          "compacted summary",
+			"summary_source":   "provider_model",
+			"compact_strategy": "chat_fallback",
 		},
 	})
 	recorder.AppendEvent(runtimeevents.EventRecord{
@@ -472,6 +496,10 @@ func TestServiceRebuildFromEventsReplaysCompactionAsHistoryRewrite(t *testing.T)
 	require.NoError(t, json.Unmarshal(history[0].Data, &compact))
 	assert.Equal(t, "compacted summary", compact.Text)
 	assert.Equal(t, "entry_count", compact.Trigger)
+	assert.Equal(t, "compact_replay_1", compact.CompactID)
+	assert.Equal(t, "assistant/.compactions/sess_compact/compact_replay_1.jsonl.gz", compact.ArchiveRef)
+	assert.Equal(t, "archivehash", compact.ArchiveSHA256)
+	assert.Equal(t, "sourcehash", compact.SourceSHA256)
 
 	serialized := session.SerializeHistory(rebuilt)
 	require.NotEmpty(t, serialized)

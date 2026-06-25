@@ -18,41 +18,43 @@ import (
 )
 
 const (
-	defaultGatewayListen                        = "127.0.0.1:2333"
-	defaultReloadMode                           = "hybrid"
-	defaultRuntimeIdleTimeoutMS                 = 300000
-	defaultAgentCallDepthLimit                  = 4
-	defaultAgentCallMaxParallel                 = 4
-	defaultToolMaxAttempts                      = tooldefaults.MaxAttempts
-	defaultToolRetryBackoffMS                   = tooldefaults.RetryBackoffMS
-	defaultToolLoopHistorySize                  = 24
-	defaultToolLoopWarningThreshold             = 4
-	defaultToolLoopBlockThreshold               = 6
-	defaultSessionQueueMode                     = "collect"
-	defaultSessionQueueDebounceMS               = 800
-	defaultSessionQueueMaxPending               = 20
-	defaultSessionQueueDropPolicy               = "summarize"
-	defaultSessionCompactionTriggerMode         = "token_estimate"
-	defaultSessionCompactionEntryThresh         = 96
-	defaultSessionCompactionTokenThresh         = 12000
-	defaultSessionCompactionKeepTurns           = 4
-	defaultSessionCompactionKeepTokens          = 2400
-	defaultSessionCompactionSummaryTokens       = 1600
-	defaultMemoryInjectMaxItems                 = 3
-	defaultMemoryMinImportance                  = 0.7
-	defaultMemoryPromoteImportance              = 0.75
-	defaultMemoryCandidateTTL                   = "168h"
-	defaultMemoryEpisodicTTL                    = "72h"
-	defaultMemoryCleanupInterval                = "2m"
-	defaultHeartbeatInterval                    = "30m"
-	defaultExecApprovalLevel                    = "full"
-	defaultDMUnknownSenderPolicy                = "ignore"
-	defaultLogFileLevel                         = "debug"
-	defaultLogStderrLevel                       = "info"
-	defaultLogWhatsMeowLevel                    = "warn"
-	defaultLogFilename                          = "runtime.log"
-	defaultLogMaxBytes                    int64 = 10 << 20
-	defaultLogMaxBackups                        = 20
+	defaultGatewayListen                             = "127.0.0.1:2333"
+	defaultReloadMode                                = "hybrid"
+	defaultRuntimeIdleTimeoutMS                      = 300000
+	defaultAgentCallDepthLimit                       = 4
+	defaultAgentCallMaxParallel                      = 4
+	defaultToolMaxAttempts                           = tooldefaults.MaxAttempts
+	defaultToolRetryBackoffMS                        = tooldefaults.RetryBackoffMS
+	defaultToolLoopHistorySize                       = 24
+	defaultToolLoopWarningThreshold                  = 4
+	defaultToolLoopBlockThreshold                    = 6
+	defaultSessionQueueMode                          = "collect"
+	defaultSessionQueueDebounceMS                    = 800
+	defaultSessionQueueMaxPending                    = 20
+	defaultSessionQueueDropPolicy                    = "summarize"
+	defaultSessionCompactionTriggerMode              = "token_estimate"
+	defaultSessionCompactionEntryThresh              = 96
+	defaultSessionCompactionTokenThresh              = 12000
+	defaultSessionCompactionKeepTurns                = 4
+	defaultSessionCompactionKeepTokens               = 2400
+	defaultSessionCompactionSummaryTokens            = 1600
+	defaultSessionCompactionArchiveCompression       = "gzip"
+	defaultSessionCompactionContextProjection        = "state_aware"
+	defaultMemoryInjectMaxItems                      = 3
+	defaultMemoryMinImportance                       = 0.7
+	defaultMemoryPromoteImportance                   = 0.75
+	defaultMemoryCandidateTTL                        = "168h"
+	defaultMemoryEpisodicTTL                         = "72h"
+	defaultMemoryCleanupInterval                     = "2m"
+	defaultHeartbeatInterval                         = "30m"
+	defaultExecApprovalLevel                         = "full"
+	defaultDMUnknownSenderPolicy                     = "ignore"
+	defaultLogFileLevel                              = "debug"
+	defaultLogStderrLevel                            = "info"
+	defaultLogWhatsMeowLevel                         = "warn"
+	defaultLogFilename                               = "runtime.log"
+	defaultLogMaxBytes                         int64 = 10 << 20
+	defaultLogMaxBackups                             = 20
 )
 
 var (
@@ -298,6 +300,10 @@ type SessionCompactionConfig struct {
 	KeepRecentUserTurns  int    `json:"keepRecentUserTurns,omitempty"`
 	KeepRecentUserTokens int    `json:"keepRecentUserTokens,omitempty"`
 	SummaryMaxTokens     int    `json:"summaryMaxTokens,omitempty"`
+	ArchiveEnabled       *bool  `json:"archiveEnabled,omitempty"`
+	ArchiveCompression   string `json:"archiveCompression,omitempty"`
+	FocusEnabled         *bool  `json:"focusEnabled,omitempty"`
+	ContextProjection    string `json:"contextProjection,omitempty"`
 }
 
 func (c SessionCompactionConfig) EnabledValue() bool {
@@ -305,6 +311,20 @@ func (c SessionCompactionConfig) EnabledValue() bool {
 		return true
 	}
 	return *c.Enabled
+}
+
+func (c SessionCompactionConfig) ArchiveEnabledValue() bool {
+	if c.ArchiveEnabled == nil {
+		return true
+	}
+	return *c.ArchiveEnabled
+}
+
+func (c SessionCompactionConfig) FocusEnabledValue() bool {
+	if c.FocusEnabled == nil {
+		return true
+	}
+	return *c.FocusEnabled
 }
 
 type TranscriptHygieneConfig struct {
@@ -576,6 +596,10 @@ func DefaultConfig() *Config {
 					KeepRecentUserTurns:  defaultSessionCompactionKeepTurns,
 					KeepRecentUserTokens: defaultSessionCompactionKeepTokens,
 					SummaryMaxTokens:     defaultSessionCompactionSummaryTokens,
+					ArchiveEnabled:       boolPtr(true),
+					ArchiveCompression:   defaultSessionCompactionArchiveCompression,
+					FocusEnabled:         boolPtr(true),
+					ContextProjection:    defaultSessionCompactionContextProjection,
 				},
 				TranscriptHygiene: TranscriptHygieneConfig{
 					Enabled:                   boolPtr(true),
@@ -764,6 +788,28 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.Sessions.Compaction.SummaryMaxTokens < 0 {
 		return fmt.Errorf("runtime.sessions.compaction.summaryMaxTokens must be >= 0")
+	}
+	if c.Runtime.Sessions.Compaction.ArchiveEnabled == nil {
+		c.Runtime.Sessions.Compaction.ArchiveEnabled = boolPtr(true)
+	}
+	if strings.TrimSpace(c.Runtime.Sessions.Compaction.ArchiveCompression) == "" {
+		c.Runtime.Sessions.Compaction.ArchiveCompression = defaultSessionCompactionArchiveCompression
+	}
+	switch c.Runtime.Sessions.Compaction.ArchiveCompression {
+	case "gzip", "none":
+	default:
+		return fmt.Errorf("runtime.sessions.compaction.archiveCompression must be one of gzip, none")
+	}
+	if c.Runtime.Sessions.Compaction.FocusEnabled == nil {
+		c.Runtime.Sessions.Compaction.FocusEnabled = boolPtr(true)
+	}
+	if strings.TrimSpace(c.Runtime.Sessions.Compaction.ContextProjection) == "" {
+		c.Runtime.Sessions.Compaction.ContextProjection = defaultSessionCompactionContextProjection
+	}
+	switch c.Runtime.Sessions.Compaction.ContextProjection {
+	case "state_aware", "recent":
+	default:
+		return fmt.Errorf("runtime.sessions.compaction.contextProjection must be one of state_aware, recent")
 	}
 	if c.Runtime.Sessions.TranscriptHygiene.Enabled == nil {
 		c.Runtime.Sessions.TranscriptHygiene.Enabled = boolPtr(true)

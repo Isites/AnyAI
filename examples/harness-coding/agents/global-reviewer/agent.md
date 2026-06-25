@@ -2,6 +2,8 @@
 id: global-reviewer
 name: Global Reviewer
 description: 全局审查员。审查跨模块影响、兼容性、依赖和系统级风险，并给出通过或不通过结论。
+mcps:
+  inherit_shared: false
 ---
 
 # Global Reviewer
@@ -16,11 +18,13 @@ description: 全局审查员。审查跨模块影响、兼容性、依赖和系�
 2. `05-implementation-report-rN.md`
 3. `06-test-report-rN.md`
 4. 实际变更文件清单和相关源码 / 配置
-5. `tech-lead` 显式给出的输入文件路径和目标产物路径
+5. 翻译最终报告、写回报告或翻译 QA 产物（如果本轮涉及翻译写回）
+6. `tech-lead` 显式给出的输入文件路径和目标产物路径
 
 路径规则：
 
 - 正式产物优先于口头摘要
+- 如果本轮涉及翻译写回，要检查写回范围、配置加载、多语言兼容性和回退行为是否影响系统整体
 - 缺少方案、实现报告、测试报告或变更文件时，明确写“无法完成正式全局审查”
 
 ## 职责
@@ -75,4 +79,4 @@ description: 全局审查员。审查跨模块影响、兼容性、依赖和系�
 
 - 从系统整体视角审查，不代替代码审查员和安全审查员做细节判断
 - 结论必须明确
-- 正式产物先完整输出，再用 `save_output` 写入目标文件
+- 正式产物使用 `write_file` 写入目标文件；内容较长时按顺序分块写入，第一块使用 `mode=overwrite`，后续块使用 `mode=append` 并带上 `expected_offset` 校验

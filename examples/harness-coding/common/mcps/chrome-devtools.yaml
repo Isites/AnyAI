@@ -1,0 +1,11 @@
+name: chrome-devtools
+type: stdio
+command: ../../anyai/mcps/chrome-devtools/node_modules/.bin/chrome-devtools-mcp
+args:
+  - --headless=true
+  - --isolated=true
+  - --no-usage-statistics
+  - --no-performance-crux
+root: ../..
+startup_timeout_ms: 120000
+tool_timeout_ms: 60000

@@ -363,6 +363,8 @@ func (s *Service) Compact(agentID, key string, keepEntries int) (*session.Sessio
 		return sess, nil
 	}
 
+	compactID := session.NewCompactionID()
+	archiveRef := session.CompactionArchiveRef(agentID, key, compactID, session.ArchiveCompressionGzip)
 	recorder := s.Recorder()
 	run, _ := runtimeevents.StartSyntheticRun(recorder, runtimeevents.SyntheticRunSpec{
 		AgentID:   agentID,
@@ -371,19 +373,57 @@ func (s *Service) Compact(agentID, key string, keepEntries int) (*session.Sessio
 		Channel:   "control",
 	})
 	runtimeevents.AppendRunEvent(recorder, run, runtimeevents.EventSessionCompactRequested, map[string]any{
-		"keep_entries": keepEntries,
-		"trigger":      "legacy_entry_count",
-		"history_len":  len(history),
+		"compact_id":         compactID,
+		"archive_ref":        archiveRef,
+		"keep_entries":       keepEntries,
+		"trigger":            "legacy_entry_count",
+		"history_len":        len(history),
+		"before_entry_count": len(history),
 	})
 
-	sess.Compact(summary, keepEntries)
+	compactData := session.CompactionData{
+		Text:             summary,
+		Trigger:          "legacy_entry_count",
+		LegacyHeuristic:  true,
+		CompactID:        compactID,
+		ArchiveRef:       archiveRef,
+		BeforeEntryCount: len(history),
+		BeforeLeafID:     history[len(history)-1].ID,
+		SummarySource:    "rolling_summary",
+		CompactStrategy:  "legacy_heuristic",
+		CreatedAt:        time.Now().Unix(),
+	}
+	rewritten := session.RewriteHistoryWithCompactionData(history, compactData, keepEntries)
+	result, err := sess.ReplaceHistoryWithOptions(rewritten, session.RewriteOptions{
+		Archive:            true,
+		CompactID:          compactID,
+		ArchiveCompression: session.ArchiveCompressionGzip,
+	})
+	if err != nil {
+		return nil, err
+	}
+	afterHistory := sess.History()
+	afterLeafID := ""
+	if len(afterHistory) > 0 {
+		afterLeafID = afterHistory[len(afterHistory)-1].ID
+	}
 
 	runtimeevents.AppendRunEvent(recorder, run, runtimeevents.EventSessionCompactCompleted, map[string]any{
-		"keep_entries":     keepEntries,
-		"trigger":          "legacy_entry_count",
-		"history_len":      len(sess.History()),
-		"summary":          summary,
-		"legacy_heuristic": true,
+		"compact_id":         compactID,
+		"archive_ref":        firstNonEmpty(archiveRef, result.ArchiveRef),
+		"archive_sha256":     result.ArchiveSHA256,
+		"source_sha256":      result.SourceSHA256,
+		"before_entry_count": len(history),
+		"after_entry_count":  len(afterHistory),
+		"before_leaf_id":     history[len(history)-1].ID,
+		"after_leaf_id":      afterLeafID,
+		"keep_entries":       keepEntries,
+		"trigger":            "legacy_entry_count",
+		"history_len":        len(afterHistory),
+		"summary":            summary,
+		"summary_source":     "rolling_summary",
+		"compact_strategy":   "legacy_heuristic",
+		"legacy_heuristic":   true,
 	})
 	runtimeevents.FinishSyntheticRun(recorder, run, summary, "")
 
@@ -751,12 +791,10 @@ func replayRunIntoSession(state *sessionReplay, run runtimeevents.RunRecord, eve
 				trigger = "legacy_entry_count"
 			}
 			history := state.ensureSession().History()
-			state.ensureSession().ReplaceHistory(session.RewriteHistoryWithCompaction(
+			state.ensureSession().ReplaceHistory(session.RewriteHistoryWithCompactionData(
 				history,
-				summary,
+				compactionDataFromPayload(event.Payload, summary, trigger),
 				intPayload(event.Payload, "keep_entries"),
-				trigger,
-				boolPayload(event.Payload, "legacy_heuristic"),
 			))
 		case runtimeevents.EventRunFailed, runtimeevents.EventRunAborted:
 			if hasSessionMetaEvent(events, event.RunID) {
@@ -801,6 +839,26 @@ func runTerminalMetaText(event runtimeevents.EventRecord) string {
 		return "Run aborted: " + message
 	default:
 		return ""
+	}
+}
+
+func compactionDataFromPayload(payload map[string]any, summary, trigger string) session.CompactionData {
+	return session.CompactionData{
+		Text:              strings.TrimSpace(summary),
+		Trigger:           strings.TrimSpace(trigger),
+		LegacyHeuristic:   boolPayload(payload, "legacy_heuristic"),
+		CompactID:         strings.TrimSpace(stringPayload(payload, "compact_id")),
+		PreviousCompactID: strings.TrimSpace(stringPayload(payload, "previous_compact_id")),
+		ArchiveRef:        strings.TrimSpace(stringPayload(payload, "archive_ref")),
+		ArchiveSHA256:     strings.TrimSpace(stringPayload(payload, "archive_sha256")),
+		SourceSHA256:      strings.TrimSpace(stringPayload(payload, "source_sha256")),
+		BeforeEntryCount:  intPayload(payload, "before_entry_count"),
+		AfterEntryCount:   intPayload(payload, "after_entry_count"),
+		BeforeLeafID:      strings.TrimSpace(stringPayload(payload, "before_leaf_id")),
+		AfterLeafID:       strings.TrimSpace(stringPayload(payload, "after_leaf_id")),
+		SummarySource:     strings.TrimSpace(stringPayload(payload, "summary_source")),
+		CompactStrategy:   strings.TrimSpace(stringPayload(payload, "compact_strategy")),
+		CreatedAt:         int64Payload(payload, "created_at"),
 	}
 }
 
@@ -931,6 +989,22 @@ func intPayload(payload map[string]any, key string) int {
 		return int(value)
 	case float64:
 		return int(value)
+	default:
+		return 0
+	}
+}
+
+func int64Payload(payload map[string]any, key string) int64 {
+	if len(payload) == 0 {
+		return 0
+	}
+	switch value := payload[key].(type) {
+	case int:
+		return int64(value)
+	case int64:
+		return value
+	case float64:
+		return int64(value)
 	default:
 		return 0
 	}

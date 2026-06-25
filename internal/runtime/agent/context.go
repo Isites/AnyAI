@@ -23,9 +23,9 @@ type transcriptBuilder struct {
 	runtimeDirective string
 }
 
-func newTranscriptBuilder(history []session.SessionEntry, policy transcriptPolicy) transcriptBuilder {
+func newTranscriptBuilder(history []session.SessionEntry, policy transcriptPolicy, projection string) transcriptBuilder {
 	return transcriptBuilder{
-		history: modelContextHistory(history),
+		history: modelContextHistory(history, projection),
 		policy:  policy,
 	}
 }
@@ -46,7 +46,7 @@ func (b transcriptBuilder) Build() preparedTranscript {
 	return prepared
 }
 
-func modelContextHistory(history []session.SessionEntry) []session.SessionEntry {
+func modelContextHistory(history []session.SessionEntry, projection string) []session.SessionEntry {
 	history = session.RepairLeadingFragment(session.ModelVisibleEntries(history))
 	if len(history) == 0 {
 		return nil
@@ -54,13 +54,52 @@ func modelContextHistory(history []session.SessionEntry) []session.SessionEntry 
 	if len(history) <= maxModelContextRecentEntries && entriesByteSize(history) <= maxModelContextBytes {
 		return append([]session.SessionEntry(nil), history...)
 	}
+	if strings.EqualFold(strings.TrimSpace(projection), "recent") {
+		return recentModelContextHistory(history)
+	}
 
+	pinned, pinnedKeys := pinnedContextEntries(history)
+	candidates := make([]session.SessionEntry, 0, len(history))
+	for _, entry := range history {
+		if _, ok := pinnedKeys[contextEntryKey(entry)]; ok {
+			continue
+		}
+		candidates = append(candidates, entry)
+	}
+	blocks := session.BuildHistoryBlocks(candidates)
+	if len(blocks) == 0 {
+		return session.RepairLeadingFragment(pinned)
+	}
+
+	selected := make([]session.HistoryBlock, 0, len(blocks))
+	totalEntries := len(pinned)
+	totalBytes := entriesByteSize(pinned)
+	for i := len(blocks) - 1; i >= 0; i-- {
+		blockBytes := entriesByteSize(blocks[i].Entries)
+		if len(selected) > 0 &&
+			(totalEntries+len(blocks[i].Entries) > maxModelContextRecentEntries ||
+				totalBytes+blockBytes > maxModelContextBytes) {
+			break
+		}
+		selected = append(selected, blocks[i])
+		totalEntries += len(blocks[i].Entries)
+		totalBytes += blockBytes
+	}
+	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
+		selected[left], selected[right] = selected[right], selected[left]
+	}
+
+	out := append([]session.SessionEntry(nil), pinned...)
+	out = append(out, session.FlattenHistoryBlocks(selected)...)
+	return session.RepairLeadingFragment(out)
+}
+
+func recentModelContextHistory(history []session.SessionEntry) []session.SessionEntry {
 	prefix := preservedContextPrefix(history)
 	blocks := session.BuildHistoryBlocks(history[len(prefix):])
 	if len(blocks) == 0 {
 		return append([]session.SessionEntry(nil), prefix...)
 	}
-
 	selected := make([]session.HistoryBlock, 0, len(blocks))
 	totalEntries := len(prefix)
 	totalBytes := entriesByteSize(prefix)
@@ -78,7 +117,6 @@ func modelContextHistory(history []session.SessionEntry) []session.SessionEntry 
 	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
 		selected[left], selected[right] = selected[right], selected[left]
 	}
-
 	out := append([]session.SessionEntry(nil), prefix...)
 	out = append(out, session.FlattenHistoryBlocks(selected)...)
 	return session.RepairLeadingFragment(out)
@@ -95,6 +133,48 @@ func preservedContextPrefix(history []session.SessionEntry) []session.SessionEnt
 		}
 	}
 	return prefix
+}
+
+func pinnedContextEntries(history []session.SessionEntry) ([]session.SessionEntry, map[string]struct{}) {
+	pinned := make([]session.SessionEntry, 0, 8)
+	pinnedKeys := make(map[string]struct{}, 8)
+	add := func(entry session.SessionEntry) {
+		key := contextEntryKey(entry)
+		if _, ok := pinnedKeys[key]; ok {
+			return
+		}
+		pinnedKeys[key] = struct{}{}
+		pinned = append(pinned, entry)
+	}
+	for _, entry := range history {
+		switch entry.Type {
+		case session.EntryTypeCompaction, session.EntryTypeMeta:
+			add(entry)
+		default:
+			goto suffix
+		}
+	}
+suffix:
+	for i := len(history) - 1; i >= 0; i-- {
+		entry := history[i]
+		if entry.Type == session.EntryTypeCompaction || session.IsSessionFocusEntry(entry) {
+			add(entry)
+			if entry.Type == session.EntryTypeCompaction {
+				break
+			}
+		}
+	}
+	for _, entry := range session.LatestStateEntries(history, nil) {
+		add(entry)
+	}
+	return pinned, pinnedKeys
+}
+
+func contextEntryKey(entry session.SessionEntry) string {
+	if id := strings.TrimSpace(entry.ID); id != "" {
+		return "id:" + id
+	}
+	return string(entry.Type) + "|" + entry.Role + "|" + entry.ToolID + "|" + entry.PlanID + "|" + string(entry.Data)
 }
 
 func entriesByteSize(entries []session.SessionEntry) int {
